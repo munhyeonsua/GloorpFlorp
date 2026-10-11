@@ -6,6 +6,12 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+# The engine and settings live in a library so the end-to-end test can drive
+# two engines without a window.
+[lib]
+name = "gloorpflorp"
+path = "src/lib.rs"
+
 [[bin]]
 name = "GloorpFlorp"
 path = "src/main.rs"
@@ -19,6 +25,7 @@ gf-sys.workspace = true
 anyhow.workspace = true
 log.workspace = true
 crossbeam-channel.workspace = true
+rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 eframe.workspace = true

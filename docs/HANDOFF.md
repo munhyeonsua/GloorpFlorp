@@ -5,8 +5,9 @@ Written when the work moved from a 4-core cloud machine to the owner's PC
 [ARCHITECTURE.md](ARCHITECTURE.md). Setting up the PC:
 [LOCAL-SETUP.md](LOCAL-SETUP.md).
 
-Branch: `claude/lucid-fermi-dew58r`. Full reports from the agents that built the finished crates:
-`.claude/handoff/phase1-agent-reports.json`. Work-in-progress commits end in
+Branch: `claude/nifty-ride-afb8qt` (earlier: `claude/lucid-fermi-dew58r`). Full reports from the
+agents that built the crates: `.claude/handoff/phase1-agent-reports.json` (proto, sys, net, video),
+`.claude/handoff/phase2-gf-audio-report.md` and `.claude/handoff/phase2-app-report.md`. Work-in-progress commits end in
 `[skip ci]` so they don't start a Windows build.
 
 ## Status
@@ -18,19 +19,20 @@ Branch: `claude/lucid-fermi-dew58r`. Full reports from the agents that built the
 | `gf-net`: TCP+UDP session, handshake, reconnect, video queue, stats | ✅ done | 29 pass |
 | `gf-video`: FFmpeg encoder (ddagrab → NVENC → FLV), mpv viewer | ✅ done | 22 unit + 4 integration pass (software encoders) |
 | `.github/workflows/build.yml`, `packaging/`, `README.md` | ✅ done | actionlint clean; packaging script run end to end with the real FFmpeg zip |
-| `gf-audio`: mic, echo cancellation, Opus, jitter, mixing, playback, game audio | ❌ still the skeleton (`todo!()`) | |
-| `app`: engine, settings, logging, egui UI, end-to-end test | ❌ still the skeleton | |
-| Integration (everything together, release build) | ❌ not started | |
+| `gf-audio`: mic, echo cancellation, Opus, jitter, mixing, playback, game audio | ✅ written (cloud, phase 2) | 42 pass; clippy clean on Linux + windows-gnu |
+| `app`: engine, settings, logging, egui UI, end-to-end test | ✅ written (cloud, phase 2) | 5 unit + 3 end-to-end pass; clippy clean on Linux + windows-gnu; UI driven under Xvfb |
+| Integration (everything together, release build) | 🟡 partly: `cargo test --workspace` passes on Linux; the integration pass (cross-crate requests, workspace clippy, release exe, README wording) has not run | |
 
 Nothing has run on real Windows/NVIDIA hardware yet.
 
 ## Next steps
 
-1. **Finish the code.** Run the saved workflow `finish-v1`
-   (`.claude/workflows/finish-v1.js`). It builds `gf-audio` and `app` in
-   parallel, then an integrator makes the whole workspace build, pass tests
-   and clippy, and produce `GloorpFlorp.exe`. The agents read this file for
-   context.
+1. **Integrate.** `gf-audio` and `app` are written (phase 2, built in a Linux
+   cloud container). Do NOT re-run the Build phase of `finish-v1`; run only its
+   integrator step (the last `agent(...)` in `.claude/workflows/finish-v1.js`),
+   giving it the two phase-2 reports above. Open items it must handle are in
+   the reports' "Requests" sections (game-audio start/stop off the engine
+   thread, README label wording, `game_capturing` doc, etc.).
 2. **Review.** Run an adversarial review across the workspace: Windows API
    correctness, real-time audio safety, protocol edge cases, UI wording.
    Verify each finding before fixing it.

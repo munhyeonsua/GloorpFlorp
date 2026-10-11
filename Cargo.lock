@@ -1415,9 +1415,11 @@ dependencies = [
  "gf-sys",
  "log",
  "opus",
+ "rand",
  "rtrb",
  "rubato",
  "sonora",
+ "windows",
 ]
 
 [[package]]
@@ -1506,6 +1508,7 @@ dependencies = [
  "gf-sys",
  "gf-video",
  "log",
+ "rand",
  "serde",
  "serde_json",
  "simplelog",
