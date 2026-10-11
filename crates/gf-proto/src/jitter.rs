@@ -191,6 +191,8 @@ impl JitterBuffer {
                     self.lost += gap;
                 }
             }
+            // From now on, anything before `head` is late.
+            self.played = Some(self.head - 1);
         }
         while self.buffered > self.target + DRIFT_SLACK {
             match self.slots[(self.head % cap) as usize].take() {

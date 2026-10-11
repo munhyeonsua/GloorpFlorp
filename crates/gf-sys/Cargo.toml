@@ -14,11 +14,14 @@ if-addrs.workspace = true
 [target.'cfg(windows)'.dependencies]
 wasapi.workspace = true
 windows = { workspace = true, features = [
+    "Wdk_System_SystemServices",
     "Win32_Foundation",
+    "Win32_Graphics_Dwm",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
     "Win32_Media_Audio",
+    "Win32_Security",
     "Win32_System_Com",
     "Win32_System_JobObjects",
     "Win32_System_ProcessStatus",

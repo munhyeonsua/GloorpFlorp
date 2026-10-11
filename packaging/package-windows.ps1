@@ -80,7 +80,7 @@ function Find-SingleFile([string] $Root, [string] $Name, [string] $What) {
 
 # Copies LICENSE*/COPYING*/Copyright* files found anywhere in an extracted
 # download into licenses\, prefixed with the program name.
-function Copy-LicenseFiles([string] $Root, [string] $Prefix) {
+function Copy-LicenseFile([string] $Root, [string] $Prefix) {
     $files = @(Get-ChildItem -LiteralPath $Root -Recurse -File |
         Where-Object { $_.Name -match '^(LICEN[CS]E|COPYING|Copyright)' })
     foreach ($f in $files) {
@@ -135,9 +135,11 @@ $Work = Join-Path $tempRoot "gloorpflorp-package-$([guid]::NewGuid().ToString('N
 New-Item -ItemType Directory -Force -Path $Work | Out-Null
 
 if (Test-Path -LiteralPath $OutDir) { Remove-Item -LiteralPath $OutDir -Recurse -Force }
-$LicensesDir = Join-Path $OutDir 'licenses'
-New-Item -ItemType Directory -Force -Path $OutDir, $LicensesDir | Out-Null
+New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+# Absolute from here on: .NET calls below don't know PowerShell's current folder.
 $OutDir = (Resolve-Path -LiteralPath $OutDir).Path
+$LicensesDir = Join-Path $OutDir 'licenses'
+New-Item -ItemType Directory -Force -Path $LicensesDir | Out-Null
 
 try {
     # --- App -------------------------------------------------------------
@@ -154,7 +156,7 @@ try {
     New-Item -ItemType Directory -Force -Path $ffDir | Out-Null
     $ffExe = Join-Path $ffDir 'ffmpeg.exe'
     Copy-Item -LiteralPath $ffSource.FullName -Destination $ffExe
-    if ((Copy-LicenseFiles $ffWork 'FFmpeg') -eq 0) {
+    if ((Copy-LicenseFile $ffWork 'FFmpeg') -eq 0) {
         Fail 'No license file (LICENSE*/COPYING*) was found in the FFmpeg download. FFmpeg is GPL software and must ship with its license; check the download.'
     }
 
@@ -176,7 +178,7 @@ try {
     $dlls = @(Get-ChildItem -LiteralPath $mpvSource.DirectoryName -File -Filter '*.dll')
     foreach ($dll in $dlls) { Copy-Item -LiteralPath $dll.FullName -Destination $mpvDir }
     Write-Host "mpv: copied mpv.exe and $($dlls.Count) DLL(s)"
-    $mpvLicenses = Copy-LicenseFiles $mpvWork 'mpv'
+    $mpvLicenses = Copy-LicenseFile $mpvWork 'mpv'
     Write-Host "mpv: found $mpvLicenses license file(s) in the download"
 
     $mpvVersion = '(not checked: packaged on a non-Windows machine)'
