@@ -29,7 +29,11 @@ pub struct JitterConfig {
 
 impl Default for JitterConfig {
     fn default() -> Self {
-        JitterConfig { frame_ms: 10, min_delay_ms: 20, max_delay_ms: 200 }
+        JitterConfig {
+            frame_ms: 10,
+            min_delay_ms: 20,
+            max_delay_ms: 200,
+        }
     }
 }
 
@@ -93,9 +97,14 @@ impl JitterBuffer {
         let frame = cfg.frame_ms.max(1);
         let min_packets = cfg.min_delay_ms.div_ceil(frame).max(1) as usize;
         let max_packets = ((cfg.max_delay_ms / frame) as usize).max(min_packets);
-        let cap = (2 * (max_packets + DRIFT_SLACK) + 8).max(64).next_power_of_two();
+        let cap = (2 * (max_packets + DRIFT_SLACK) + 8)
+            .max(64)
+            .next_power_of_two();
         JitterBuffer {
-            cfg: JitterConfig { frame_ms: frame, ..cfg },
+            cfg: JitterConfig {
+                frame_ms: frame,
+                ..cfg
+            },
             slots: vec![None; cap],
             head: 0,
             highest: None,
@@ -208,7 +217,9 @@ impl JitterBuffer {
             }
             None => {
                 self.lost += 1;
-                Pop::Lost { next: self.slots[(self.head % cap) as usize].clone() }
+                Pop::Lost {
+                    next: self.slots[(self.head % cap) as usize].clone(),
+                }
             }
         }
     }
@@ -309,7 +320,10 @@ mod tests {
             assert_eq!(jb.pop(), frame(s - 1));
         }
         let st = jb.stats();
-        assert_eq!((st.received, st.lost, st.late_dropped, st.buffered), (100, 0, 0, 1));
+        assert_eq!(
+            (st.received, st.lost, st.late_dropped, st.buffered),
+            (100, 0, 0, 1)
+        );
         assert_eq!(st.delay_ms, 20);
     }
 
@@ -498,7 +512,11 @@ mod tests {
     #[test]
     fn target_clamped_to_max() {
         let clock = Clock(Instant::now());
-        let cfg = JitterConfig { frame_ms: 10, min_delay_ms: 20, max_delay_ms: 50 };
+        let cfg = JitterConfig {
+            frame_ms: 10,
+            min_delay_ms: 20,
+            max_delay_ms: 50,
+        };
         let mut jb = JitterBuffer::new(cfg);
         let mut t = 0;
         for s in 0..500u16 {
@@ -546,7 +564,13 @@ mod tests {
         push_all(&mut jb, &clock, 0, &[100, 101, 102]);
         jb.pop();
         jb.reset();
-        assert_eq!(jb.stats(), JitterStats { delay_ms: 20, ..Default::default() });
+        assert_eq!(
+            jb.stats(),
+            JitterStats {
+                delay_ms: 20,
+                ..Default::default()
+            }
+        );
         assert_eq!(jb.pop(), Pop::Empty);
         push_all(&mut jb, &clock, 100, &[5, 6]);
         assert_eq!(jb.pop(), frame(5));
@@ -576,7 +600,7 @@ mod tests {
                         let s = u16::from_le_bytes([p[0], p[1]]);
                         if let Some(l) = last {
                             let d = s.wrapping_sub(l) as i16;
-                            assert!(d > 0 || d < -1000, "went backwards {l} -> {s}");
+                            assert!(!(-1000..=0).contains(&d), "went backwards {l} -> {s}");
                         }
                         last = Some(s);
                     }

@@ -67,7 +67,10 @@ impl RoomCode {
         if !is_tailscale_ipv4(ip) {
             return Err(RoomError::NotTailscale(ip));
         }
-        Ok(RoomCode { ip, secret: rand::random::<u32>() & SECRET_MASK })
+        Ok(RoomCode {
+            ip,
+            secret: rand::random::<u32>() & SECRET_MASK,
+        })
     }
 
     /// Format as `XXXX-XXXX-XXX`. Only the low 22 bits of the offset from
@@ -164,7 +167,10 @@ mod tests {
     fn round_trip_many() {
         let mut rng = StdRng::seed_from_u64(1);
         for _ in 0..20_000 {
-            let code = RoomCode { ip: random_ip(&mut rng), secret: rng.random::<u32>() & SECRET_MASK };
+            let code = RoomCode {
+                ip: random_ip(&mut rng),
+                secret: rng.random::<u32>() & SECRET_MASK,
+            };
             let s = code.encode();
             assert_eq!(s.len(), 13);
             assert_eq!(&s[4..5], "-");
@@ -172,7 +178,10 @@ mod tests {
             assert_eq!(RoomCode::parse(&s), Ok(code), "{s}");
             assert_eq!(s.parse::<RoomCode>(), Ok(code));
         }
-        for ip in [Ipv4Addr::new(100, 64, 0, 0), Ipv4Addr::new(100, 127, 255, 255)] {
+        for ip in [
+            Ipv4Addr::new(100, 64, 0, 0),
+            Ipv4Addr::new(100, 127, 255, 255),
+        ] {
             for secret in [0, SECRET_MASK] {
                 let code = RoomCode { ip, secret };
                 assert_eq!(RoomCode::parse(&code.encode()), Ok(code));
@@ -192,12 +201,23 @@ mod tests {
 
     #[test]
     fn forgiving_parse() {
-        let code = RoomCode { ip: Ipv4Addr::new(100, 90, 1, 1), secret: 0x1234_5678 & SECRET_MASK };
+        let code = RoomCode {
+            ip: Ipv4Addr::new(100, 90, 1, 1),
+            secret: 0x1234_5678 & SECRET_MASK,
+        };
         let s = code.encode();
         let plain: String = s.chars().filter(|&c| c != '-').collect();
         assert_eq!(RoomCode::parse(&s.to_lowercase()), Ok(code));
         assert_eq!(RoomCode::parse(&plain), Ok(code));
-        assert_eq!(RoomCode::parse(&format!("  {} {} {}\n", &plain[..3], &plain[3..7], &plain[7..])), Ok(code));
+        assert_eq!(
+            RoomCode::parse(&format!(
+                "  {} {} {}\n",
+                &plain[..3],
+                &plain[3..7],
+                &plain[7..]
+            )),
+            Ok(code)
+        );
         assert_eq!(RoomCode::parse(&s.replace('-', "–")), Ok(code));
         // Confusables map to the digits they look like.
         let ones = s.replace('1', "I");
@@ -210,18 +230,42 @@ mod tests {
     #[test]
     fn wrong_length() {
         assert_eq!(RoomCode::parse(""), Err(RoomError::WrongLength(0)));
-        assert_eq!(RoomCode::parse("ABCD-EFGH-JK"), Err(RoomError::WrongLength(10)));
-        assert_eq!(RoomCode::parse("ABCD-EFGH-JKMN"), Err(RoomError::WrongLength(12)));
-        assert_eq!(RoomCode::parse(&"7".repeat(500)), Err(RoomError::WrongLength(500)));
+        assert_eq!(
+            RoomCode::parse("ABCD-EFGH-JK"),
+            Err(RoomError::WrongLength(10))
+        );
+        assert_eq!(
+            RoomCode::parse("ABCD-EFGH-JKMN"),
+            Err(RoomError::WrongLength(12))
+        );
+        assert_eq!(
+            RoomCode::parse(&"7".repeat(500)),
+            Err(RoomError::WrongLength(500))
+        );
     }
 
     #[test]
     fn bad_chars() {
-        assert_eq!(RoomCode::parse("ABCD-EFGH-JKU"), Err(RoomError::BadChar('U')));
-        assert_eq!(RoomCode::parse("abcd-efgh-jku"), Err(RoomError::BadChar('u')));
-        assert_eq!(RoomCode::parse("ABCD_EFGH_JKM"), Err(RoomError::BadChar('_')));
-        assert_eq!(RoomCode::parse("ABCD-EFGH-JK!"), Err(RoomError::BadChar('!')));
-        assert_eq!(RoomCode::parse("ÄBCD-EFGH-JKM"), Err(RoomError::BadChar('Ä')));
+        assert_eq!(
+            RoomCode::parse("ABCD-EFGH-JKU"),
+            Err(RoomError::BadChar('U'))
+        );
+        assert_eq!(
+            RoomCode::parse("abcd-efgh-jku"),
+            Err(RoomError::BadChar('u'))
+        );
+        assert_eq!(
+            RoomCode::parse("ABCD_EFGH_JKM"),
+            Err(RoomError::BadChar('_'))
+        );
+        assert_eq!(
+            RoomCode::parse("ABCD-EFGH-JK!"),
+            Err(RoomError::BadChar('!'))
+        );
+        assert_eq!(
+            RoomCode::parse("ÄBCD-EFGH-JKM"),
+            Err(RoomError::BadChar('Ä'))
+        );
     }
 
     #[test]
@@ -229,7 +273,10 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(7);
         let (mut tries, mut caught) = (0u32, 0u32);
         for _ in 0..5_000 {
-            let code = RoomCode { ip: random_ip(&mut rng), secret: rng.random::<u32>() & SECRET_MASK };
+            let code = RoomCode {
+                ip: random_ip(&mut rng),
+                secret: rng.random::<u32>() & SECRET_MASK,
+            };
             let mut chars: Vec<u8> = code.encode().into_bytes();
             let mut pos = rng.random_range(0..chars.len());
             if chars[pos] == b'-' {
@@ -249,19 +296,28 @@ mod tests {
             }
         }
         let rate = f64::from(caught) / f64::from(tries);
-        assert!(rate > 0.83, "only {rate:.3} of single-character typos caught");
+        assert!(
+            rate > 0.83,
+            "only {rate:.3} of single-character typos caught"
+        );
     }
 
     #[test]
     fn checksum_bits_always_checked() {
-        let code = RoomCode { ip: Ipv4Addr::new(100, 64, 3, 4), secret: 99 };
+        let code = RoomCode {
+            ip: Ipv4Addr::new(100, 64, 3, 4),
+            secret: 99,
+        };
         let s = code.encode();
         let last = s.as_bytes()[12];
         let v = ALPHABET.iter().position(|&a| a == last).unwrap();
         for flip in 1..8 {
             let mut bad = s.clone().into_bytes();
             bad[12] = ALPHABET[v ^ flip];
-            assert_eq!(RoomCode::parse(std::str::from_utf8(&bad).unwrap()), Err(RoomError::Checksum));
+            assert_eq!(
+                RoomCode::parse(std::str::from_utf8(&bad).unwrap()),
+                Err(RoomError::Checksum)
+            );
         }
     }
 }

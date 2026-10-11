@@ -17,6 +17,7 @@
     Used by .github/workflows/build.yml. Also runs locally with PowerShell 7
     and 7-Zip ("7z") on PATH, e.g. to test the layout on Linux.
 #>
+#Requires -Version 7.0
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)] [string] $AppExe,
@@ -46,7 +47,7 @@ function Fail([string] $Message) {
 # Writes text with Windows line endings (CRLF) and UTF-8 without BOM, so it
 # reads well in Notepad.
 function Write-WindowsText([string] $Path, [string[]] $Lines) {
-    $text = ($Lines -join "`r`n") + "`r`n"
+    $text = (($Lines -join "`n") -replace "`r?`n", "`r`n") + "`r`n"
     [IO.File]::WriteAllText($Path, $text, [Text.UTF8Encoding]::new($false))
 }
 
@@ -88,12 +89,22 @@ function Copy-LicenseFiles([string] $Root, [string] $Prefix) {
     return $files.Count
 }
 
-# First line printed by `exe args`, or $null if it could not run.
+# First line printed by `exe args`, or $null if it fails or takes over 30 s
+# (a hung probe must not stall the build until the job timeout).
 function Get-FirstLine([string] $Exe, [string[]] $Arguments) {
     try {
-        $out = @(& $Exe @Arguments)
-        if ($LASTEXITCODE -ne 0 -or $out.Count -eq 0) { return $null }
-        return "$($out[0])".Trim()
+        $psi = [Diagnostics.ProcessStartInfo]::new($Exe)
+        foreach ($a in $Arguments) { $psi.ArgumentList.Add($a) }
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardOutput = $true
+        $p = [Diagnostics.Process]::Start($psi)
+        $stdout = $p.StandardOutput.ReadToEndAsync()
+        if (-not $p.WaitForExit(30000)) {
+            $p.Kill($true)
+            return $null
+        }
+        if ($p.ExitCode -ne 0 -or -not $stdout.Wait(5000)) { return $null }
+        return @($stdout.Result -split "`r?`n" | Where-Object { $_.Trim() }) | Select-Object -First 1
     } catch {
         return $null
     }

@@ -34,10 +34,16 @@ pub enum TcpMsg {
         udp_token: u32,
     },
     /// Host -> joiner, refuses the join (wrong code, room full, version mismatch).
-    Reject { reason: String },
+    Reject {
+        reason: String,
+    },
     /// Keepalive, sent every 2 s by both sides; answered with `Pong`.
-    Ping { nonce: u64 },
-    Pong { nonce: u64 },
+    Ping {
+        nonce: u64,
+    },
+    Pong {
+        nonce: u64,
+    },
     /// Sender started sharing its screen; frames follow.
     ShareStarted {
         codec: VideoCodec,
@@ -47,10 +53,14 @@ pub enum TcpMsg {
     },
     ShareStopped,
     /// Viewer tells the sharer whether it wants frames (viewer window open).
-    Watching { on: bool },
+    Watching {
+        on: bool,
+    },
     Video(VideoFrame),
     /// Sender started/stopped sending game audio.
-    GameAudio { active: bool },
+    GameAudio {
+        active: bool,
+    },
     /// Polite goodbye before closing the connection.
     Bye,
 }
@@ -97,7 +107,10 @@ pub fn decode_tcp_body(body: &[u8]) -> Result<TcpMsg, WireError> {
     }
     match postcard::take_from_bytes::<TcpMsg>(body) {
         Ok((msg, [])) => Ok(msg),
-        Ok((_, rest)) => Err(WireError::Malformed(format!("{} unexpected trailing bytes", rest.len()))),
+        Ok((_, rest)) => Err(WireError::Malformed(format!(
+            "{} unexpected trailing bytes",
+            rest.len()
+        ))),
         Err(e) => Err(WireError::Malformed(e.to_string())),
     }
 }
@@ -173,11 +186,22 @@ mod tests {
                 name: "Gloorp ✓".into(),
                 encoders: vec![VideoCodec::Av1, VideoCodec::Hevc, VideoCodec::H264],
             },
-            TcpMsg::Welcome { name: String::new(), encoders: vec![], udp_token: u32::MAX },
-            TcpMsg::Reject { reason: "wrong code".into() },
+            TcpMsg::Welcome {
+                name: String::new(),
+                encoders: vec![],
+                udp_token: u32::MAX,
+            },
+            TcpMsg::Reject {
+                reason: "wrong code".into(),
+            },
             TcpMsg::Ping { nonce: u64::MAX },
             TcpMsg::Pong { nonce: 0 },
-            TcpMsg::ShareStarted { codec: VideoCodec::Hevc, width: 2560, height: 1440, fps: 60 },
+            TcpMsg::ShareStarted {
+                codec: VideoCodec::Hevc,
+                width: 2560,
+                height: 1440,
+                fps: 60,
+            },
             TcpMsg::ShareStopped,
             TcpMsg::Watching { on: true },
             TcpMsg::Watching { on: false },
@@ -215,9 +239,17 @@ mod tests {
     fn large_video_message() {
         let mut data = vec![0u8; 2 * 1024 * 1024];
         StdRng::seed_from_u64(3).fill_bytes(&mut data);
-        let msg = TcpMsg::Video(VideoFrame { codec: VideoCodec::Av1, keyframe: false, sent_us: 9, data });
+        let msg = TcpMsg::Video(VideoFrame {
+            codec: VideoCodec::Av1,
+            keyframe: false,
+            sent_us: 9,
+            data,
+        });
         let enc = encode_tcp(&msg);
-        assert!(enc.len() < 2 * 1024 * 1024 + 32, "video bytes should not be inflated");
+        assert!(
+            enc.len() < 2 * 1024 * 1024 + 32,
+            "video bytes should not be inflated"
+        );
         assert_eq!(read_tcp(&mut Cursor::new(&enc)).unwrap(), msg);
     }
 
@@ -226,7 +258,10 @@ mod tests {
         for m in all_msgs() {
             let enc = encode_tcp(&m);
             for cut in 0..enc.len() {
-                assert!(read_tcp(&mut Cursor::new(&enc[..cut])).is_err(), "{m:?} cut at {cut}");
+                assert!(
+                    read_tcp(&mut Cursor::new(&enc[..cut])).is_err(),
+                    "{m:?} cut at {cut}"
+                );
             }
         }
     }
@@ -235,9 +270,14 @@ mod tests {
     fn oversized_is_rejected_before_reading() {
         let mut buf = ((MAX_TCP_MSG + 1) as u32).to_le_bytes().to_vec();
         buf.extend_from_slice(&[0; 16]);
-        assert!(matches!(read_tcp(&mut Cursor::new(&buf)), Err(WireError::TooLarge(n)) if n == MAX_TCP_MSG + 1));
+        assert!(
+            matches!(read_tcp(&mut Cursor::new(&buf)), Err(WireError::TooLarge(n)) if n == MAX_TCP_MSG + 1)
+        );
         let buf = u32::MAX.to_le_bytes();
-        assert!(matches!(read_tcp(&mut Cursor::new(&buf)), Err(WireError::TooLarge(_))));
+        assert!(matches!(
+            read_tcp(&mut Cursor::new(&buf)),
+            Err(WireError::TooLarge(_))
+        ));
     }
 
     #[test]
@@ -245,15 +285,24 @@ mod tests {
         // Unknown enum variant.
         let mut buf = 1u32.to_le_bytes().to_vec();
         buf.push(200);
-        assert!(matches!(read_tcp(&mut Cursor::new(&buf)), Err(WireError::Malformed(_))));
+        assert!(matches!(
+            read_tcp(&mut Cursor::new(&buf)),
+            Err(WireError::Malformed(_))
+        ));
         // Valid message followed by junk inside the same frame.
         let mut enc = encode_tcp(&TcpMsg::Bye);
         enc.push(0);
         let len = (enc.len() - 4) as u32;
         enc[..4].copy_from_slice(&len.to_le_bytes());
-        assert!(matches!(read_tcp(&mut Cursor::new(&enc)), Err(WireError::Malformed(_))));
+        assert!(matches!(
+            read_tcp(&mut Cursor::new(&enc)),
+            Err(WireError::Malformed(_))
+        ));
         // Empty body.
-        assert!(matches!(read_tcp(&mut Cursor::new(&[0, 0, 0, 0])), Err(WireError::Malformed(_))));
+        assert!(matches!(
+            read_tcp(&mut Cursor::new(&[0, 0, 0, 0])),
+            Err(WireError::Malformed(_))
+        ));
         // Video claiming a huge payload that isn't there.
         let mut body = encode_tcp(&TcpMsg::Video(VideoFrame {
             codec: VideoCodec::H264,
@@ -297,7 +346,12 @@ mod tests {
 
     #[test]
     fn udp_layout_is_exact() {
-        let hdr = UdpHeader { kind: UdpKind::Game, token: 0x0403_0201, seq: 0x0605, ts: 0x0a09_0807 };
+        let hdr = UdpHeader {
+            kind: UdpKind::Game,
+            token: 0x0403_0201,
+            seq: 0x0605,
+            ts: 0x0a09_0807,
+        };
         let mut out = vec![9, 9, 9];
         encode_udp(&hdr, &[0xaa, 0xbb], &mut out);
         assert_eq!(out, [0x47, 2, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 0xaa, 0xbb]);
@@ -310,7 +364,12 @@ mod tests {
     fn udp_round_trip_all_kinds() {
         let mut out = Vec::new();
         for kind in [UdpKind::Voice, UdpKind::Game, UdpKind::Ping, UdpKind::Pong] {
-            let hdr = UdpHeader { kind, token: 77, seq: u16::MAX, ts: 480 };
+            let hdr = UdpHeader {
+                kind,
+                token: 77,
+                seq: u16::MAX,
+                ts: 480,
+            };
             let payload = 1234u64.to_le_bytes();
             encode_udp(&hdr, &payload, &mut out);
             assert_eq!(out.len(), UDP_HEADER_LEN + 8);
@@ -322,7 +381,12 @@ mod tests {
 
     #[test]
     fn udp_rejects_malformed() {
-        let hdr = UdpHeader { kind: UdpKind::Voice, token: 1, seq: 2, ts: 3 };
+        let hdr = UdpHeader {
+            kind: UdpKind::Voice,
+            token: 1,
+            seq: 2,
+            ts: 3,
+        };
         let mut good = Vec::new();
         encode_udp(&hdr, &[1, 2, 3], &mut good);
         for cut in 0..UDP_HEADER_LEN {
