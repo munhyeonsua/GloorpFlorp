@@ -13,9 +13,33 @@
 //! and the viewer runs `mpv` if it exists, else `ffmpeg -f null` as a sink.
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
+use std::time::Instant;
 
 use crossbeam_channel::Receiver;
 use gf_proto::{VideoCodec, VideoFrame};
+
+mod args;
+mod encoder;
+mod proc;
+mod tools;
+mod viewer;
+
+pub use args::output_size;
+
+/// Microseconds on a process-wide monotonic clock (the clock behind
+/// `VideoFrame::sent_us` for frames produced by [`Encoder`]).
+pub fn clock_us() -> u64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_micros() as u64
+}
+
+/// Size of monitor `index` (`gf_sys::Monitor::index`) as the encoder sees it;
+/// 1920×1080 if it can't be found. Together with [`output_size`] this gives
+/// the stream size before `EncoderEvent::Started` arrives.
+pub fn monitor_size(index: u32) -> (u32, u32) {
+    encoder::monitor_size(index)
+}
 
 /// Paths to the bundled programs.
 #[derive(Clone, Debug)]
@@ -30,15 +54,17 @@ impl Tools {
     /// plain-language message if FFmpeg is missing. mpv being missing is not
     /// an error here (only viewing needs it).
     pub fn locate() -> anyhow::Result<Tools> {
-        todo!()
+        tools::locate()
     }
 }
 
 /// Which NVENC encoders actually work on this PC, best first. Runs a tiny
 /// test encode for each codec (a few seconds total, call off the UI thread).
 /// Non-Windows: the software encoders available in the local FFmpeg.
+///
+/// Each probe encodes 3 frames of 640×360 black and is killed after 8 s.
 pub fn probe_encoders(tools: &Tools) -> Vec<VideoCodec> {
-    todo!()
+    tools::probe_encoders(tools)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -77,18 +103,29 @@ pub enum EncoderEvent {
 /// B-frames, `-zerolatency 1`, `-delay 0`, `-g keyframe_interval`. Output is
 /// FLV on stdout (`-f flv -flvflags no_duration_filesize -flush_packets 1`)
 /// parsed by `gf_proto::bitstream::FlvDemuxer`.
-pub struct Encoder {}
+///
+/// The monitor size comes from `gf_sys::list_monitors()` (1920×1080 if the
+/// monitor isn't listed). `start` returns once the first FFmpeg process is
+/// running; the ladder continues in the background. Frames are dropped
+/// (until the next keyframe) if the receiver isn't read fast enough.
+/// Non-Windows, or with `GLOORP_FAKE_VIDEO=1`: `testsrc2` + software encoder.
+pub struct Encoder {
+    inner: encoder::EncoderInner,
+}
 
 impl Encoder {
     pub fn start(
         tools: &Tools,
         settings: &EncoderSettings,
     ) -> anyhow::Result<(Encoder, Receiver<EncoderEvent>)> {
-        todo!()
+        let (inner, rx) = encoder::EncoderInner::start(tools, settings)?;
+        Ok((Encoder { inner }, rx))
     }
 
+    /// Kills FFmpeg and waits for it; the last event is `Stopped { error: None }`
+    /// (unless the encoder had already stopped by itself).
     pub fn stop(&mut self) {
-        todo!()
+        self.inner.stop();
     }
 }
 
@@ -104,24 +141,30 @@ impl Encoder {
 /// Frames are handed to a writer thread through a small queue. If mpv falls
 /// behind (queue full) the queue is cleared and frames are skipped until the
 /// next keyframe. Frames before the first keyframe are skipped.
-pub struct Viewer {}
+///
+/// Non-Windows without a display (or with `GLOORP_FAKE_VIDEO=1` and no mpv):
+/// `ffmpeg -f <fmt> -i pipe:0 -f null -` stands in for mpv.
+pub struct Viewer {
+    inner: viewer::ViewerInner,
+}
 
 impl Viewer {
     pub fn start(tools: &Tools, codec: VideoCodec, title: &str) -> anyhow::Result<Viewer> {
-        todo!()
+        viewer::ViewerInner::start(tools, codec, title).map(|inner| Viewer { inner })
     }
 
     /// Never blocks. Returns false once the window has been closed.
     pub fn push(&self, frame: &VideoFrame) -> bool {
-        todo!()
+        self.inner.push(frame)
     }
 
     /// False after the user closed the window or mpv exited.
     pub fn is_open(&self) -> bool {
-        todo!()
+        self.inner.is_open()
     }
 
+    /// Closes the window (kills mpv) and waits for it.
     pub fn stop(&mut self) {
-        todo!()
+        self.inner.stop();
     }
 }

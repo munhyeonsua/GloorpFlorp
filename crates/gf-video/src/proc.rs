@@ -57,7 +57,7 @@ impl StderrTail {
 fn collect_lines(mut r: impl Read, tag: &str, lines: &Mutex<VecDeque<String>>) {
     let mut buf = [0u8; 4096];
     let mut line = Vec::new();
-    let mut push = |line: &mut Vec<u8>| {
+    let push = |line: &mut Vec<u8>| {
         let text = String::from_utf8_lossy(line).trim_end().to_string();
         line.clear();
         if text.is_empty() {
@@ -87,20 +87,7 @@ fn collect_lines(mut r: impl Read, tag: &str, lines: &Mutex<VecDeque<String>>) {
     push(&mut line);
 }
 
-/// Waits up to `grace` for the child to exit by itself, then kills it.
-/// Always reaps it.
-pub(crate) fn reap(child: &mut Child, grace: Duration) -> Option<ExitStatus> {
-    let deadline = Instant::now() + grace;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Some(status),
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
-            _ => break,
-        }
-    }
-    kill(child)
-}
-
+/// Kills the child and reaps it.
 pub(crate) fn kill(child: &mut Child) -> Option<ExitStatus> {
     let _ = child.kill();
     child.wait().ok()
