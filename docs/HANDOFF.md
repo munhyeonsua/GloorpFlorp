@@ -350,8 +350,8 @@ whole run against 37–53). Gap sd 0.4–1.5 ms at 60–144 fps (with `-r`
 0.8–2.9), p95 within 1.8 ms of the frame time, max ≤ 12.2 ms at 144 apart
 from one 6 s run per CPU-fallback case at 16–18 ms (repeated 3× each: 0–1
 gaps over 1.5×, max 7.9–12.2 ms, same as `-r`). Bitrate per second, start
-time (730–940 ms GPU, 815–1540 ms CPU fallback), CPU cores (0.6–1.5 GPU
-paths, 1.6–4.3 CPU fallback) and keyframes every `2·fps` frames are the same
+time (730–940 ms GPU, 815–1550 ms CPU fallback), CPU cores (0.6–1.5 GPU
+paths, 1.6–5.0 CPU fallback, 3.3–5.0 of it at 144 fps over the repeats; `-r` 3.2–4.9) and keyframes every `2·fps` frames are the same
 as with `-r`; every stream decoded in full (AV1 0 errors; H.264 only the
 known prologue message). Real mpv viewer (AV1 1440p60, 8 s, 2 runs each,
 alternating): first picture 30.7–34.8 ms after the keyframe (`-r`:
@@ -502,7 +502,7 @@ From the agents' reports (also check the code's doc comments):
   and paced to the share's rate with `select` (see "Capture pacing fix"):
   exactly 30/60/120/144 fps, also on a still screen. The cost is ddagrab
   polling: +0.6–1.0 CPU core for a native GPU-direct share, +0.9–1.3 for a
-  CUDA-scaled/turned one, +0.8–2.7 on the CPU fallback (part of that is
+  CUDA-scaled/turned one, +0.8–2.9 on the CPU fallback (up to +3.8 in one 144 fps repeat; part of that is
   the CPU scaling the frames that used to be missing) — measured on the
   9800X3D only. If the friend's PC struggles, 60 fps is cheaper than
   120/144. Untested: a heavily loaded CPU (a game using every core) could
