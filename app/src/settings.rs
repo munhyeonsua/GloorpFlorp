@@ -217,7 +217,8 @@ impl Default for Settings {
     }
 }
 
-fn default_name() -> String {
+/// This PC's name, used when "Your name" is left empty.
+pub fn default_name() -> String {
     clean_name(&gf_sys::computer_name())
 }
 

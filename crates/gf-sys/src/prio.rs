@@ -44,6 +44,25 @@ pub fn raise_audio_thread_priority() -> AudioThreadPriority {
     AudioThreadPriority {}
 }
 
+/// Raises the calling thread's priority for the rest of its life. For
+/// threads we don't own, like cpal's device threads, where no guard can be
+/// kept (it must be dropped on its own thread): call it from code running on
+/// that thread, e.g. once in an audio callback. Later calls do nothing.
+pub fn keep_audio_thread_priority() {
+    thread_local! {
+        // Dropped (priority restored) when the thread exits.
+        static KEPT: std::cell::RefCell<Option<AudioThreadPriority>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    // Only fails while the thread is already exiting.
+    let _ = KEPT.try_with(|kept| {
+        let mut kept = kept.borrow_mut();
+        if kept.is_none() {
+            *kept = Some(raise_audio_thread_priority());
+        }
+    });
+}
+
 impl Drop for AudioThreadPriority {
     fn drop(&mut self) {
         #[cfg(windows)]
@@ -62,5 +81,29 @@ mod tests {
     fn raise_and_restore() {
         let guard = super::raise_audio_thread_priority();
         drop(guard);
+    }
+
+    #[cfg(windows)]
+    fn current_priority() -> i32 {
+        use windows::Win32::System::Threading::{GetCurrentThread, GetThreadPriority};
+        // SAFETY: GetCurrentThread is a pseudo-handle for this thread.
+        unsafe { GetThreadPriority(GetCurrentThread()) }
+    }
+
+    #[test]
+    fn kept_priority_lasts_until_the_thread_ends() {
+        let t = std::thread::spawn(|| {
+            #[cfg(windows)]
+            let before = current_priority();
+            super::keep_audio_thread_priority();
+            super::keep_audio_thread_priority();
+            #[cfg(windows)]
+            {
+                // MMCSS reports 15 here; the fallback is 2 (HIGHEST).
+                let after = current_priority();
+                assert!(after > before, "{before} -> {after}");
+            }
+        });
+        t.join().unwrap();
     }
 }

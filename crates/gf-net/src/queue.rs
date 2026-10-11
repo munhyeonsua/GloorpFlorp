@@ -48,7 +48,8 @@ impl VideoQueue {
         self.frames.pop_front()
     }
 
-    /// Discards everything without counting drops (used when closing).
+    /// Discards everything without counting drops (used when closing, and
+    /// when a new share starts).
     pub fn clear(&mut self) {
         self.frames.clear();
     }

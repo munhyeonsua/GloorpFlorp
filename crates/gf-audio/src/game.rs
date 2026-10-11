@@ -18,7 +18,9 @@ const FRAME_LEN: usize = AUDIO_FRAME_SAMPLES * 2;
 const RING_SAMPLES: usize = 48_000;
 /// The capture sends nothing while the program is silent; a part-filled
 /// frame left waiting longer than this is padded with silence and sent.
-const FLUSH_AFTER: Duration = Duration::from_millis(30);
+/// Longer than the capture's 100 ms buffer, so a capture thread that was
+/// held up (and then delivers everything at once) never gets a gap padded in.
+const FLUSH_AFTER: Duration = Duration::from_millis(120);
 /// After this long without samples the level meter drops to zero.
 const IDLE_AFTER: Duration = Duration::from_millis(150);
 
@@ -198,5 +200,28 @@ mod tests {
         assert!(shared.meters.game_level.load() > 0.5);
         let got = sent.lock().unwrap().clone();
         assert_eq!(got, vec![(0, 0), (1, 480), (2, 960), (3, 1440)]);
+    }
+
+    #[test]
+    fn held_up_capture_is_not_padded() {
+        let shared = Arc::new(Shared::new(&AudioSettings::default()));
+        let sent: Arc<Mutex<Vec<u16>>> = Arc::default();
+        let s = sent.clone();
+        let sink: PacketSink = Arc::new(move |_, seq, _, _: &[u8]| s.lock().unwrap().push(seq));
+        let enc = GameEncoder::new(shared, sink).unwrap();
+        let (mut producer, consumer) = rtrb::RingBuffer::new(RING_SAMPLES);
+        let stop = Arc::new(AtomicBool::new(false));
+        let st = stop.clone();
+        let t = std::thread::spawn(move || enc.run(consumer, &st));
+        // 2.5 frames, an 80 ms hold-up (the game kept playing), the rest.
+        let tone = sine(440.0, 0.3, 0, AUDIO_FRAME_SAMPLES * 3, 2);
+        let half = FRAME_LEN * 5 / 2;
+        producer.push_entire_slice(&tone[..half]).unwrap();
+        std::thread::sleep(Duration::from_millis(80));
+        producer.push_entire_slice(&tone[half..]).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        stop.store(true, Relaxed);
+        t.join().unwrap();
+        assert_eq!(*sent.lock().unwrap(), vec![0, 1, 2], "3 frames, no padding");
     }
 }

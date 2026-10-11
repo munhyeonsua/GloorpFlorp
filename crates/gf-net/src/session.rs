@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
 use gf_proto::wire::{
-    decode_udp, encode_tcp, encode_udp, TcpMsg, UdpHeader, UdpKind, WireError, MAX_TCP_MSG,
+    decode_tcp_body, decode_udp, encode_tcp, encode_udp, hello_version, TcpMsg, UdpHeader, UdpKind,
+    WireError, MAX_TCP_MSG,
 };
 use gf_proto::{AudioStream, VideoFrame, PROTOCOL_VERSION};
 
@@ -31,7 +32,20 @@ const CLOSE_WAIT: Duration = Duration::from_millis(150);
 /// After a local close, how long the reader waits for the peer to hang up.
 const CLOSE_DRAIN: Duration = Duration::from_secs(2);
 const ACCEPT_POLL: Duration = Duration::from_millis(50);
+/// The host gives up on a listener whose `accept()` keeps failing this long.
+const ACCEPT_GIVE_UP: Duration = Duration::from_secs(5);
+/// A joiner's first attempt retries "room full" for this long beyond
+/// `dead_after` (see `join_loop`).
+const ROOM_FULL_GRACE: Duration = Duration::from_secs(2);
 const NO_RTT: u64 = u64::MAX;
+
+const VERSION_MISMATCH: &str = "Your GloorpFlorp is a different version from your friend's. Both of you need the same (latest) version, then try again.";
+const WRONG_SECRET: &str =
+    "Wrong room code. Ask your friend to send the code again and paste it exactly.";
+/// Also how the joiner recognises this answer (both sides run the same
+/// version by then).
+const ROOM_FULL: &str = "Your friend's GloorpFlorp still has an older connection open. Wait about 10 seconds, then click Join again.";
+const LISTENER_GONE: &str = "The network connection used for the room went away (did Tailscale restart?). Click Host again.";
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Timing {
@@ -43,6 +57,9 @@ pub(crate) struct Timing {
     pub stats: Duration,
     pub retry_every: Duration,
     pub retry_for: Duration,
+    /// A reconnected connection that ends sooner than this doesn't start a
+    /// fresh `retry_for` window.
+    pub stable_after: Duration,
     pub connect: Duration,
     pub handshake: Duration,
 }
@@ -58,6 +75,7 @@ impl Default for Timing {
             stats: Duration::from_secs(1),
             retry_every: Duration::from_secs(2),
             retry_for: Duration::from_secs(30),
+            stable_after: Duration::from_secs(5),
             connect: Duration::from_secs(5),
             handshake: Duration::from_secs(5),
         }
@@ -160,14 +178,20 @@ impl Shared {
         Some(id)
     }
 
-    fn teardown(&self, id: u64) {
+    /// Ends connection `id`. `events` are emitted before its slot is freed,
+    /// so they always come before the next connection's `Connected`.
+    fn teardown(&self, id: u64, events: impl IntoIterator<Item = NetEvent>) {
         let mut out = lock(&self.out);
         if out.conn != id {
             return;
         }
+        for ev in events {
+            self.emit(ev);
+        }
         out.conn = 0;
         out.control.clear();
         out.video.clear();
+        self.counters.tcp_rtt_us.store(NO_RTT, Ordering::SeqCst);
         self.out_cv.notify_all();
         if let Some(s) = lock(&self.stream).take() {
             let _ = s.shutdown(Shutdown::Both);
@@ -185,6 +209,11 @@ impl Shared {
     fn queue_control(&self, msg: TcpMsg) {
         let mut out = lock(&self.out);
         if out.conn != 0 {
+            // Control goes out before queued video, so frames still queued
+            // from the previous share would follow the announcement.
+            if matches!(msg, TcpMsg::ShareStarted { .. } | TcpMsg::ShareStopped) {
+                out.video.clear();
+            }
             out.control.push_back(msg);
             self.out_cv.notify_all();
         }
@@ -297,9 +326,10 @@ impl Shared {
             (out.conn != 0, out.video.len(), out.video.dropped())
         };
         let tcp_rtt = self.counters.tcp_rtt_us.load(Ordering::Relaxed);
+        let rtt_ms = rtt_ms.or((tcp_rtt != NO_RTT).then(|| tcp_rtt as f32 / 1000.0));
         NetStats {
             connected,
-            rtt_ms: rtt_ms.or((tcp_rtt != NO_RTT).then(|| tcp_rtt as f32 / 1000.0)),
+            rtt_ms: rtt_ms.filter(|_| connected),
             video_send_kbps: kbps(&self.counters.video_sent),
             video_recv_kbps: kbps(&self.counters.video_recv),
             audio_send_kbps: kbps(&self.counters.audio_sent),
@@ -321,7 +351,7 @@ fn spawn(name: &str, f: impl FnOnce() + Send + 'static) -> io::Result<()> {
 /// Plain-language text for a failure to bind the host port.
 fn bind_error(e: &io::Error, port: u16) -> String {
     match e.kind() {
-        ErrorKind::AddrInUse => format!("Port {port} is already in use. Is GloorpFlorp already open?"),
+        ErrorKind::AddrInUse => format!("Another program (maybe a second GloorpFlorp window) is already using port {port}. Close it, then click Host again."),
         ErrorKind::AddrNotAvailable => {
             "Your Tailscale address isn't available. Make sure Tailscale is connected, then try again.".into()
         }
@@ -351,11 +381,11 @@ fn bind_host(bind_ip: Ipv4Addr, port: u16) -> anyhow::Result<(TcpListener, UdpSo
     }
 }
 
-const UNREACHABLE: &str = "Couldn't reach your friend's PC over Tailscale. Check that both PCs show as connected in Tailscale and that your friend allowed GloorpFlorp through Windows Firewall.";
+const UNREACHABLE: &str = "Couldn't reach your friend's PC over Tailscale. Check that both PCs show as connected in Tailscale and that your friend allowed GloorpFlorp through Windows Firewall. If you use two Tailscale accounts, the person whose PC is shared must be the one who clicks Host.";
 
 fn connect_error(e: &io::Error) -> String {
     match e.kind() {
-        ErrorKind::ConnectionRefused => "Your friend's PC answered, but GloorpFlorp isn't hosting a room there (or Windows Firewall blocked it).".into(),
+        ErrorKind::ConnectionRefused => "Your friend's PC answered, but GloorpFlorp isn't hosting a room there (or Windows Firewall blocked it). Ask your friend to click Host and send you the new code.".into(),
         _ => UNREACHABLE.into(),
     }
 }
@@ -433,18 +463,32 @@ pub(crate) fn start(
 // ---------------------------------------------------------------- host
 
 fn accept_loop(sh: &Arc<Shared>, listener: TcpListener, addr: SocketAddr) {
+    // Since when every accept has failed.
+    let mut failing_since: Option<Instant> = None;
     while !sh.is_stopped() {
         match listener.accept() {
             Ok((stream, from)) => {
+                failing_since = None;
                 log::debug!("incoming connection from {from}");
                 let sh = sh.clone();
                 if let Err(e) = spawn("gf-net-conn", move || host_conn(&sh, stream, from, addr)) {
                     log::warn!("couldn't start a connection thread: {e}");
                 }
             }
-            Err(e) if e.kind() == ErrorKind::WouldBlock => thread::sleep(ACCEPT_POLL),
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                failing_since = None;
+                thread::sleep(ACCEPT_POLL);
+            }
             Err(e) => {
                 log::warn!("accepting a connection failed: {e}");
+                // E.g. Tailscale restarted and replaced its network adapter:
+                // this listener won't work again.
+                let since = *failing_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= ACCEPT_GIVE_UP {
+                    sh.emit(NetEvent::Error(LISTENER_GONE.into()));
+                    sh.close();
+                    break;
+                }
                 thread::sleep(ACCEPT_POLL * 4);
             }
         }
@@ -469,10 +513,21 @@ fn host_conn(sh: &Arc<Shared>, stream: TcpStream, from: SocketAddr, listen_addr:
         log::warn!("couldn't set up the connection from {from}: {e}");
         return;
     }
-    let hello = match read_handshake(&stream, sh.timing.handshake) {
-        Ok(m) => m,
+    let body = match read_handshake(sh, &stream) {
+        Ok(b) => b,
         Err(e) => {
             log::debug!("handshake with {from} failed: {e}");
+            return;
+        }
+    };
+    let hello = match decode_tcp_body(&body) {
+        Ok(m) => m,
+        Err(e) => {
+            // Another version may have changed Hello's later fields.
+            if hello_version(&body).is_some_and(|v| v != PROTOCOL_VERSION) {
+                return reject(stream, VERSION_MISMATCH);
+            }
+            log::debug!("{from} sent an unreadable handshake: {e}");
             return;
         }
     };
@@ -487,23 +542,17 @@ fn host_conn(sh: &Arc<Shared>, stream: TcpStream, from: SocketAddr, listen_addr:
         return;
     };
     if version != PROTOCOL_VERSION {
-        return reject(stream, "Your GloorpFlorp is a different version from your friend's. Both of you need the same (latest) version, then try again.");
+        return reject(stream, VERSION_MISMATCH);
     }
     if secret != sh.cfg.secret {
-        return reject(
-            stream,
-            "Wrong room code. Ask your friend to send the code again and paste it exactly.",
-        );
+        return reject(stream, WRONG_SECRET);
     }
     let token = rand::random::<u32>();
     let Some(id) = sh.install(&stream, token, None) else {
         if sh.is_stopped() {
             return;
         }
-        return reject(
-            stream,
-            "This room is full (your friend is already connected to someone).",
-        );
+        return reject(stream, ROOM_FULL);
     };
     log::info!("{name} joined from {from}");
     sh.emit(NetEvent::Connected {
@@ -519,18 +568,23 @@ fn host_conn(sh: &Arc<Shared>, stream: TcpStream, from: SocketAddr, listen_addr:
         Ok(()) => run_conn(sh, &stream, id),
         Err(e) => End::Lost(format!("The connection to your friend was lost ({e}).")),
     };
-    sh.teardown(id);
     let reason = match end {
-        End::Closed => return,
-        End::Bye => "Your friend left the room.".to_string(),
-        End::Lost(r) => r,
+        End::Closed => None,
+        End::Bye => Some("Your friend left the room.".to_string()),
+        End::Lost(r) => Some(r),
     };
-    log::info!("peer disconnected: {reason}");
-    sh.emit(NetEvent::Disconnected {
-        reason,
-        will_retry: false,
+    let events = reason.map(|reason| {
+        log::info!("peer disconnected: {reason}");
+        [
+            NetEvent::Disconnected {
+                reason,
+                will_retry: false,
+            },
+            NetEvent::Listening { addr: listen_addr },
+        ]
     });
-    sh.emit(NetEvent::Listening { addr: listen_addr });
+    // Emitted by teardown, before a quick rejoin can take the slot.
+    sh.teardown(id, events.into_iter().flatten());
 }
 
 // ---------------------------------------------------------------- joiner
@@ -538,6 +592,8 @@ fn host_conn(sh: &Arc<Shared>, stream: TcpStream, from: SocketAddr, listen_addr:
 enum JoinFail {
     Rejected(String),
     Failed(String),
+    /// The session was closed meanwhile.
+    Stopped,
 }
 
 fn join_attempt(sh: &Shared, addr: SocketAddr) -> Result<(TcpStream, u64), JoinFail> {
@@ -545,6 +601,10 @@ fn join_attempt(sh: &Shared, addr: SocketAddr) -> Result<(TcpStream, u64), JoinF
         log::debug!("connecting to {addr} failed: {e}");
         JoinFail::Failed(connect_error(&e))
     })?;
+    // Connecting can take seconds; the user may have clicked Leave meanwhile.
+    if sh.is_stopped() {
+        return Err(JoinFail::Stopped);
+    }
     let no_answer = || {
         JoinFail::Failed("Your friend's PC accepted the connection but didn't answer like GloorpFlorp. Make sure your friend is hosting a room, then try again.".into())
     };
@@ -560,15 +620,28 @@ fn join_attempt(sh: &Shared, addr: SocketAddr) -> Result<(TcpStream, u64), JoinF
     (&stream)
         .write_all(&encode_tcp(&hello))
         .map_err(|e| JoinFail::Failed(connect_error(&e)))?;
-    match read_handshake(&stream, sh.timing.handshake) {
+    let reply = read_handshake(sh, &stream).and_then(|body| decode_tcp_body(&body));
+    if sh.is_stopped() && !matches!(reply, Ok(TcpMsg::Welcome { .. })) {
+        return Err(JoinFail::Stopped);
+    }
+    match reply {
         Ok(TcpMsg::Welcome {
             name,
             encoders,
             udp_token,
         }) => {
-            let id = sh
-                .install(&stream, udp_token, Some(addr))
-                .ok_or_else(|| JoinFail::Failed("The connection was closed.".into()))?;
+            let Some(id) = sh.install(&stream, udp_token, Some(addr)) else {
+                // The host counts us as connected now: say goodbye rather
+                // than leave it waiting for a dead connection.
+                let _ = (&stream).write_all(&encode_tcp(&TcpMsg::Bye));
+                let _ = stream.shutdown(Shutdown::Write);
+                if sh.is_stopped() {
+                    return Err(JoinFail::Stopped);
+                }
+                return Err(JoinFail::Failed(
+                    "Couldn't set up the connection to your friend. Click Join again.".into(),
+                ));
+            };
             log::info!("joined {name}'s room at {addr}");
             sh.emit(NetEvent::Connected {
                 peer_name: name,
@@ -611,14 +684,29 @@ fn join_loop(sh: &Arc<Shared>) {
         sh.emit(ev);
         sh.stopped.store(true, Ordering::SeqCst);
     };
-    let (mut stream, mut id) = match join_attempt(sh, addr) {
-        Ok(c) => c,
-        Err(JoinFail::Rejected(reason)) => return stop(NetEvent::Rejected { reason }),
-        Err(JoinFail::Failed(msg)) => return stop(NetEvent::Error(msg)),
+    // After a crash or sleep, the host may still hold our old connection
+    // until it notices it's dead (`dead_after`), so "room full" is retried
+    // until then.
+    let full_until = Instant::now() + sh.timing.dead_after + ROOM_FULL_GRACE;
+    let (mut stream, mut id) = loop {
+        match join_attempt(sh, addr) {
+            Ok(c) => break c,
+            Err(JoinFail::Rejected(r)) if r == ROOM_FULL && Instant::now() < full_until => {
+                log::debug!("the room is still full; trying again");
+                if !sleep_unless_stopped(sh, sh.timing.retry_every) {
+                    return;
+                }
+            }
+            Err(JoinFail::Stopped) => return,
+            Err(JoinFail::Rejected(reason)) => return stop(NetEvent::Rejected { reason }),
+            Err(JoinFail::Failed(msg)) => return stop(NetEvent::Error(msg)),
+        }
     };
+    let mut give_up: Option<Instant> = None;
     loop {
+        let since = Instant::now();
         let end = run_conn(sh, &stream, id);
-        sh.teardown(id);
+        sh.teardown(id, []);
         let reason = match end {
             End::Closed => return,
             End::Bye => {
@@ -629,32 +717,42 @@ fn join_loop(sh: &Arc<Shared>) {
             }
             End::Lost(r) => r,
         };
+        // A connection that drops right after connecting (e.g. the friend's
+        // app sends something this version can't read) doesn't earn a fresh
+        // retry window, so this can't go on forever.
+        let deadline = match give_up {
+            Some(t) if since.elapsed() < sh.timing.stable_after => t,
+            _ => Instant::now() + sh.timing.retry_for,
+        };
+        give_up = Some(deadline);
         log::info!("connection lost ({reason}), reconnecting");
         sh.emit(NetEvent::Disconnected {
-            reason,
+            reason: reason.clone(),
             will_retry: true,
         });
-        let give_up = Instant::now() + sh.timing.retry_for;
+        let mut last = reason;
         loop {
             if !sleep_unless_stopped(sh, sh.timing.retry_every) {
                 return;
+            }
+            if Instant::now() >= deadline {
+                let secs = sh.timing.retry_for.as_secs();
+                return stop(NetEvent::Disconnected {
+                    reason: format!("Couldn't reconnect to your friend within {secs} seconds. {last} Join again when your friend is back."),
+                    will_retry: false,
+                });
             }
             match join_attempt(sh, addr) {
                 Ok(c) => {
                     (stream, id) = c;
                     break;
                 }
+                Err(JoinFail::Stopped) => return,
                 // During a reconnect the host may still hold the old,
-                // dead connection ("room is full"), so keep trying.
+                // dead connection ("room full"), so keep trying.
                 Err(JoinFail::Rejected(r) | JoinFail::Failed(r)) => {
                     log::debug!("reconnect attempt failed: {r}");
-                    if Instant::now() >= give_up {
-                        let secs = sh.timing.retry_for.as_secs();
-                        return stop(NetEvent::Disconnected {
-                            reason: format!("Couldn't reconnect to your friend for {secs} seconds. {r} Join again when your friend is back."),
-                            will_retry: false,
-                        });
-                    }
+                    last = r;
                 }
             }
         }
@@ -663,13 +761,18 @@ fn join_loop(sh: &Arc<Shared>) {
 
 // ---------------------------------------------------------------- connection
 
-fn read_handshake(stream: &TcpStream, timeout: Duration) -> Result<TcpMsg, WireError> {
+/// Reads one handshake message (undecoded). Gives up after
+/// `timing.handshake`, or as soon as the session is closed.
+fn read_handshake(sh: &Shared, stream: &TcpStream) -> Result<Vec<u8>, WireError> {
     stream.set_read_timeout(Some(Duration::from_millis(100)))?;
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::now() + sh.timing.handshake;
     let mut framer = Framer::new(HANDSHAKE_MAX_MSG);
     loop {
-        if let Some(m) = framer.poll(&mut &*stream)? {
-            return Ok(m);
+        if let Some(body) = framer.poll_body(&mut &*stream)? {
+            return Ok(body);
+        }
+        if sh.is_stopped() {
+            return Err(io::Error::new(ErrorKind::Interrupted, "the session was closed").into());
         }
         if Instant::now() >= deadline {
             return Err(io::Error::from(ErrorKind::TimedOut).into());
@@ -937,12 +1040,14 @@ fn udp_loop(sh: &Shared) {
                 sh.counters
                     .audio_recv
                     .fetch_add(n as u64, Ordering::Relaxed);
-                loss.record(stream, hdr.seq, Instant::now());
+                let arrived = Instant::now();
+                loss.record(stream, hdr.seq, arrived);
                 sh.emit(NetEvent::Audio {
                     stream,
                     seq: hdr.seq,
                     ts: hdr.ts,
                     payload: payload.to_vec(),
+                    arrived,
                 });
             }
         }

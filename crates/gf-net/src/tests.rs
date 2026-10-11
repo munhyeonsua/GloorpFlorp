@@ -1,6 +1,6 @@
 //! Loopback tests: host and joiner in one process on 127.0.0.1.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::time::{Duration, Instant};
 
@@ -23,12 +23,17 @@ fn timing() -> Timing {
         stats: Duration::from_millis(200),
         retry_every: Duration::from_millis(200),
         retry_for: Duration::from_secs(3),
+        stable_after: Duration::from_secs(1),
         connect: Duration::from_secs(4),
         handshake: Duration::from_secs(2),
     }
 }
 
 fn host_on(port: u16) -> anyhow::Result<Net> {
+    host_timed(port, timing())
+}
+
+fn host_timed(port: u16, timing: Timing) -> anyhow::Result<Net> {
     start_with(
         NetConfig {
             role: Role::Host {
@@ -39,7 +44,7 @@ fn host_on(port: u16) -> anyhow::Result<Net> {
             name: "Gloorp".into(),
             encoders: vec![VideoCodec::Av1, VideoCodec::Hevc],
         },
-        timing(),
+        timing,
     )
 }
 
@@ -55,6 +60,10 @@ fn host() -> (Net, u16) {
 }
 
 fn join_with(port: u16, secret: u32) -> Net {
+    join_timed(port, secret, timing())
+}
+
+fn join_timed(port: u16, secret: u32, timing: Timing) -> Net {
     start_with(
         NetConfig {
             role: Role::Join {
@@ -65,7 +74,7 @@ fn join_with(port: u16, secret: u32) -> Net {
             name: "Florp".into(),
             encoders: vec![VideoCodec::H264],
         },
-        timing(),
+        timing,
     )
     .unwrap()
 }
@@ -181,6 +190,80 @@ fn version_mismatch_is_rejected() {
     }
 }
 
+/// Postcard's encoding of an unsigned integer.
+fn varint(mut v: u64, out: &mut Vec<u8>) {
+    while v >= 0x80 {
+        out.push(v as u8 | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
+#[test]
+fn future_hello_layout_still_gets_the_version_message() {
+    let (_h, port) = host();
+    let mut s = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+    s.set_read_timeout(Some(WAIT)).unwrap();
+    // A later version's Hello: the same frozen start (variant 0, version),
+    // then fields this version can't decode.
+    let mut body = vec![0];
+    varint(u64::from(PROTOCOL_VERSION) + 1, &mut body);
+    body.extend_from_slice(&[0xff; 9]);
+    let mut msg = (body.len() as u32).to_le_bytes().to_vec();
+    msg.extend_from_slice(&body);
+    s.write_all(&msg).unwrap();
+    match read_tcp(&mut s).unwrap() {
+        TcpMsg::Reject { reason } => assert!(reason.contains("different version"), "{reason}"),
+        m => panic!("{m:?}"),
+    }
+}
+
+/// Completes the handshake as a joiner, then never says anything again
+/// (like a PC that crashed or went to sleep). Keep it to keep the connection.
+fn silent_joiner(port: u16) -> TcpStream {
+    let mut s = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+    s.set_read_timeout(Some(WAIT)).unwrap();
+    let hello = TcpMsg::Hello {
+        version: PROTOCOL_VERSION,
+        secret: SECRET,
+        name: "Gone".into(),
+        encoders: vec![],
+    };
+    s.write_all(&encode_tcp(&hello)).unwrap();
+    assert!(matches!(read_tcp(&mut s).unwrap(), TcpMsg::Welcome { .. }));
+    s
+}
+
+#[test]
+fn quick_rejoin_waits_for_the_old_connection_to_time_out() {
+    let (h, port) = host();
+    let _old = silent_joiner(port);
+    connected(&h);
+    // The host holds the dead connection until `dead_after`; joining again
+    // meanwhile keeps trying instead of being told the room is full.
+    let j = join(port);
+    connected(&j);
+    // The old connection's end is reported before the new one starts.
+    let mut order = Vec::new();
+    while order.last() != Some(&"connected") {
+        order.push(
+            match next(&h, |e| {
+                matches!(
+                    e,
+                    NetEvent::Disconnected { .. }
+                        | NetEvent::Listening { .. }
+                        | NetEvent::Connected { .. }
+                )
+            }) {
+                NetEvent::Disconnected { .. } => "disconnected",
+                NetEvent::Listening { .. } => "listening",
+                _ => "connected",
+            },
+        );
+    }
+    assert_eq!(order, ["disconnected", "listening", "connected"]);
+}
+
 #[test]
 fn second_joiner_finds_room_full() {
     let (h, j, port) = pair();
@@ -188,7 +271,9 @@ fn second_joiner_finds_room_full() {
     match next(&second, |e| {
         matches!(e, NetEvent::Rejected { .. } | NetEvent::Connected { .. })
     }) {
-        NetEvent::Rejected { reason } => assert!(reason.contains("room is full"), "{reason}"),
+        NetEvent::Rejected { reason } => {
+            assert!(reason.contains("older connection open"), "{reason}")
+        }
         e => panic!("{e:?}"),
     }
     // The first connection is unaffected.
@@ -238,6 +323,58 @@ fn video_frames_arrive_intact_and_in_order() {
     assert_eq!(s.video_frames_dropped, 0);
 }
 
+#[test]
+fn new_share_discards_frames_queued_from_the_old_one() {
+    let h = host_timed(
+        0,
+        Timing {
+            dead_after: Duration::from_secs(60),
+            ..timing()
+        },
+    )
+    .unwrap();
+    let NetEvent::Listening { addr } = next(&h, |e| matches!(e, NetEvent::Listening { .. })) else {
+        unreachable!()
+    };
+    let mut s = silent_joiner(addr.port());
+    connected(&h);
+    // Nothing is read yet, so frames pile up behind the full socket.
+    let frame = |i: u64, len: usize| VideoFrame {
+        codec: VideoCodec::Hevc,
+        keyframe: i == 0,
+        sent_us: i,
+        data: vec![7; len],
+    };
+    for i in 0..20 {
+        h.tx.send_video(frame(i, 4 << 20));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    let started = TcpMsg::ShareStarted {
+        codec: VideoCodec::Av1,
+        width: 1280,
+        height: 720,
+        fps: 60,
+    };
+    h.tx.send(started.clone());
+    h.tx.send_video(frame(1000, 100));
+    let mut announced = false;
+    loop {
+        match read_tcp(&mut s).unwrap() {
+            TcpMsg::Video(f) if f.sent_us == 1000 => {
+                assert!(announced);
+                break;
+            }
+            TcpMsg::Video(f) => assert!(
+                !announced,
+                "old frame {} came after ShareStarted",
+                f.sent_us
+            ),
+            m if m == started => announced = true,
+            _ => {}
+        }
+    }
+}
+
 fn recv_audio(net: &Net, send: impl Fn()) -> NetEvent {
     let deadline = Instant::now() + WAIT;
     while Instant::now() < deadline {
@@ -271,6 +408,7 @@ fn audio_datagrams_both_ways() {
     junk.send_to(b"garbage", (Ipv4Addr::LOCALHOST, port))
         .unwrap();
 
+    let before = Instant::now();
     let ev = recv_audio(&h, || {
         j.tx.send_audio(AudioStream::Voice, 65_535, 480, b"opus voice")
     });
@@ -280,9 +418,11 @@ fn audio_datagrams_both_ways() {
             seq,
             ts,
             payload,
+            arrived,
         } => {
             assert_eq!((stream, seq, ts), (AudioStream::Voice, 65_535, 480));
             assert_eq!(payload, b"opus voice");
+            assert!(before <= arrived && arrived <= Instant::now());
         }
         _ => unreachable!(),
     }
@@ -295,6 +435,7 @@ fn audio_datagrams_both_ways() {
             seq,
             ts,
             payload,
+            ..
         } => {
             assert_eq!((stream, seq, ts), (AudioStream::Game, 7, 96_000));
             assert_eq!(payload, vec![9; 300]);
@@ -405,6 +546,25 @@ fn joiner_leaving_politely_then_rejoining() {
 }
 
 #[test]
+fn ping_is_cleared_when_the_friend_leaves() {
+    let (h, j, _) = pair();
+    next(
+        &h,
+        |e| matches!(e, NetEvent::Stats(s) if s.rtt_ms.is_some()),
+    );
+    drop(j);
+    next(&h, |e| matches!(e, NetEvent::Disconnected { .. }));
+    for _ in 0..3 {
+        let NetEvent::Stats(s) = next(&h, |e| matches!(e, NetEvent::Stats(_))) else {
+            unreachable!()
+        };
+        if !s.connected {
+            assert_eq!(s.rtt_ms, None);
+        }
+    }
+}
+
+#[test]
 fn host_closing_stops_joiner() {
     let (h, j, _) = pair();
     let t0 = Instant::now();
@@ -481,6 +641,46 @@ fn joiner_gives_up_after_retry_window() {
 }
 
 #[test]
+fn joiner_gives_up_when_every_reconnect_fails_at_once() {
+    // A broken host: welcomes every join, then sends something unreadable.
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for s in listener.incoming() {
+            let Ok(mut s) = s else { return };
+            let _ = read_tcp(&mut s);
+            let welcome = TcpMsg::Welcome {
+                name: "Broken".into(),
+                encoders: vec![],
+                udp_token: 1,
+            };
+            let _ = s.write_all(&encode_tcp(&welcome));
+            let _ = s.write_all(&[1, 0, 0, 0, 250]);
+        }
+    });
+    let j = join(port);
+    connected(&j);
+    let t0 = Instant::now();
+    match next(&j, |e| {
+        matches!(
+            e,
+            NetEvent::Disconnected {
+                will_retry: false,
+                ..
+            }
+        )
+    }) {
+        NetEvent::Disconnected { reason, .. } => {
+            assert!(reason.contains("reconnect"), "{reason}");
+            assert!(reason.contains("doesn't understand"), "{reason}");
+        }
+        _ => unreachable!(),
+    }
+    // One retry window (3 s here), not a fresh one after every reconnect.
+    assert!(t0.elapsed() < Duration::from_secs(6), "{:?}", t0.elapsed());
+}
+
+#[test]
 fn nobody_hosting_is_a_plain_error() {
     let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .unwrap()
@@ -500,6 +700,33 @@ fn nobody_hosting_is_a_plain_error() {
 }
 
 #[test]
+fn closing_while_joining_stops_at_once() {
+    // A host that never answers the Hello.
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let j = join_timed(
+        port,
+        SECRET,
+        Timing {
+            handshake: Duration::from_secs(60),
+            ..timing()
+        },
+    );
+    let (mut s, _) = listener.accept().unwrap();
+    s.set_read_timeout(Some(WAIT)).unwrap();
+    assert!(matches!(read_tcp(&mut s).unwrap(), TcpMsg::Hello { .. }));
+    let t0 = Instant::now();
+    j.tx.close();
+    // The joiner hangs up instead of waiting out the handshake.
+    s.read_to_end(&mut Vec::new()).unwrap();
+    assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+    assert!(!j
+        .events
+        .try_iter()
+        .any(|e| matches!(e, NetEvent::Error(_) | NetEvent::Rejected { .. })));
+}
+
+#[test]
 fn port_in_use_is_a_plain_error() {
     let taken = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let port = taken.local_addr().unwrap().port();
@@ -509,7 +736,7 @@ fn port_in_use_is_a_plain_error() {
         .to_string();
     assert_eq!(
         err,
-        format!("Port {port} is already in use. Is GloorpFlorp already open?")
+        format!("Another program (maybe a second GloorpFlorp window) is already using port {port}. Close it, then click Host again.")
     );
 }
 

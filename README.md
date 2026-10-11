@@ -215,8 +215,9 @@ Choose how your microphone sends:
 - **Push-to-talk**: your voice is sent only while you hold a key. Click the
   button to set the key, then press any keyboard key or mouse button. The
   side mouse buttons (Mouse 4 and Mouse 5) work well. It works while the game
-  is in focus. The game still receives the key too, so pick one you don't use
-  in the game.
+  is in focus (unless the game runs as administrator, see
+  [Troubleshooting](#troubleshooting)). The game still receives the key too,
+  so pick one you don't use in the game.
 - **Voice activation**: sends when you speak. If the start of your words
   gets cut off, raise the sensitivity. If keyboard clicks get through, lower
   it.
@@ -268,9 +269,11 @@ are going:
   freeze or go black, especially when alt-tabbing.
 - **Use a second monitor for watching**, so the viewer window doesn't sit on
   top of your game.
-- **Use headsets.** Echo cancellation helps with speakers, but a headset is
-  always better: no echo for your friend, and your game sound doesn't leak
-  into your microphone.
+- **Use headsets, especially when sending game audio.** Echo cancellation
+  only removes your friend's voice and game audio from what your microphone
+  picks up, not your own game's sound. On speakers, your game leaks into
+  your microphone, so your friend hears it twice (once as game audio, once
+  slightly later through your voice).
 - **Pause big downloads** (game updates, cloud backups, streaming on other
   devices) while you play.
 
@@ -291,7 +294,7 @@ are going:
 | Your friend hears no game audio | Check that GloorpFlorp says "Sending game audio." (click **Start sending game audio**) and that the right program is chosen. Some games play sound from a different program than the one with the window: try **Everything except GloorpFlorp**. If you restarted the game, click **Start sending game audio** again. Ask your friend to check their game-audio volume slider and that they're not deafened. |
 | Your friend hears an echo of their own voice | You're probably on speakers: use a headset, or turn your speakers down and keep echo cancellation on. If you're also in a Discord call together, send only one program's game audio (see [Game audio](#game-audio)). |
 | Your friend can't hear you | Check that you're not muted, the right microphone is chosen, and the mic meter moves when you talk. With push-to-talk, hold the key while talking. In Windows Settings, under Privacy, Microphone, make sure desktop apps may use the microphone. |
-| Push-to-talk doesn't work while the game is running | If the game (or its launcher) runs as administrator, Windows hides its key presses from normal programs. Close GloorpFlorp, right-click `GloorpFlorp.exe` and choose **Run as administrator**. |
+| Push-to-talk doesn't work while the game is running | If the game (or its launcher) runs as administrator, Windows hides its key presses from normal programs. Close GloorpFlorp, right-click `GloorpFlorp.exe` and choose **Run as administrator**. Or use **Voice activation** instead. |
 
 ### The log file
 

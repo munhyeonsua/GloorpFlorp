@@ -4,15 +4,21 @@
 //! there is no extra TLS. The room secret only stops accidental joins.
 //!
 //! Host: listens on `bind_ip:port` (its Tailscale address only, never 0.0.0.0)
-//! for TCP and UDP. Accepts one peer at a time; a second joiner gets
-//! `Reject { reason: "room is full" }`. After a peer leaves, keeps listening
-//! so the friend can rejoin with the same code.
+//! for TCP and UDP. Accepts one peer at a time; a second joiner gets a
+//! "room full" `Reject`. After a peer leaves, keeps listening so the friend
+//! can rejoin with the same code. A listener whose `accept()` keeps failing
+//! for 5 s (e.g. Tailscale replaced its network adapter) ends the session
+//! with [`NetEvent::Error`].
 //!
-//! Joiner: connects (5 s timeout), sends `Hello`, waits for `Welcome`. If an
+//! Joiner: connects (5 s timeout), sends `Hello`, waits for `Welcome`. The
+//! first attempt retries "room full" for 12 s (after a crash or sleep the
+//! host still holds the old connection until it times out). If an
 //! established connection drops, retries every 2 s for 30 s
-//! (`Disconnected { will_retry: true }`), then gives up.
+//! (`Disconnected { will_retry: true }`), then gives up; a connection that
+//! drops within 5 s of reconnecting doesn't restart the 30 s.
 //!
-//! Handshake checks: protocol version, secret. On mismatch the host sends
+//! Handshake checks: protocol version (read from `Hello`'s frozen start, see
+//! [`gf_proto::wire::hello_version`]), secret. On mismatch the host sends
 //! `Reject` with a plain-language reason and closes.
 //!
 //! TCP: `set_nodelay(true)`. One writer thread per connection sends control
@@ -23,7 +29,8 @@
 //! [`MAX_VIDEO_QUEUE`] frames are waiting (network slower than the encoder),
 //! all queued frames are discarded and new frames are dropped until the next
 //! keyframe, so the viewer catches up instead of falling further behind.
-//! Dropped frames are counted in [`NetStats`].
+//! Dropped frames are counted in [`NetStats`]. Sending `ShareStarted` or
+//! `ShareStopped` discards the queued frames (they belong to the old share).
 //!
 //! UDP: one socket. The joiner sends `Ping` datagrams every 500 ms (keeps
 //! the path alive, measures RTT); the host learns the joiner's UDP address
@@ -42,6 +49,7 @@ mod tests;
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Instant;
 
 use crossbeam_channel::Receiver;
 use gf_proto::wire::TcpMsg;
@@ -108,6 +116,9 @@ pub enum NetEvent {
         seq: u16,
         ts: u32,
         payload: Vec<u8>,
+        /// When the UDP thread received it (the jitter buffer sizes itself
+        /// from arrival times; the event may be handled a bit later).
+        arrived: Instant,
     },
     /// Sent about once per second while running.
     Stats(NetStats),
@@ -118,8 +129,9 @@ pub enum NetEvent {
         reason: String,
         will_retry: bool,
     },
-    /// Fatal problem (e.g. the joiner can't reach the host). The session has
-    /// stopped. The text is plain language for the UI.
+    /// Fatal problem (e.g. the joiner can't reach the host, or the host's
+    /// network adapter went away). The session has stopped. The text is
+    /// plain language for the UI.
     Error(String),
 }
 
@@ -168,8 +180,9 @@ impl NetTx {
 
 /// Starts hosting or joining. Never blocks on the network: the host binds
 /// its port here (a failure is returned as a plain-language error, e.g.
-/// "Port 47800 is already in use. Is GloorpFlorp already open?"), the
-/// joiner connects in the background and reports the outcome as an event.
+/// "Another program (maybe a second GloorpFlorp window) is already using
+/// port 47800. …"), the joiner connects in the background and reports the
+/// outcome as an event.
 pub fn start(cfg: NetConfig) -> anyhow::Result<Net> {
     start_with(cfg, session::Timing::default())
 }

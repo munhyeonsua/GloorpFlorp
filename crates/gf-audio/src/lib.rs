@@ -17,9 +17,10 @@
 //!  The mixed output is also fed to the echo canceller as its reference.
 //! ```
 //!
-//! Real-time rules: the cpal callbacks never lock, allocate or block. They
-//! only move samples through `rtrb` ring buffers; Opus, sonora and resampling
-//! run on ordinary threads.
+//! Real-time rules: the cpal callbacks never lock, allocate or block (apart
+//! from raising their thread's priority once, on the first call). They only
+//! move samples through `rtrb` ring buffers; Opus, sonora and resampling run
+//! on ordinary threads.
 //!
 //! Threads: a playout thread pulls one frame per stream from the jitter
 //! buffers whenever the output ring holds less than ~30 ms, decodes, mixes,
@@ -30,9 +31,13 @@
 //!
 //! Devices: `None` means the system default. If the chosen device disappears
 //! or fails, report it in [`AudioStatus::error`] and keep the rest working
-//! (e.g. no microphone must not stop you hearing your friend). Missing or
-//! failed devices are retried every few seconds; a chosen device that is
-//! missing is replaced by the default until it comes back.
+//! (e.g. no microphone must not stop you hearing your friend). A stream that
+//! stops working is reopened at once (and when Windows switches its default
+//! device, the default streams follow quietly); missing devices are retried
+//! every few seconds. While a chosen device is missing or can't be opened,
+//! the default (or the device already playing) is used until it can be.
+//! The cpal stream threads raise their own priority (MMCSS) on their first
+//! callback, like the engine's other audio threads.
 //!
 //! Test mode: with the environment variable `GLOORP_FAKE_AUDIO=1`,
 //! [`AudioEngine::start`] opens no sound devices. The microphone becomes a
@@ -145,12 +150,16 @@ pub struct AudioStatus {
     pub game_level: f32,
     /// Game-audio capture is running and hasn't reported a problem. Becomes
     /// false when it stops or fails (e.g. the chosen program exited); the
-    /// reason is then in `error`.
+    /// reason is then in `game_error`.
     pub game_capturing: bool,
     pub voice_jitter: JitterStats,
     pub game_jitter: JitterStats,
-    /// Plain-language problem to show the user (missing device, etc.).
+    /// Plain-language problem with voice chat to show the user (missing
+    /// device, etc.). Game-audio problems are in `game_error` instead.
     pub error: Option<String>,
+    /// Plain-language reason the game-audio capture stopped (e.g. the chosen
+    /// program closed), while it is still switched on.
+    pub game_error: Option<String>,
 }
 
 /// Microphone names usable as [`AudioSettings::input_device`]. The system
@@ -302,13 +311,25 @@ impl AudioEngine {
         *current = settings;
     }
 
-    /// Packet from the network.
+    /// Packet from the network, arriving now.
     pub fn receive(&self, stream: AudioStream, seq: u16, ts: u32, payload: Vec<u8>) {
+        self.receive_at(stream, seq, ts, payload, Instant::now());
+    }
+
+    /// Packet from the network that arrived at `arrived`. The jitter buffer
+    /// sizes itself from arrival times, so pass the time the network thread
+    /// received it if that is known (it may be handed over a bit later).
+    pub fn receive_at(
+        &self,
+        stream: AudioStream,
+        seq: u16,
+        ts: u32,
+        payload: Vec<u8>,
+        arrived: Instant,
+    ) {
         // Ordering and loss come from `seq`; the timestamp isn't needed.
         let _ = ts;
-        self.shared
-            .incoming
-            .push(stream, seq, payload, Instant::now());
+        self.shared.incoming.push(stream, seq, payload, arrived);
     }
 
     /// Clear all incoming state (call when the friend disconnects).
@@ -346,7 +367,6 @@ impl AudioEngine {
             lock(&shared.internal_error).clone(),
             lock(&shared.input_error).clone(),
             lock(&shared.output_error).clone(),
-            game_error.clone().flatten(),
         ]
         .into_iter()
         .flatten()
@@ -361,6 +381,7 @@ impl AudioEngine {
             voice_jitter,
             game_jitter,
             error: (!errors.is_empty()).then(|| errors.join(" ")),
+            game_error: game_error.flatten(),
         }
     }
 }

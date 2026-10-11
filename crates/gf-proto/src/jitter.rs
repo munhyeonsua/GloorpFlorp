@@ -11,10 +11,18 @@
 //! - Loss: if the next expected sequence number is missing but later packets
 //!   are buffered, `pop` returns `Lost` (with the following packet if present,
 //!   so Opus in-band FEC can recover it) and advances.
-//! - Silence: if the buffer runs dry, `pop` returns `Empty` and the buffer
-//!   re-primes when packets resume (this is normal with push-to-talk).
-//! - Drift: if more than `target + 3` packets are buffered, the oldest is
-//!   dropped (counted as `late_dropped`) to bring latency back down.
+//! - Running dry: if the buffer empties while playing (a packet is late, or
+//!   the talk spurt ended), `pop` returns `Lost { next: None }` for up to
+//!   ~50 ms so the decoder conceals and fades out instead of cutting to
+//!   silence. No sequence number is used up meanwhile: a packet that turns up
+//!   then is played normally (a little later), and the extra delay is the
+//!   cushion that stops it happening again. These frames don't count as lost.
+//! - Silence: after that, `pop` returns `Empty` and the buffer re-primes when
+//!   packets resume (this is normal with push-to-talk).
+//! - Drift: if more than `target + 3` packets are buffered, the oldest are
+//!   dropped (counted as `late_dropped`) to bring latency back down. The last
+//!   one dropped is handed out as `Skip`, so the decoder stays in step and
+//!   the jump can be cross-faded.
 //! - Packets older than what was already played are discarded.
 //! - Sequence numbers are u16 and wrap around.
 
@@ -41,11 +49,16 @@ impl Default for JitterConfig {
 pub enum Pop {
     /// Next packet in order: decode it normally.
     Frame(Vec<u8>),
-    /// Expected packet is missing. `next` is the packet after it, if already
-    /// here, for FEC decoding; it is *not* consumed.
+    /// Expected packet is missing (or late, while the buffer has run dry):
+    /// conceal it. `next` is the packet after it, if already here, for FEC
+    /// decoding; it is *not* consumed.
     Lost { next: Option<Vec<u8>> },
     /// Nothing to play (priming or silence): output silence, don't run PLC.
     Empty,
+    /// The buffer skipped ahead to cut the delay; this is the last packet
+    /// skipped. Decode it without playing it (keeps the decoder's state
+    /// continuous), then call `pop` again for this frame's audio.
+    Skip(Vec<u8>),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -73,6 +86,10 @@ pub struct JitterBuffer {
     played: Option<u64>,
     buffered: usize,
     primed: bool,
+    /// Frames concealed in a row because the buffer ran dry while playing.
+    dry: usize,
+    /// How many of those before giving up and going silent.
+    dry_limit: usize,
     target: usize,
     min_packets: usize,
     max_packets: usize,
@@ -86,6 +103,8 @@ pub struct JitterBuffer {
 
 /// Extra packets above the target tolerated before dropping (drift control).
 const DRIFT_SLACK: usize = 3;
+/// How long to conceal when the buffer runs dry while playing.
+const CONCEAL_DRY_MS: u32 = 50;
 /// This many late packets in a row means the sender restarted its sequence
 /// numbers: start over instead of discarding everything.
 const RESYNC_AFTER_LATE: u32 = 50;
@@ -111,6 +130,8 @@ impl JitterBuffer {
             played: None,
             buffered: 0,
             primed: false,
+            dry: 0,
+            dry_limit: CONCEAL_DRY_MS.div_ceil(frame).max(1) as usize,
             target: min_packets,
             min_packets,
             max_packets,
@@ -193,22 +214,38 @@ impl JitterBuffer {
             }
             // From now on, anything before `head` is late.
             self.played = Some(self.head - 1);
+            self.dry = 0;
         }
-        while self.buffered > self.target + DRIFT_SLACK {
-            match self.slots[(self.head % cap) as usize].take() {
-                Some(_) => {
-                    self.buffered -= 1;
-                    self.late_dropped += 1;
+        if self.buffered > self.target + DRIFT_SLACK {
+            // Too much delay: skip the oldest packets. The loop ends on a
+            // packet (only those count in `buffered`), which is handed out.
+            loop {
+                let slot = self.slots[(self.head % cap) as usize].take();
+                self.played = Some(self.head);
+                self.head += 1;
+                match slot {
+                    Some(p) => {
+                        self.buffered -= 1;
+                        self.late_dropped += 1;
+                        if self.buffered <= self.target + DRIFT_SLACK {
+                            return Pop::Skip(p);
+                        }
+                    }
+                    None => self.lost += 1,
                 }
-                None => self.lost += 1,
             }
-            self.played = Some(self.head);
-            self.head += 1;
         }
         if self.buffered == 0 {
+            if self.dry < self.dry_limit {
+                // Late packet or end of the talk spurt: conceal for now,
+                // without giving up on the packet we're waiting for.
+                self.dry += 1;
+                return Pop::Lost { next: None };
+            }
             self.primed = false;
             return Pop::Empty;
         }
+        self.dry = 0;
         let idx = (self.head % cap) as usize;
         self.played = Some(self.head);
         self.head += 1;
@@ -309,6 +346,18 @@ mod tests {
         }
     }
 
+    /// The buffer ran dry while playing: it conceals for ~50 ms (not counted
+    /// as loss), then goes silent.
+    fn assert_runs_dry(jb: &mut JitterBuffer) {
+        let lost = jb.stats().lost;
+        assert_eq!(jb.dry_limit, 5);
+        for i in 0..jb.dry_limit {
+            assert_eq!(jb.pop(), Pop::Lost { next: None }, "concealed frame {i}");
+        }
+        assert_eq!(jb.pop(), Pop::Empty);
+        assert_eq!(jb.stats().lost, lost);
+    }
+
     #[test]
     fn in_order_with_priming() {
         let clock = Clock(Instant::now());
@@ -338,7 +387,7 @@ mod tests {
             assert_eq!(jb.pop(), frame(s));
         }
         assert_eq!(jb.stats().lost, 0);
-        assert_eq!(jb.pop(), Pop::Empty);
+        assert_runs_dry(&mut jb);
     }
 
     #[test]
@@ -396,7 +445,7 @@ mod tests {
         assert_eq!(jb.pop(), frame(0));
         assert_eq!(jb.pop(), frame(1));
         assert_eq!(jb.pop(), frame(2));
-        assert_eq!(jb.pop(), Pop::Empty);
+        assert_runs_dry(&mut jb);
     }
 
     #[test]
@@ -411,7 +460,7 @@ mod tests {
         assert_eq!(jb.stats().late_dropped, 2);
         assert_eq!(jb.pop(), frame(2));
         assert_eq!(jb.pop(), frame(3));
-        assert_eq!(jb.pop(), Pop::Empty);
+        assert_runs_dry(&mut jb);
     }
 
     #[test]
@@ -423,6 +472,7 @@ mod tests {
             assert_eq!(jb.pop(), frame(s));
         }
         // Push-to-talk released: the buffer runs dry.
+        assert_runs_dry(&mut jb);
         for _ in 0..50 {
             assert_eq!(jb.pop(), Pop::Empty);
         }
@@ -444,7 +494,7 @@ mod tests {
         push_all(&mut jb, &clock, 0, &[0, 1]);
         assert_eq!(jb.pop(), frame(0));
         assert_eq!(jb.pop(), frame(1));
-        assert_eq!(jb.pop(), Pop::Empty);
+        assert_runs_dry(&mut jb);
         push_all(&mut jb, &clock, 2000, &[5, 4]);
         assert_eq!(jb.pop(), frame(4));
         assert_eq!(jb.pop(), frame(5));
@@ -462,11 +512,71 @@ mod tests {
         }
         let target = (jb.stats().delay_ms / 10) as usize;
         let keep = target + DRIFT_SLACK;
+        // The last packet dropped goes to the decoder; this frame's audio
+        // comes from the next pop.
+        assert_eq!(jb.pop(), Pop::Skip(pkt((10 - keep) as u16)));
         assert_eq!(jb.pop(), frame((11 - keep) as u16));
         let st = jb.stats();
         assert_eq!(st.late_dropped, (11 - keep) as u64);
         assert_eq!(st.buffered, keep - 1);
         assert_eq!(st.lost, 0);
+        // Back under the limit: no more skipping.
+        assert_eq!(jb.pop(), frame((12 - keep) as u16));
+    }
+
+    #[test]
+    fn drift_skips_over_gaps_and_hands_out_a_packet() {
+        let clock = Clock(Instant::now());
+        let mut jb = JitterBuffer::new(JitterConfig::default());
+        // 1 is missing; 9 packets buffered, 5 (target + 3) allowed.
+        push_all(&mut jb, &clock, 0, &[0, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(jb.pop(), Pop::Skip(pkt(4)));
+        assert_eq!(jb.pop(), frame(5));
+        let st = jb.stats();
+        assert_eq!((st.late_dropped, st.lost, st.buffered), (4, 1, 4));
+    }
+
+    #[test]
+    fn stall_is_concealed_and_nothing_is_lost() {
+        let clock = Clock(Instant::now());
+        let mut jb = JitterBuffer::new(JitterConfig::default());
+        jb.push(0, pkt(0), clock.at(0));
+        assert_eq!(jb.pop(), Pop::Empty);
+        for s in 1..10u16 {
+            jb.push(s, pkt(s), clock.at(10 * s as u64));
+            assert_eq!(jb.pop(), frame(s - 1));
+        }
+        assert_eq!(jb.pop(), frame(9));
+        // The network stalls for 30 ms mid-sentence: conceal, don't go silent
+        // or re-prime.
+        for _ in 0..3 {
+            assert_eq!(jb.pop(), Pop::Lost { next: None });
+        }
+        // The late packets turn up together and play in order, a bit later.
+        push_all(&mut jb, &clock, 130, &[10, 11, 12]);
+        for s in 10..30u16 {
+            assert_eq!(jb.pop(), frame(s));
+            jb.push(s + 3, pkt(s + 3), clock.at(160 + 10 * (s - 10) as u64));
+        }
+        let st = jb.stats();
+        assert_eq!((st.lost, st.late_dropped), (0, 0));
+        assert_eq!(st.buffered, 3, "the stall left a cushion behind");
+    }
+
+    #[test]
+    fn packet_late_beyond_concealment_starts_a_new_spurt() {
+        let clock = Clock(Instant::now());
+        let mut jb = JitterBuffer::new(JitterConfig::default());
+        push_all(&mut jb, &clock, 0, &[0, 1]);
+        assert_eq!(jb.pop(), frame(0));
+        assert_eq!(jb.pop(), frame(1));
+        assert_runs_dry(&mut jb);
+        // Seq 2 wasn't skipped: it's the start of the next spurt, not late.
+        push_all(&mut jb, &clock, 500, &[2, 3]);
+        assert_eq!(jb.pop(), frame(2));
+        assert_eq!(jb.pop(), frame(3));
+        let st = jb.stats();
+        assert_eq!((st.lost, st.late_dropped), (0, 0));
     }
 
     #[test]
@@ -598,7 +708,7 @@ mod tests {
                 }
                 5 => jb.push(rng.random(), vec![], clock.at(t)),
                 _ => match jb.pop() {
-                    Pop::Frame(p) if p.len() == 2 => {
+                    Pop::Frame(p) | Pop::Skip(p) if p.len() == 2 => {
                         let s = u16::from_le_bytes([p[0], p[1]]);
                         if let Some(l) = last {
                             let d = s.wrapping_sub(l) as i16;

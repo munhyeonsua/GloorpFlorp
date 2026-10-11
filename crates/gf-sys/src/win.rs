@@ -11,6 +11,7 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, WAIT_OBJECT_
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1, DXGI_ERROR_NOT_FOUND};
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITORINFO};
+use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
     SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -18,13 +19,14 @@ use windows::Win32::System::JobObjects::{
 };
 use windows::Win32::System::SystemInformation::OSVERSIONINFOW;
 use windows::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, WaitForSingleObject, PROCESS_NAME_WIN32,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    GetCurrentProcess, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
+    WaitForSingleObject, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SYNCHRONIZE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindow, GetWindowLongW, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, IsWindowVisible, GWL_EXSTYLE, GW_OWNER, MONITORINFOF_PRIMARY,
-    WS_EX_TOOLWINDOW,
+    EnumChildWindows, EnumWindows, GetClassNameW, GetForegroundWindow, GetWindow, GetWindowLongW,
+    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, GWL_EXSTYLE,
+    GW_OWNER, MONITORINFOF_PRIMARY, WS_EX_TOOLWINDOW,
 };
 
 use crate::{AudioApp, GameAudioSource, Monitor, SampleCallback};
@@ -125,6 +127,50 @@ fn exe_name(pid: u32) -> Option<String> {
     }
 }
 
+/// Store (UWP) apps: the visible window is a frame owned by
+/// ApplicationFrameHost.exe; the app's own process owns a child window of it.
+const UWP_FRAME_CLASS: &str = "ApplicationFrameWindow";
+const UWP_APP_CLASS: &str = "Windows.UI.Core.CoreWindow";
+const UWP_FRAME_HOST_EXE: &str = "ApplicationFrameHost.exe";
+
+unsafe fn class_name(hwnd: HWND) -> String {
+    let mut buf = [0u16; 256];
+    let n = unsafe { GetClassNameW(hwnd, &mut buf) }.max(0) as usize;
+    String::from_utf16_lossy(&buf[..n.min(buf.len())])
+}
+
+unsafe fn window_pid(hwnd: HWND) -> u32 {
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    pid
+}
+
+unsafe extern "system" fn find_uwp_app(child: HWND, lparam: LPARAM) -> BOOL {
+    // SAFETY: lparam is the `&mut u32` passed to EnumChildWindows below,
+    // which outlives the (synchronous) enumeration.
+    let found = unsafe { &mut *(lparam.0 as *mut u32) };
+    if unsafe { class_name(child) } == UWP_APP_CLASS {
+        *found = unsafe { window_pid(child) };
+    }
+    // Keep looking until found.
+    (*found == 0).into()
+}
+
+/// The process behind a Store app's frame window; `None` while the app is
+/// suspended (its window isn't inside the frame then).
+unsafe fn uwp_app_pid(frame: HWND, frame_pid: u32) -> Option<u32> {
+    let mut pid = 0u32;
+    // The result only says whether the callback stopped early.
+    let _ = unsafe {
+        EnumChildWindows(
+            Some(frame),
+            Some(find_uwp_app),
+            LPARAM(&raw mut pid as isize),
+        )
+    };
+    (pid != 0 && pid != frame_pid).then_some(pid)
+}
+
 pub(crate) fn list_audio_apps() -> Vec<AudioApp> {
     let mut windows: Vec<HWND> = Vec::new();
     // SAFETY: the callback only pushes into `windows`, which outlives the call.
@@ -139,12 +185,20 @@ pub(crate) fn list_audio_apps() -> Vec<AudioApp> {
         // SAFETY: hwnd came from EnumWindows; a window closing meanwhile only
         // makes these calls fail harmlessly.
         unsafe {
-            if !is_app_window(hwnd) {
+            // Skip our own windows before anything asks for a title: for
+            // them Windows sends a message to our UI thread, which may be
+            // busy (or shutting down) and would block us.
+            let mut pid = window_pid(hwnd);
+            if pid == 0 || pid == own_pid || !is_app_window(hwnd) {
                 continue;
             }
-            let mut pid = 0u32;
-            GetWindowThreadProcessId(hwnd, Some(&mut pid));
-            if pid == 0 || pid == own_pid || apps.iter().any(|a| a.pid == pid) {
+            if class_name(hwnd) == UWP_FRAME_CLASS {
+                match uwp_app_pid(hwnd, pid) {
+                    Some(app) => pid = app,
+                    None => continue,
+                }
+            }
+            if pid == own_pid || apps.iter().any(|a| a.pid == pid) {
                 continue;
             }
             let title = window_title(hwnd);
@@ -154,10 +208,63 @@ pub(crate) fn list_audio_apps() -> Vec<AudioApp> {
             // Keep programs whose exe we can't read (e.g. protected) so they
             // can still be picked by title.
             let exe = exe_name(pid).unwrap_or_else(|| format!("Process {pid}"));
+            // Capturing the frame host would capture nothing.
+            if exe.eq_ignore_ascii_case(UWP_FRAME_HOST_EXE) {
+                continue;
+            }
             apps.push(AudioApp { pid, exe, title });
         }
     }
     apps
+}
+
+/// Whether the process behind `process` runs elevated (as administrator).
+fn is_elevated(process: HANDLE) -> Option<bool> {
+    // SAFETY: the token handle is owned by OwnedHandle; the out-struct is a
+    // correctly sized local.
+    unsafe {
+        let mut token = HANDLE::default();
+        OpenProcessToken(process, TOKEN_QUERY, &mut token).ok()?;
+        let token = OwnedHandle(token);
+        let mut elevation = TOKEN_ELEVATION::default();
+        let mut len = 0u32;
+        GetTokenInformation(
+            token.0,
+            TokenElevation,
+            Some((&raw mut elevation).cast()),
+            size_of::<TOKEN_ELEVATION>() as u32,
+            &mut len,
+        )
+        .ok()?;
+        Some(elevation.TokenIsElevated != 0)
+    }
+}
+
+pub(crate) fn foreground_is_elevated() -> bool {
+    static SELF_ELEVATED: OnceLock<bool> = OnceLock::new();
+    // SAFETY: GetCurrentProcess is a pseudo-handle that needs no closing.
+    let self_elevated =
+        *SELF_ELEVATED.get_or_init(|| is_elevated(unsafe { GetCurrentProcess() }).unwrap_or(false));
+    if self_elevated {
+        // Windows shows an elevated app's keys to other elevated apps.
+        return false;
+    }
+    // SAFETY: plain queries; the process handle is owned by OwnedHandle.
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_invalid() {
+            return false;
+        }
+        let pid = window_pid(hwnd);
+        if pid == 0 {
+            return false;
+        }
+        let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return false;
+        };
+        let process = OwnedHandle(process);
+        is_elevated(process.0).unwrap_or(false)
+    }
 }
 
 /// Windows build number (e.g. 19041), not affected by compatibility shims.
@@ -203,8 +310,11 @@ pub(crate) fn loopback_capture(
 }
 
 fn wasapi_error(what: &str, e: wasapi::WasapiError) -> String {
-    format!("Game-audio capture failed while {what} ({e}). Turn game audio off and on again, or restart GloorpFlorp.")
+    format!("Game-audio capture failed while {what} ({e}). Click Start sending game audio to try again, or restart GloorpFlorp.")
 }
+
+/// How often lost-sample counts are written to the log.
+const GAP_REPORT_EVERY: Duration = Duration::from_secs(10);
 
 fn capture_loop(
     source: GameAudioSource,
@@ -213,6 +323,9 @@ fn capture_loop(
     ready: &dyn Fn(),
 ) -> Result<(), String> {
     use wasapi::{AudioClient, Direction, SampleType, StreamMode, WasapiError, WaveFormat};
+
+    // A game using every core must not starve this thread (lost samples).
+    let _priority = crate::raise_audio_thread_priority();
 
     // include_tree=false is PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE.
     let (pid, include_tree) = match source {
@@ -248,11 +361,13 @@ fn capture_loop(
             }
         })?;
     // Process loopback can't report a mix format; ask for ours and let
-    // Windows convert (AUTOCONVERTPCM). 20 ms buffer as in Microsoft's sample.
+    // Windows convert (AUTOCONVERTPCM). A 100 ms buffer (Microsoft's sample
+    // uses 20 ms): we still read every ~10 ms event, so it adds no delay,
+    // but this thread can be held up that long without losing samples.
     let format = WaveFormat::new(32, 32, &SampleType::Float, 48_000, 2, None);
     let mode = StreamMode::EventsShared {
         autoconvert: true,
-        buffer_duration_hns: 200_000,
+        buffer_duration_hns: 1_000_000,
     };
     client
         .initialize_client(&format, &Direction::Capture, &mode)
@@ -273,9 +388,18 @@ fn capture_loop(
     let mut bytes: Vec<u8> = vec![0; 4800 * block_align];
     let mut samples: Vec<f32> = Vec::with_capacity(4800 * 2);
     let mut last_exit_check = Instant::now();
+    // Packets marked "data discontinuity": Windows dropped samples because we
+    // didn't read in time. Logged as a summary, never per packet.
+    let mut gaps = 0u32;
+    let mut last_gap_report = Instant::now();
     let result = loop {
         if stop.load(Ordering::Relaxed) {
             break Ok(());
+        }
+        if gaps > 0 && last_gap_report.elapsed() >= GAP_REPORT_EVERY {
+            log::debug!("game audio: samples lost {gaps} times in the last {GAP_REPORT_EVERY:?}");
+            gaps = 0;
+            last_gap_report = Instant::now();
         }
         match event.wait_for_event(100) {
             Ok(()) | Err(WasapiError::EventTimeout) => {}
@@ -294,6 +418,10 @@ fn capture_loop(
                 let n = n as usize;
                 if n == 0 {
                     return Ok(());
+                }
+                // (The flag is meaningless on the first packet after start.)
+                if info.flags.data_discontinuity && info.index != 0 {
+                    gaps += 1;
                 }
                 samples.clear();
                 if info.flags.silent {
@@ -326,6 +454,9 @@ fn capture_loop(
     };
     if let Err(e) = client.stop_stream() {
         log::debug!("stopping loopback stream: {e}");
+    }
+    if gaps > 0 {
+        log::debug!("game audio: samples lost {gaps} times in the last few seconds");
     }
     result
 }

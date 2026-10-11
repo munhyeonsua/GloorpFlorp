@@ -32,3 +32,7 @@ eframe.workspace = true
 egui.workspace = true
 directories.workspace = true
 simplelog.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# Only for the message box shown when the window can't open.
+windows = { workspace = true, features = ["Win32_UI_WindowsAndMessaging"] }

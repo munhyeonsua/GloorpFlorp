@@ -9,7 +9,7 @@ mod prio;
 #[cfg(windows)]
 mod win;
 
-pub use prio::{raise_audio_thread_priority, AudioThreadPriority};
+pub use prio::{keep_audio_thread_priority, raise_audio_thread_priority, AudioThreadPriority};
 
 use std::io::Read;
 use std::net::Ipv4Addr;
@@ -81,6 +81,21 @@ pub fn list_audio_apps() -> Vec<AudioApp> {
     let mut apps: Vec<AudioApp> = Vec::new();
     apps.sort_by_cached_key(|a| (a.exe.to_lowercase(), a.pid));
     apps
+}
+
+/// True while the focused window belongs to a program running as
+/// administrator and this app isn't: Windows then hides key presses from
+/// us, so push-to-talk can't see its key. False on any failure and on
+/// non-Windows. Cheap enough to call every few hundred ms (not per audio frame).
+pub fn foreground_is_elevated() -> bool {
+    #[cfg(windows)]
+    {
+        win::foreground_is_elevated()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 /// What to capture as "game audio".
@@ -361,6 +376,24 @@ mod tests {
         let m = list_monitors();
         assert_eq!(m, vec![Monitor::new(0, 1920, 1080, true)]);
         assert!(list_audio_apps().is_empty());
+    }
+
+    #[test]
+    fn app_list_and_foreground_check_are_quick() {
+        let t = Instant::now();
+        let apps = list_audio_apps();
+        assert!(apps.iter().all(|a| a.pid != std::process::id()));
+        assert!(apps
+            .iter()
+            .all(|a| !a.exe.eq_ignore_ascii_case("ApplicationFrameHost.exe")));
+        let mut pids: Vec<u32> = apps.iter().map(|a| a.pid).collect();
+        pids.sort_unstable();
+        pids.dedup();
+        assert_eq!(pids.len(), apps.len(), "one entry per program");
+        // Whatever has focus, this must answer (false here unless a test
+        // runner window is elevated) without blocking.
+        let _ = foreground_is_elevated();
+        assert!(t.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

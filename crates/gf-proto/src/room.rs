@@ -22,11 +22,12 @@ use std::net::Ipv4Addr;
 pub enum RoomError {
     #[error("{0} is not a Tailscale address (100.64.0.0 – 100.127.255.255)")]
     NotTailscale(Ipv4Addr),
-    #[error("a room code has 11 letters/digits, this one has {0}")]
+    #[error("a room code has 11 letters and numbers, but this one has {0}")]
     WrongLength(usize),
-    #[error("'{0}' can't appear in a room code")]
+    #[error("it contains '{0}', which isn't used in room codes")]
     BadChar(char),
-    #[error("that code has a typo in it (checksum mismatch)")]
+    /// The checksum doesn't match.
+    #[error("it has a typo in it")]
     Checksum,
 }
 
@@ -266,6 +267,19 @@ mod tests {
             RoomCode::parse("ÄBCD-EFGH-JKM"),
             Err(RoomError::BadChar('Ä'))
         );
+    }
+
+    #[test]
+    fn error_messages_are_plain() {
+        assert_eq!(
+            RoomCode::parse("ABCD-EFGH").unwrap_err().to_string(),
+            "a room code has 11 letters and numbers, but this one has 8"
+        );
+        assert_eq!(
+            RoomCode::parse("ABCD-EFGH-JKU").unwrap_err().to_string(),
+            "it contains 'U', which isn't used in room codes"
+        );
+        assert_eq!(RoomError::Checksum.to_string(), "it has a typo in it");
     }
 
     #[test]

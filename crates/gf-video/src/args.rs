@@ -329,7 +329,8 @@ pub(crate) fn advice(stderr: &str, codec: VideoCodec) -> String {
             "The NVIDIA video encoder couldn't start for {}. Update your NVIDIA graphics \
              driver (NVIDIA App or nvidia.com), restart the PC, then try again. Closing \
              other programs that record the screen (OBS, Instant Replay) can also help. \
-             If it still fails, pick another codec in Settings.",
+             If it still fails, pick another Codec under “Your screen” (H.264 works on \
+             every NVIDIA card).",
             codec.label()
         )
     } else if has(&[
@@ -563,6 +564,7 @@ mod tests {
             VideoCodec::H264,
         );
         assert!(nv.contains("Update your NVIDIA graphics driver"));
+        assert!(nv.contains("pick another Codec under “Your screen”") && !nv.contains('\n'));
         let nv = advice(
             "Driver does not support the required nvenc API version. Required: 13.0 Found: 12.1\n\
              The minimum required Nvidia driver for nvenc is 570.0 or newer",

@@ -230,10 +230,15 @@ fn two_engines_end_to_end() {
     assert!(s.my_game_audio, "{s:#?}");
 
     // Rejoin: the friend is told about the game audio again. Then the host
-    // leaves: the joiner sees the room close, the host's game audio stops.
+    // leaves: the joiner sees the room close, the host's game audio stops,
+    // and so does the joiner's own.
     join(&host, &joiner);
     wait_for(&joiner, "the host's game audio after rejoining", T, |s| {
         s.peer_game_audio && s.audio.game_jitter.received > 0
+    });
+    joiner.send(Command::StartGameAudio);
+    wait_for(&joiner, "the joiner's game audio to start", T, |s| {
+        s.my_game_audio && !s.game_audio_starting
     });
     host.send(Command::Leave);
     wait_for(&host, "the host's game audio to stop on Leave", T, |s| {
@@ -248,6 +253,13 @@ fn two_engines_end_to_end() {
             .is_some_and(|i| i.contains("closed the room")),
         "{s:#?}"
     );
+    assert!(
+        s.info
+            .as_deref()
+            .is_some_and(|i| i.contains("game audio were stopped")),
+        "{s:#?}"
+    );
+    assert!(!s.my_game_audio, "{s:#?}");
     assert_eq!(s.peer_name, None);
 
     let t = Instant::now();
@@ -258,6 +270,42 @@ fn two_engines_end_to_end() {
         "shutdown took {:?}",
         t.elapsed()
     );
+}
+
+#[test]
+fn clicking_host_again_while_the_room_opens() {
+    init();
+    // A fixed port, so the overlapping start-ups compete for it.
+    let port = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .and_then(|l| l.local_addr())
+        .map(|a| a.port())
+        .unwrap();
+    let mut host = Engine::start(
+        host_settings(),
+        EngineOptions {
+            bind_ip: Some(Ipv4Addr::LOCALHOST),
+            port: Some(port),
+            ..EngineOptions::default()
+        },
+    )
+    .expect("engine starts");
+    let mut joiner = engine("Joiner PC");
+    // Host, then New code twice before the room has opened.
+    for _ in 0..3 {
+        host.send(Command::Host);
+    }
+    // The newest room opens (on the same port) and its code works.
+    join(&host, &joiner);
+    let s = host.snapshot();
+    assert_eq!(s.listen_addr.map(|a| a.port()), Some(port), "{s:#?}");
+    assert!(
+        !s.error
+            .as_deref()
+            .is_some_and(|e| e.contains("already using port")),
+        "{s:#?}"
+    );
+    assert!(host.shutdown(Duration::from_secs(5)));
+    assert!(joiner.shutdown(Duration::from_secs(5)));
 }
 
 #[test]

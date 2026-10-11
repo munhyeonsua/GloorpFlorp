@@ -132,6 +132,11 @@ pub struct Snapshot {
     /// couldn't start at all (see `error`).
     pub audio_running: bool,
     pub audio: AudioStatus,
+    /// The game-audio capture's problem, while game audio is still on.
+    pub game_audio_note: Option<String>,
+    /// Push-to-talk is on and a program running as administrator has (or
+    /// had, in the last few seconds) focus: Windows hides the key from us.
+    pub ptt_blocked: bool,
     pub monitors: Vec<Monitor>,
     pub input_devices: Vec<String>,
     pub output_devices: Vec<String>,
@@ -141,6 +146,9 @@ pub struct Snapshot {
     /// Plain-language note (e.g. "Your friend left the room.").
     pub info: Option<String>,
 }
+
+/// Shown when no video encoder works on this PC.
+pub const NO_ENCODER: &str = "Your graphics card's video encoder didn't work, so screen sharing can't start. Update your NVIDIA driver, restart the PC, then start GloorpFlorp again.";
 
 /// Called from the engine thread whenever the snapshot changed.
 pub type ChangeCallback = Arc<dyn Fn() + Send + Sync>;

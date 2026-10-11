@@ -9,10 +9,12 @@ use eframe::egui::{
     self, Align, Color32, ComboBox, Grid, Layout, ProgressBar, RichText, Slider, TextEdit, Ui,
 };
 use gf_proto::VideoCodec;
-use gloorpflorp::engine::{Command, Engine, EngineOptions, Phase, ShareState, Snapshot};
+use gloorpflorp::engine::{
+    Command, Engine, EngineOptions, Phase, ShareState, Snapshot, NO_ENCODER,
+};
 use gloorpflorp::settings::{
-    default_bitrate_mbps, CodecChoice, GameAudioMode, Settings, VoiceModeChoice, FPS_CHOICES,
-    HEIGHT_CHOICES, MAX_BITRATE_MBPS, MIN_BITRATE_MBPS,
+    default_bitrate_mbps, default_name, CodecChoice, GameAudioMode, Settings, VoiceModeChoice,
+    FPS_CHOICES, HEIGHT_CHOICES, MAX_BITRATE_MBPS, MIN_BITRATE_MBPS,
 };
 
 const GREEN: Color32 = Color32::from_rgb(90, 200, 110);
@@ -21,6 +23,10 @@ const ORANGE: Color32 = Color32::from_rgb(240, 140, 60);
 const GREY: Color32 = Color32::from_rgb(150, 150, 150);
 const RED_BG: Color32 = Color32::from_rgb(120, 30, 30);
 const INFO: Color32 = Color32::from_rgb(140, 180, 230);
+
+const PTT_BLOCKED: &str = "The program in front runs as administrator, so Windows hides your \
+                           push-to-talk key from GloorpFlorp. Run GloorpFlorp as administrator \
+                           too, or use Voice activation.";
 
 /// Push-to-talk key capture in progress.
 struct KeyBinding {
@@ -43,6 +49,8 @@ pub struct GloorpApp {
     /// The program last picked for "Only one program" (kept while
     /// "Everything except GloorpFlorp" is selected).
     last_app: String,
+    /// The name used when "Your name" is left empty (this PC's name).
+    default_name: String,
     commands: Vec<Command>,
 }
 
@@ -80,6 +88,7 @@ impl GloorpApp {
                 GameAudioMode::AllExceptThisApp => String::new(),
             },
             settings,
+            default_name: default_name(),
             commands: Vec::new(),
         })
     }
@@ -112,13 +121,13 @@ impl GloorpApp {
                     Some(ms) => format!(" (ping {} ms)", ms.round() as u32),
                     None => String::new(),
                 };
-                (format!("Connected to {peer}{ping}"), GREEN)
+                (format!("Connected to {}{ping}", shorten(peer, 24)), GREEN)
             }
             Phase::Reconnecting => ("Reconnecting…".to_string(), ORANGE),
         };
         ui.horizontal(|ui| {
             dot(ui, color, 18.0);
-            ui.label(RichText::new(text).color(color).size(18.0).strong());
+            ui.add(egui::Label::new(RichText::new(text).color(color).size(18.0).strong()).wrap());
         });
     }
 
@@ -154,6 +163,7 @@ impl GloorpApp {
             ui.label("Your name:");
             ui.add(
                 TextEdit::singleline(&mut self.settings.name)
+                    .hint_text(self.default_name.as_str())
                     .desired_width(200.0)
                     .char_limit(40),
             )
@@ -192,6 +202,7 @@ impl GloorpApp {
                     let join = ui
                         .add_enabled(can_join, egui::Button::new("Join"))
                         .on_hover_text("Connect to your friend's room.")
+                        .on_disabled_hover_text("Paste your friend's room code first.")
                         .clicked();
                     if can_join && (join || enter) {
                         self.settings.last_code = self.join_code.trim().to_string();
@@ -201,10 +212,8 @@ impl GloorpApp {
             }
             Phase::Hosting { code, waiting } => {
                 if !waiting || code.is_empty() {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label("Opening a room…");
-                    });
+                    // The status line says "Opening a room…".
+                    ui.spinner();
                 } else {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(&code).monospace().size(28.0).strong());
@@ -242,10 +251,8 @@ impl GloorpApp {
                 });
             }
             Phase::Joining => {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label("Connecting to your friend's PC…");
-                });
+                // The status line says "Connecting to your friend…".
+                ui.spinner();
                 if ui
                     .button("Cancel")
                     .on_hover_text("Stop trying to join.")
@@ -273,7 +280,7 @@ impl GloorpApp {
                 }
             }
             Phase::Reconnecting => {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.spinner();
                     ui.label("The connection dropped. Trying to reconnect for up to 30 seconds…");
                 });
@@ -296,6 +303,11 @@ impl GloorpApp {
         ui.heading("Your screen");
         let snap = &self.snap;
         let s = &mut self.settings;
+        let no_encoder =
+            snap.video_available && !snap.probing_encoders && snap.my_encoders.is_empty();
+        if no_encoder {
+            ui.label(RichText::new(NO_ENCODER).color(ORANGE));
+        }
         let monitor = snap.monitors.iter().find(|m| m.index == s.monitor).cloned();
         // Pick a monitor that exists (e.g. after unplugging one).
         if monitor.is_none() {
@@ -376,6 +388,7 @@ impl GloorpApp {
             let auto_label = match (snap.probing_encoders, snap.my_encoders.first()) {
                 (true, _) => "Auto (checking your graphics card…)".to_string(),
                 (false, Some(c)) => format!("Auto (best available: {})", c.label()),
+                (false, None) if no_encoder => "Auto (no working video encoder found)".to_string(),
                 (false, None) => "Auto (best available)".to_string(),
             };
             let label = |c: CodecChoice| match c {
@@ -391,11 +404,14 @@ impl GloorpApp {
                             None => true,
                             Some(codec) => !probed || snap.my_encoders.contains(&codec),
                         };
+                        let why = if c == CodecChoice::Av1 {
+                            "Your graphics card can't send this format. AV1 needs an RTX 40 series or newer."
+                        } else {
+                            "Your graphics card can't send this format."
+                        };
                         let r = ui
                             .add_enabled(available, egui::Button::selectable(s.codec == c, label(c)))
-                            .on_disabled_hover_text(
-                                "Your graphics card can't encode this format (AV1 needs an RTX 40 series or newer).",
-                            );
+                            .on_disabled_hover_text(why);
                         if r.clicked() {
                             s.codec = c;
                         }
@@ -444,31 +460,36 @@ impl GloorpApp {
                     self.commands.push(Command::StopSharing);
                 }
             } else {
+                let why_not = if snap.video_available {
+                    "No working video encoder was found on your graphics card. Update your NVIDIA \
+                     driver, restart the PC, then start GloorpFlorp again."
+                } else {
+                    "FFmpeg is missing, so screen sharing doesn't work. Extract the whole GloorpFlorp zip again."
+                };
                 let r = ui
                     .add_enabled(
-                        snap.video_available,
+                        snap.video_available && !no_encoder,
                         egui::Button::new(RichText::new("Start sharing").size(16.0)),
                     )
                     .on_hover_text(
                         "Show your whole monitor to your friend. You can start before they join.",
                     )
-                    .on_disabled_hover_text("FFmpeg is missing, so screen sharing doesn't work. Extract the whole GloorpFlorp zip again.");
+                    .on_disabled_hover_text(why_not);
                 if r.clicked() {
                     self.commands.push(Command::StartSharing);
                 }
             }
         });
-        let connected = matches!(snap.phase, Phase::Connected { .. });
         let status = match snap.my_share {
             ShareState::Off => "Not sharing.".to_string(),
             ShareState::Waiting | ShareState::Starting => "Starting…".to_string(),
             ShareState::Live(i) => {
-                let who = if !connected {
-                    "waiting for your friend to join"
-                } else if snap.peer_watching {
-                    "friend is watching"
-                } else {
-                    "friend's viewer is closed"
+                let who = match snap.phase {
+                    Phase::Connected { .. } if snap.peer_watching => "friend is watching",
+                    Phase::Connected { .. } => "friend's viewer is closed",
+                    Phase::Hosting { .. } => "waiting for your friend to join",
+                    Phase::Reconnecting => "reconnecting",
+                    Phase::Idle | Phase::Joining => "not connected to anyone yet",
                 };
                 format!(
                     "Sharing {} {}×{} @ {} fps, {who}",
@@ -505,7 +526,7 @@ impl GloorpApp {
              GloorpFlorp's own, so your friend never hears themselves. If you're also in a \
              Discord call together, use \"Only one program\" instead.",
         );
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let only_one = matches!(s.game_audio, GameAudioMode::App { .. });
             if ui
                 .radio(only_one, "Only one program")
@@ -582,7 +603,8 @@ impl GloorpApp {
                 )
                 .on_hover_text("Your friend hears the sound chosen above. You keep hearing it too.")
                 .on_disabled_hover_text(
-                    "Sound is still starting, or isn't working (see the message above).",
+                    "Sound is still starting (a few seconds after GloorpFlorp opens). \
+                     If this stays greyed out, sound couldn't start: restart GloorpFlorp.",
                 )
                 .clicked()
             {
@@ -596,6 +618,9 @@ impl GloorpApp {
         } else {
             "Not sending game audio."
         });
+        if let Some(note) = &snap.game_audio_note {
+            ui.label(RichText::new(note).color(ORANGE));
+        }
         if refresh {
             self.commands.push(Command::RefreshLists);
         }
@@ -689,7 +714,11 @@ impl GloorpApp {
             ui.label("How your microphone sends:");
             ui.horizontal(|ui| {
                 ui.radio_value(&mut a.voice_mode, VoiceModeChoice::PushToTalk, "Push-to-talk")
-                    .on_hover_text("Your voice is sent only while you hold a key. Works while the game has focus.");
+                    .on_hover_text(
+                        "Your voice is sent only while you hold a key. Works while the game has \
+                         focus, unless the game runs as administrator; then run GloorpFlorp as \
+                         administrator too, or use Voice activation.",
+                    );
                 ui.radio_value(&mut a.voice_mode, VoiceModeChoice::VoiceActivity, "Voice activation")
                     .on_hover_text("Sends when you speak.");
                 ui.radio_value(&mut a.voice_mode, VoiceModeChoice::AlwaysOn, "Always on")
@@ -697,7 +726,7 @@ impl GloorpApp {
             });
             match a.voice_mode {
                 VoiceModeChoice::PushToTalk => {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label("Push-to-talk key:");
                         if self.binding.is_some() {
                             ui.label(
@@ -719,6 +748,9 @@ impl GloorpApp {
                             start_binding = true;
                         }
                     });
+                    if snap.ptt_blocked {
+                        ui.label(RichText::new(PTT_BLOCKED).color(ORANGE));
+                    }
                 }
                 VoiceModeChoice::VoiceActivity => {
                     ui.horizontal(|ui| {
@@ -835,7 +867,11 @@ impl GloorpApp {
                 };
                 Grid::new("details").num_columns(2).striped(true).show(ui, |ui| {
                     ui.label("Ping").on_hover_text("Round trip time between the PCs. Under about 50 ms is great.");
-                    ui.label(n.rtt_ms.map_or("-".to_string(), |ms| format!("{ms:.0} ms")));
+                    ui.label(
+                        n.rtt_ms
+                            .filter(|_| n.connected)
+                            .map_or("-".to_string(), |ms| format!("{ms:.0} ms")),
+                    );
                     ui.end_row();
                     ui.label("Bitrates: video").on_hover_text("How much video is being sent and received.");
                     ui.label(format!(

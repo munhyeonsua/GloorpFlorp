@@ -16,8 +16,9 @@ use gf_video::{EncoderEvent, EncoderSettings, Tools, Viewer};
 
 use super::{
     first_paragraph, lock, Command, EngineOptions, Phase, ShareInfo, ShareState, Snapshot,
+    NO_ENCODER,
 };
-use crate::settings::{GameAudioMode, Settings};
+use crate::settings::{GameAudioMode, Settings, VoiceModeChoice};
 
 const TICK: Duration = Duration::from_millis(100);
 /// Settings are written this long after the last change.
@@ -31,9 +32,14 @@ const REBIND_WINDOW: Duration = Duration::from_secs(5);
 const VIEWER_EARLY_CLOSE: Duration = Duration::from_secs(2);
 /// Game audio is considered dead after the capture reports a problem this long.
 const GAME_DEAD_AFTER: Duration = Duration::from_secs(1);
+/// How often to check whether an elevated program has focus (a few cheap
+/// system calls; only with push-to-talk).
+const ELEVATED_CHECK: Duration = Duration::from_millis(500);
+/// How long the "runs as administrator" hint stays after that program
+/// lost focus.
+const ELEVATED_HINT_HOLD: Duration = Duration::from_secs(10);
 
 const TAILSCALE_MISSING: &str = "Tailscale isn't running or isn't signed in on this PC. Open Tailscale, sign in, then click Host again.";
-const NO_ENCODER: &str = "Your graphics card's video encoder didn't work, so screen sharing can't start. Update your NVIDIA driver, restart the PC, then start GloorpFlorp again.";
 const NO_AUDIO: &str = "Sound isn't working in GloorpFlorp right now, so game audio can't be sent. Restart GloorpFlorp, then try again.";
 const GAME_AUDIO_DIED: &str = "Game audio stopped by itself (the program you picked may have closed). Choose what to send under \"Game audio\", then click Start sending game audio again.";
 
@@ -68,14 +74,25 @@ enum Internal {
     GameAudioReady {
         gen: u64,
         result: Result<(), String>,
+        /// The running programs, when the audio thread looked them up.
+        apps: Option<Vec<AudioApp>>,
     },
+}
+
+/// What to send as game audio, as chosen in the settings.
+#[derive(Debug)]
+enum GameSource {
+    AllExceptThisApp,
+    /// A program by exe name, looked up on the audio thread (listing
+    /// windows can wait on unresponsive programs).
+    Program(String),
 }
 
 /// Work for the audio thread: starting audio and starting or stopping game
 /// audio can each block for seconds, so they never run on the engine thread.
 /// Jobs run one at a time, in order.
 enum AudioJob {
-    StartGame { gen: u64, source: GameAudioSource },
+    StartGame { gen: u64, source: GameSource },
     StopGame,
 }
 
@@ -112,9 +129,8 @@ fn audio_thread(
         }
         match job {
             AudioJob::StartGame { gen, source } => {
-                log::info!("starting game audio from {source:?}");
-                let result = audio.start_game_audio(source).map_err(|e| e.to_string());
-                let _ = tx.send(Internal::GameAudioReady { gen, result });
+                let (result, apps) = start_game_audio(&audio, source);
+                let _ = tx.send(Internal::GameAudioReady { gen, result, apps });
             }
             AudioJob::StopGame => {
                 audio.stop_game_audio();
@@ -122,6 +138,34 @@ fn audio_thread(
             }
         }
     }
+}
+
+/// Finds the chosen program and starts (or switches) the capture. Also
+/// returns the fresh program list when it had to look.
+fn start_game_audio(
+    audio: &AudioEngine,
+    source: GameSource,
+) -> (Result<(), String>, Option<Vec<AudioApp>>) {
+    let (source, apps) = match source {
+        GameSource::AllExceptThisApp => (GameAudioSource::AllExceptThisApp, None),
+        GameSource::Program(exe) => {
+            let apps = gf_sys::list_audio_apps();
+            match apps.iter().find(|a| a.exe.eq_ignore_ascii_case(&exe)) {
+                Some(a) => (GameAudioSource::Process { pid: a.pid }, Some(apps)),
+                None => {
+                    // Don't leave a capture of the previous choice running.
+                    audio.stop_game_audio();
+                    let msg = format!("{exe} isn't running. Start it, click Refresh next to the program list, pick it, then click Start sending game audio again.");
+                    return (Err(msg), Some(apps));
+                }
+            }
+        }
+    };
+    log::info!("starting game audio from {source:?}");
+    (
+        audio.start_game_audio(source).map_err(|e| e.to_string()),
+        apps,
+    )
 }
 
 /// Drops `value` (stopping a child process, a session, ...) on a helper
@@ -167,6 +211,8 @@ struct Core {
     net_rx: Receiver<NetEvent>,
     /// Bumped for every new session, so a late host start-up is discarded.
     session_gen: u64,
+    /// Host start-ups still running (a discarded one may hold the port).
+    host_starts: usize,
     hosting: bool,
     last_close: Option<Instant>,
 
@@ -191,6 +237,10 @@ struct Core {
     /// Since when the game-audio capture has been reported not running
     /// while it should be.
     game_dead_since: Option<Instant>,
+    /// When to next check whether an elevated program has focus.
+    elevated_check_at: Instant,
+    /// When an elevated program last had focus (with push-to-talk on).
+    elevated_seen: Option<Instant>,
 
     save_at: Option<Instant>,
     fps_at: Instant,
@@ -223,6 +273,7 @@ pub(super) fn run(
         net: None,
         net_rx: never(),
         session_gen: 0,
+        host_starts: 0,
         hosting: false,
         last_close: None,
         encoder: None,
@@ -236,6 +287,8 @@ pub(super) fn run(
         viewer_for: None,
         viewer_declined: false,
         game_dead_since: None,
+        elevated_check_at: Instant::now(),
+        elevated_seen: None,
         save_at: None,
         fps_at: Instant::now(),
         fps_sent: 0,
@@ -470,9 +523,12 @@ impl Core {
             encoders: self.snap.my_encoders.clone(),
         };
         let retry_until = self.last_close.map(|t| t + REBIND_WINDOW);
+        // An older start-up (now discarded) may be about to take the port.
+        let overlap = self.host_starts > 0;
+        self.host_starts += 1;
         let tx = self.internal_tx.clone();
         spawn_helper("host-start", move || {
-            let result = start_host(cfg, bind_override, retry_until);
+            let result = start_host(cfg, bind_override, retry_until, overlap);
             // If the engine is gone, this drops (closes) the new session.
             let _ = tx.send(Internal::HostReady { gen, result });
         });
@@ -875,26 +931,34 @@ impl Core {
     // ------------------------------------------------------------ game audio
 
     /// The capture source for the game-audio setting, or a plain error.
-    fn game_audio_source(&mut self) -> Result<GameAudioSource, String> {
+    fn game_audio_source(&self) -> Result<GameSource, String> {
         match &self.settings.game_audio {
-            GameAudioMode::AllExceptThisApp => Ok(GameAudioSource::AllExceptThisApp),
+            GameAudioMode::AllExceptThisApp => Ok(GameSource::AllExceptThisApp),
             GameAudioMode::App { exe } if exe.trim().is_empty() => {
                 Err("Choose the program to send under \"Game audio\" first.".into())
             }
-            GameAudioMode::App { exe } => {
-                let exe = exe.clone();
-                let apps = gf_sys::list_audio_apps();
-                let found = apps
-                    .iter()
-                    .find(|a| a.exe.eq_ignore_ascii_case(&exe))
-                    .map(|a| a.pid);
-                self.snap.audio_apps = apps;
-                found.map(|pid| GameAudioSource::Process { pid }).ok_or_else(|| {
-                    format!(
-                        "{exe} isn't running. Start it, click Refresh next to the program list, pick it, then click Start again."
-                    )
-                })
+            GameAudioMode::App { exe } => Ok(GameSource::Program(exe.clone())),
+        }
+    }
+
+    /// Push-to-talk can't see its key while a program running as
+    /// administrator has focus. Remembered for a few seconds, so the hint is
+    /// still there after switching back to GloorpFlorp's window.
+    fn check_ptt_blocked(&mut self, now: Instant) {
+        let ptt = self.settings.audio.voice_mode == VoiceModeChoice::PushToTalk;
+        if ptt && gf_sys::foreground_is_elevated() {
+            self.elevated_seen = Some(now);
+        }
+        let blocked = ptt
+            && self
+                .elevated_seen
+                .is_some_and(|t| now.duration_since(t) < ELEVATED_HINT_HOLD);
+        if blocked != self.snap.ptt_blocked {
+            if blocked {
+                log::info!("an elevated program has focus: push-to-talk can't see its key");
             }
+            self.snap.ptt_blocked = blocked;
+            self.urgent = true;
         }
     }
 
@@ -1039,6 +1103,7 @@ impl Core {
                 }
             }
             Internal::HostReady { gen, result } => {
+                self.host_starts = self.host_starts.saturating_sub(1);
                 if gen != self.session_gen {
                     if let Ok(h) = result {
                         dispose("old room", h.net);
@@ -1097,9 +1162,15 @@ impl Core {
                 if self.game_audio != GameAudio::Off {
                     self.set_game_audio(GameAudio::Off);
                 }
-                self.error(msg);
+                self.error(format!(
+                    "Voice chat couldn't start ({}). Restart GloorpFlorp. If it keeps happening, send your log file.",
+                    msg.trim().trim_end_matches('.')
+                ));
             }
-            Internal::GameAudioReady { gen, result } => {
+            Internal::GameAudioReady { gen, result, apps } => {
+                if let Some(apps) = apps {
+                    self.snap.audio_apps = apps;
+                }
                 if gen == self.game_gen {
                     self.game_audio_started(result);
                 }
@@ -1121,9 +1192,10 @@ impl Core {
                 seq,
                 ts,
                 payload,
+                arrived,
             } => {
                 if let Some(a) = &self.audio {
-                    a.receive(stream, seq, ts, payload);
+                    a.receive_at(stream, seq, ts, payload, arrived);
                 }
             }
             NetEvent::Stats(stats) => self.snap.net = stats,
@@ -1175,9 +1247,10 @@ impl Core {
                 let was_reconnecting = self.snap.phase == Phase::Reconnecting;
                 self.peer_gone();
                 if will_retry {
-                    // Keep sharing and game audio; they're announced again on reconnect.
+                    // Keep sharing and game audio; they're announced again on
+                    // reconnect. (The UI says it is reconnecting.)
                     self.snap.phase = Phase::Reconnecting;
-                    self.info(format!("{reason} Trying to reconnect…"));
+                    self.info(reason);
                 } else if self.hosting {
                     // The host can't tell a network blip from leaving, so its
                     // sharing and game audio keep running (like before the
@@ -1193,10 +1266,18 @@ impl Core {
                     ));
                 } else {
                     // The joiner's session is over for good.
+                    let had_media =
+                        self.snap.my_share != ShareState::Off || self.game_audio != GameAudio::Off;
                     self.stop_local_media();
                     self.close_net();
                     self.snap.phase = Phase::Idle;
                     self.snap.net = Default::default();
+                    self.snap.info = None;
+                    let reason = if had_media {
+                        format!("{reason} Your screen sharing and game audio were stopped.")
+                    } else {
+                        reason
+                    };
                     if was_reconnecting {
                         self.error(reason);
                     } else {
@@ -1205,14 +1286,17 @@ impl Core {
                 }
             }
             NetEvent::Rejected { reason } | NetEvent::Error(reason) => {
-                // Only a joiner's first attempt ends like this; local
-                // sharing (started before joining) continues.
+                // A joiner's first attempt, or a host whose network went
+                // away. Local sharing and game audio continue.
                 self.session_gen += 1;
                 self.close_net();
                 self.peer_gone();
                 self.hosting = false;
                 self.snap.phase = Phase::Idle;
+                self.snap.room_code = None;
+                self.snap.listen_addr = None;
                 self.snap.net = Default::default();
+                self.snap.info = None;
                 self.error(reason);
             }
         }
@@ -1239,11 +1323,19 @@ impl Core {
                 self.close_viewer();
             }
             TcpMsg::Watching { on } => {
+                // An answer to a share that has stopped since.
+                if on && !self.share_announced {
+                    log::debug!("ignoring Watching from the friend: not sharing");
+                    return;
+                }
                 log::info!("friend {} watching", if on { "started" } else { "stopped" });
-                self.snap.peer_watching = on;
-                if on {
+                // Only a newly opened viewer needs a keyframe; the friend
+                // also confirms (again) after each encoder restart, which
+                // already starts at one.
+                if on && !self.snap.peer_watching {
                     self.need_keyframe = true;
                 }
+                self.snap.peer_watching = on;
             }
             TcpMsg::GameAudio { active } => {
                 log::info!("friend's game audio: {}", if active { "on" } else { "off" });
@@ -1261,17 +1353,31 @@ impl Core {
         if let Some(a) = &self.audio {
             self.snap.audio = a.status();
         }
+        // (The audio engine keeps reporting a failed capture until the audio
+        // thread has dropped it.)
+        self.snap.game_audio_note = self
+            .snap
+            .audio
+            .game_error
+            .clone()
+            .filter(|_| self.game_audio == GameAudio::On);
         // A capture that reports a problem (e.g. the chosen program exited)
         // has stopped for good: tell the user and the friend.
         if self.game_audio == GameAudio::On && !self.snap.audio.game_capturing {
             let since = *self.game_dead_since.get_or_insert(now);
             if now.duration_since(since) >= GAME_DEAD_AFTER {
-                log::warn!("game audio capture stopped: {:?}", self.snap.audio.error);
+                let msg = self.snap.audio.game_error.clone();
+                log::warn!("game audio capture stopped: {msg:?}");
                 self.stop_game_audio(true);
-                self.error(GAME_AUDIO_DIED);
+                self.snap.game_audio_note = None;
+                self.error(msg.unwrap_or_else(|| GAME_AUDIO_DIED.into()));
             }
         } else {
             self.game_dead_since = None;
+        }
+        if now >= self.elevated_check_at {
+            self.elevated_check_at = now + ELEVATED_CHECK;
+            self.check_ptt_blocked(now);
         }
         let secs = now.duration_since(self.fps_at).as_secs_f32();
         if secs >= 1.0 {
@@ -1295,10 +1401,16 @@ impl Core {
 
 /// Finds the address, makes the room code and opens the port (on a helper
 /// thread: the Tailscale lookup can take seconds).
+///
+/// `retry_until`: keep trying until then (the previous room's port may still
+/// be closing). `overlap`: another start-up was still running, so keep
+/// trying for a while after the lookup too (its room is closed as soon as
+/// it reports back).
 fn start_host(
     mut cfg: NetConfig,
     bind_override: Option<Ipv4Addr>,
     retry_until: Option<Instant>,
+    overlap: bool,
 ) -> Result<HostStarted, String> {
     let ip = match bind_override {
         Some(ip) => ip,
@@ -1315,6 +1427,7 @@ fn start_host(
     };
     cfg.role = Role::Host { bind_ip: ip };
     cfg.secret = code.secret;
+    let retry_until = retry_until.max(overlap.then(|| Instant::now() + REBIND_WINDOW));
     loop {
         match gf_net::start(cfg.clone()) {
             Ok(net) => {

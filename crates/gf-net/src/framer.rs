@@ -37,14 +37,20 @@ impl Framer {
     /// times out / would block (`Ok(None)`, partial bytes are kept).
     /// End of stream is an `UnexpectedEof` I/O error.
     pub fn poll(&mut self, r: &mut impl Read) -> Result<Option<TcpMsg>, WireError> {
+        match self.poll_body(r)? {
+            Some(body) => decode_tcp_body(&body).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Like [`Framer::poll`], but returns the undecoded message body.
+    pub fn poll_body(&mut self, r: &mut impl Read) -> Result<Option<Vec<u8>>, WireError> {
         loop {
             if self.in_body && self.body_got == self.body.len() {
-                let msg = decode_tcp_body(&self.body);
                 self.in_body = false;
                 self.hdr_got = 0;
-                self.body = Vec::new();
                 self.body_got = 0;
-                return msg.map(Some);
+                return Ok(Some(std::mem::take(&mut self.body)));
             }
             let res = if self.in_body {
                 r.read(&mut self.body[self.body_got..])

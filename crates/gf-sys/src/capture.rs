@@ -32,7 +32,7 @@ where
             };
             let result = std::panic::catch_unwind(AssertUnwindSafe(|| body(&stop, &ready)))
                 .unwrap_or_else(|_| {
-                    Err("Game-audio capture stopped unexpectedly. Turn game audio off and on again.".to_string())
+                    Err("Game-audio capture stopped unexpectedly. Click Start sending game audio to try again, or restart GloorpFlorp.".to_string())
                 });
             match result {
                 Ok(()) => log::info!("game-audio capture stopped"),

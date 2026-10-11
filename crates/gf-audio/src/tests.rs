@@ -180,6 +180,7 @@ fn fake_game_audio_flows_and_restarts() {
     }
     let st = engine.status();
     assert!(st.game_capturing && st.game_level > 0.3, "{st:?}");
+    assert_eq!((st.error, st.game_error), (None, None));
 
     // Decodes as stereo 440 Hz on the other side.
     for p in &packets {

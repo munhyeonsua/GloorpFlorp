@@ -17,6 +17,10 @@ pub const MAX_TCP_MSG: usize = 16 * 1024 * 1024;
 pub const UDP_MAGIC: u8 = 0x47;
 pub const UDP_HEADER_LEN: usize = 12;
 
+/// Frozen across versions: `Hello` stays the first variant with `version` as
+/// its first field (see [`hello_version`]), and `Reject` stays the third
+/// variant with only `reason`, so two different versions can always tell
+/// each other so. New variants go at the end.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum TcpMsg {
     /// Joiner -> host, first message.
@@ -112,6 +116,23 @@ pub fn decode_tcp_body(body: &[u8]) -> Result<TcpMsg, WireError> {
             rest.len()
         ))),
         Err(e) => Err(WireError::Malformed(e.to_string())),
+    }
+}
+
+/// The frozen start of every `Hello`, past and future.
+#[derive(Deserialize)]
+enum HelloHead {
+    Hello { version: u16 },
+}
+
+/// The protocol version from a `Hello` message body, reading only its
+/// frozen start, so a `Hello` from another version whose later fields differ
+/// still gets a "different version" answer. `None` if the body doesn't start
+/// like a `Hello`.
+pub fn hello_version(body: &[u8]) -> Option<u16> {
+    match postcard::take_from_bytes::<HelloHead>(body) {
+        Ok((HelloHead::Hello { version }, _)) => Some(version),
+        Err(_) => None,
     }
 }
 
@@ -314,6 +335,24 @@ mod tests {
         body.pop();
         body.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0x0f]);
         assert!(decode_tcp_body(&body).is_err());
+    }
+
+    #[test]
+    fn hello_version_reads_only_the_frozen_start() {
+        let hello = &all_msgs()[0];
+        let body = &encode_tcp(hello)[4..];
+        assert_eq!(hello_version(body), Some(crate::PROTOCOL_VERSION));
+        // A future Hello with other fields after `version`.
+        let mut future = vec![0u8];
+        future.extend_from_slice(&postcard::to_stdvec(&700u16).unwrap());
+        future.extend_from_slice(&[0xff; 9]);
+        assert!(decode_tcp_body(&future).is_err());
+        assert_eq!(hello_version(&future), Some(700));
+        for other in &all_msgs()[1..] {
+            assert_eq!(hello_version(&encode_tcp(other)[4..]), None, "{other:?}");
+        }
+        assert_eq!(hello_version(&[]), None);
+        assert_eq!(hello_version(&[0]), None);
     }
 
     #[test]

@@ -78,10 +78,8 @@ impl Incoming {
 pub(crate) struct PlayoutCore {
     shared: Arc<Shared>,
     generation: u64,
-    voice_dec: OpusDecoder,
-    game_dec: OpusDecoder,
-    voice: Vec<f32>,
-    game: Vec<f32>,
+    voice: Decoded,
+    game: Decoded,
     meter: LevelMeter,
     talking_hold: u32,
 }
@@ -91,10 +89,8 @@ impl PlayoutCore {
         Ok(PlayoutCore {
             generation: shared.incoming.generation(),
             shared,
-            voice_dec: OpusDecoder::new(1)?,
-            game_dec: OpusDecoder::new(2)?,
-            voice: vec![0.0; AUDIO_FRAME_SAMPLES],
-            game: vec![0.0; AUDIO_FRAME_SAMPLES * 2],
+            voice: Decoded::new(AudioStream::Voice, 1)?,
+            game: Decoded::new(AudioStream::Game, 2)?,
             meter: LevelMeter::default(),
             talking_hold: 0,
         })
@@ -106,26 +102,16 @@ impl PlayoutCore {
         let generation = self.shared.incoming.generation();
         if generation != self.generation {
             self.generation = generation;
-            self.voice_dec.reset();
-            self.game_dec.reset();
+            self.voice.reset();
+            self.game.reset();
             self.meter.reset();
             self.talking_hold = 0;
         }
         let incoming = &self.shared.incoming;
-        pull(
-            incoming,
-            AudioStream::Voice,
-            &mut self.voice_dec,
-            &mut self.voice,
-        );
-        pull(
-            incoming,
-            AudioStream::Game,
-            &mut self.game_dec,
-            &mut self.game,
-        );
+        self.voice.pull(incoming);
+        self.game.pull(incoming);
 
-        let level = rms_dbfs(&self.voice);
+        let level = rms_dbfs(&self.voice.pcm);
         if level > TALKING_DBFS {
             self.talking_hold = TALKING_HOLD_FRAMES;
         } else {
@@ -135,18 +121,102 @@ impl PlayoutCore {
         meters.peer_voice_level.store(self.meter.update(level));
         meters.peer_talking.store(self.talking_hold > 0, Relaxed);
 
-        mixer::mix(&self.voice, &self.game, mix, out);
+        mixer::mix(&self.voice.pcm, &self.game.pcm, mix, out);
     }
 }
 
-fn pull(incoming: &Incoming, stream: AudioStream, dec: &mut OpusDecoder, out: &mut [f32]) {
-    match incoming.pop(stream) {
-        Pop::Frame(packet) => {
-            dec.decode(&packet, out);
+/// One incoming stream's decoder and its latest 10 ms of sound.
+struct Decoded {
+    stream: AudioStream,
+    channels: usize,
+    dec: OpusDecoder,
+    /// The latest frame, interleaved.
+    pcm: Vec<f32>,
+    /// How the previous frame would have gone on, to cross-fade from when
+    /// the jitter buffer skips ahead.
+    tail: Vec<f32>,
+    /// The previous frame was sound (not silence).
+    playing: bool,
+}
+
+impl Decoded {
+    fn new(stream: AudioStream, channels: usize) -> anyhow::Result<Decoded> {
+        Ok(Decoded {
+            stream,
+            channels,
+            dec: OpusDecoder::new(channels)?,
+            pcm: vec![0.0; AUDIO_FRAME_SAMPLES * channels],
+            tail: vec![0.0; AUDIO_FRAME_SAMPLES * channels],
+            playing: false,
+        })
+    }
+
+    fn reset(&mut self) {
+        self.dec.reset();
+        self.playing = false;
+    }
+
+    /// Decodes the next 10 ms into `pcm`.
+    fn pull(&mut self, incoming: &Incoming) {
+        let mut pop = incoming.pop(self.stream);
+        let mut splice = false;
+        while let Pop::Skip(skipped) = pop {
+            // Skipping ahead to cut the delay. Cross-fade from how the last
+            // frame would have continued, and run the decoder over the
+            // skipped packet so the next one decodes cleanly.
+            if self.playing && !splice {
+                self.dec.conceal(&mut self.tail);
+                splice = true;
+            }
+            self.dec.decode(&skipped, &mut self.pcm);
+            pop = incoming.pop(self.stream);
         }
-        Pop::Lost { next: Some(next) } => dec.decode_fec(&next, out),
-        Pop::Lost { next: None } => dec.conceal(out),
-        Pop::Empty => out.fill(0.0),
+        match pop {
+            Pop::Frame(packet) => {
+                self.dec.decode(&packet, &mut self.pcm);
+            }
+            Pop::Lost { next: Some(next) } => self.dec.decode_fec(&next, &mut self.pcm),
+            Pop::Lost { next: None } => self.dec.conceal(&mut self.pcm),
+            // (`Skip` can't be left here; the loop above took them all.)
+            Pop::Empty | Pop::Skip(_) => {
+                if self.playing {
+                    // The stream stopped: fade out instead of cutting off.
+                    self.dec.conceal(&mut self.pcm);
+                    fade_out(&mut self.pcm, self.channels);
+                } else {
+                    self.pcm.fill(0.0);
+                }
+                self.playing = false;
+                return;
+            }
+        }
+        if splice {
+            cross_fade(&self.tail, &mut self.pcm, self.channels);
+        }
+        self.playing = true;
+    }
+}
+
+/// Length of the cross-fade over a skip, in samples per channel (5 ms).
+const SPLICE_SAMPLES: usize = AUDIO_FRAME_SAMPLES / 2;
+
+/// Fades `frame` (interleaved) from full level to silence.
+fn fade_out(frame: &mut [f32], channels: usize) {
+    let n = (frame.len() / channels) as f32;
+    for (i, f) in frame.chunks_mut(channels).enumerate() {
+        let gain = 1.0 - (i + 1) as f32 / n;
+        f.iter_mut().for_each(|s| *s *= gain);
+    }
+}
+
+/// Blends the start of `to` in from `from` (both interleaved).
+fn cross_fade(from: &[f32], to: &mut [f32], channels: usize) {
+    let frames = to.chunks_mut(channels).zip(from.chunks(channels));
+    for (i, (t, f)) in frames.take(SPLICE_SAMPLES).enumerate() {
+        let w = (i + 1) as f32 / (SPLICE_SAMPLES + 1) as f32;
+        for (t, &f) in t.iter_mut().zip(f) {
+            *t = f * (1.0 - w) + *t * w;
+        }
     }
 }
 
@@ -373,6 +443,80 @@ mod tests {
             "talking for {talking} frames"
         );
         assert!(!shared.meters.peer_talking.load(Relaxed));
+    }
+
+    /// Largest jump between neighbouring samples of the left channel. A
+    /// 440 Hz tone at 0.3 moves at most ~0.017 per sample; a click is far more.
+    fn max_step(stereo: &[f32]) -> f32 {
+        let left: Vec<f32> = stereo.iter().step_by(2).copied().collect();
+        left.windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0, f32::max)
+    }
+
+    /// Plays a 440 Hz voice tone, one packet per 10 ms tick, except that
+    /// `arrivals(tick)` says how many packets arrive at that tick.
+    fn play(ticks: u64, arrivals: impl Fn(u64) -> usize) -> (Arc<Shared>, Vec<Vec<f32>>) {
+        let (shared, mut core) = setup();
+        let packets = voice_packets(440.0, 400);
+        let t0 = Instant::now();
+        let mut out = vec![0f32; AUDIO_FRAME_SAMPLES * 2];
+        let mut frames = Vec::new();
+        let mut next = 0;
+        for tick in 0..ticks {
+            let now = t0 + Duration::from_millis(tick * 10);
+            for _ in 0..arrivals(tick) {
+                let p = packets[next].clone();
+                shared
+                    .incoming
+                    .push(AudioStream::Voice, next as u16, p, now);
+                next += 1;
+            }
+            core.render(MixParams::default(), &mut out);
+            frames.push(out.clone());
+        }
+        (shared, frames)
+    }
+
+    #[test]
+    fn stall_is_concealed_and_the_end_fades_out() {
+        // Packets 50..53 are held up for 30 ms; the stream ends after 100.
+        let (shared, frames) = play(160, |tick| match tick {
+            50..=52 => 0,
+            53 => 4,
+            0..100 => 1,
+            _ => 0,
+        });
+        let stats = shared.incoming.stats().0;
+        assert_eq!((stats.lost, stats.late_dropped), (0, 0), "{stats:?}");
+        // The tone carries on through the stall (concealed, not silent).
+        for (i, f) in frames[20..100].iter().enumerate() {
+            assert!(rms(f) > 0.05, "frame {} rms {}", i + 20, rms(f));
+        }
+        // No clicks anywhere, including where the stream ends...
+        let all: Vec<f32> = frames[20..].concat();
+        assert!(max_step(&all) < 0.025, "step {}", max_step(&all));
+        // ...and then silence.
+        assert!(frames[115..].iter().flatten().all(|&s| s == 0.0));
+    }
+
+    #[test]
+    fn skipping_ahead_is_cross_faded() {
+        // A burst of packets arrives at once: the jitter buffer skips ahead.
+        // (Without the cross-fade these jumps click with steps of 0.3-0.5.)
+        for (at, burst) in [(60, 5), (61, 8), (62, 12)] {
+            let (shared, frames) = play(150, |tick| if tick == at { burst } else { 1 });
+            let stats = shared.incoming.stats().0;
+            assert!(stats.late_dropped > 0, "{stats:?}");
+            let all: Vec<f32> = frames[20..].concat();
+            assert!(
+                max_step(&all) < 0.025,
+                "burst {burst}: step {}",
+                max_step(&all)
+            );
+            let hz = zero_crossing_hz(&all, 2, AUDIO_SAMPLE_RATE);
+            assert!((hz - 440.0).abs() < 10.0, "{hz} Hz");
+        }
     }
 
     #[test]

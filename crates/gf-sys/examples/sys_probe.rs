@@ -17,6 +17,10 @@ fn main() {
     for a in gf_sys::list_audio_apps() {
         println!("app: {:>6} {:<30} {}", a.pid, a.exe, a.title);
     }
+    println!(
+        "focused window runs as administrator (keys hidden from us): {}",
+        gf_sys::foreground_is_elevated()
+    );
     for vk in [0x05, 0x06, 0x56, 0x14, 0xC0, 0xE2, 0xE5] {
         println!("key {vk:#04x}: {}", gf_sys::keys::name(vk));
     }

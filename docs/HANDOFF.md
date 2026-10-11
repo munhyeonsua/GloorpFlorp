@@ -96,6 +96,52 @@ FFmpeg).
   so the default microphone is used instead") are shown in orange under
   "Voice", not in the red error banner.
 
+### Review fixes
+
+- **Audio thread priority:** cpal's stream threads raise their own priority
+  (MMCSS) on their first callback via `gf_sys::keep_audio_thread_priority`.
+- **Jitter and playout:** a dry buffer conceals for up to 50 ms instead of
+  cutting to silence; a drift drop is cross-faded (`Pop::Skip`); a stream
+  that ends fades out. Packets carry their real arrival time
+  (`NetEvent::Audio::arrived` → `AudioEngine::receive_at`).
+- **Devices:** a stream that stops working is reopened at once, and default
+  streams follow Windows' default device.
+- **Voice activation:** with auto gain on, the gate threshold stays 6 dB
+  above the noise level the gain may lift, so a fan can't hold it open.
+- **Game-audio capture:** 100 ms buffer, encoder flush after 120 ms (no
+  padding when the capture thread was held up). The capture's problem is
+  `AudioStatus::game_error`, shown under "Game audio" and as the banner when
+  it dies.
+- **Program list:** our own windows are skipped before asking for titles
+  (no message to our own UI thread); Store (UWP) apps resolve to the app's
+  process, not ApplicationFrameHost; the "Only one program" lookup runs on
+  the audio thread, never the engine thread.
+- **Push-to-talk vs. elevated games:** `gf_sys::foreground_is_elevated`,
+  polled every 500 ms on the engine tick while push-to-talk is on; the hint
+  under "Voice" stays 10 s after such a window loses focus.
+- **Wording:** FFmpeg errors point at "Codec under 'Your screen'"; game-audio
+  messages say "Start sending game audio".
+- **Frozen handshake start:** `Hello` stays variant 0 with `version` first,
+  `Reject` stays variant 2 with only `reason`. The host reads the version
+  with `gf_proto::wire::hello_version` before decoding the rest, so any
+  version gets the "different version" answer.
+- **gf-net ordering:** a connection's `Disconnected` + `Listening` are
+  emitted before its slot is freed, so a quick rejoin's `Connected` always
+  comes after them. Sending `ShareStarted`/`ShareStopped` drops video still
+  queued from the old share. Ping resets when the friend leaves.
+- **Joiner retries:** the first attempt retries "room full" for
+  `dead_after` + 2 s (12 s; after a crash or sleep the host still holds the
+  old connection). A reconnect that drops within 5 s doesn't restart the
+  30 s window. Leave during connect/handshake stops at once (with `Bye` if
+  the host already welcomed us).
+- **Host listener:** `accept()` failing for 5 s (Tailscale adapter
+  replaced) ends the room with `NetEvent::Error`.
+- **Engine:** `Watching{on:true}` asks for a keyframe only when the friend
+  starts watching, and is ignored while not sharing. Overlapping host
+  start-ups ("New code" while "Opening a room…") retry the port.
+- **UI:** no-encoder state shown up front; release builds show a message
+  box if the window can't open; minimum width 440.
+
 ## What the finished crates need from `gf-audio` and `app`
 
 From the agents' reports (also check the code's doc comments):
@@ -139,14 +185,24 @@ From the agents' reports (also check the code's doc comments):
 **For `gf-audio`**
 - `JitterBuffer::pop` allocates when returning `Lost{next:Some}` (a clone),
   so call it from the playout thread, not the device callback. Call
-  `reset()` on `reset_peer`.
-- `NetEvent::Audio` arrives on gf-net's UDP thread, one `Vec` per packet.
-  `NetTx::send_audio` takes a short mutex and does a UDP send, so call it
-  from encoder threads, never from a cpal/WASAPI callback.
+  `reset()` on `reset_peer`. When the buffer runs dry while playing, `pop`
+  conceals (`Lost{next:None}`) for up to 5 frames (50 ms) before going
+  `Empty`, without using up a sequence number. On a drift drop it returns
+  `Pop::Skip(packet)`: decode that packet without playing it (keeps the
+  decoder in step), then `pop` again for the frame's audio.
+- `NetEvent::Audio` arrives on gf-net's UDP thread, one `Vec` per packet,
+  stamped with its arrival time (`arrived`); the engine passes it to
+  `AudioEngine::receive_at`. `NetTx::send_audio` takes a short mutex and
+  does a UDP send, so call it from encoder threads, never from a cpal/WASAPI
+  callback.
 - Game audio from `LoopbackCapture` arrives in Windows-sized chunks (~10 ms),
   and **stops entirely while the program is silent** (process loopback sends
-  nothing then). The encoder must tolerate gaps. The capture buffer is 20 ms,
-  so the callback must hand samples off immediately (no Opus encoding inside it).
+  nothing then). The encoder must tolerate gaps. The capture buffer is
+  100 ms (the encoder's `FLUSH_AFTER` is 120 ms, so a held-up capture isn't
+  padded), and the callback must hand samples off immediately (no Opus
+  encoding inside it).
+- `AudioStatus::error` is voice problems only; the game-audio capture's own
+  problem is `AudioStatus::game_error`.
 
 ## Known risks / unverified
 

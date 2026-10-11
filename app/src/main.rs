@@ -21,7 +21,7 @@ fn main() -> anyhow::Result<()> {
             .with_title("GloorpFlorp")
             .with_app_id("GloorpFlorp")
             .with_inner_size([460.0, 760.0])
-            .with_min_inner_size([360.0, 320.0]),
+            .with_min_inner_size([440.0, 320.0]),
         ..Default::default()
     };
     let dev = dev_overrides();
@@ -36,9 +36,39 @@ fn main() -> anyhow::Result<()> {
     );
     if let Err(e) = &result {
         log::error!("the window couldn't be shown: {e}");
+        let e = e.to_string();
+        show_error(&format!(
+            "GloorpFlorp couldn't open its window: {}. Update your graphics driver and try again. \
+             Details are in %APPDATA%\\GloorpFlorp\\log.txt.",
+            e.trim().trim_end_matches('.')
+        ));
     }
     log::info!("GloorpFlorp closed");
     result.map_err(|e| anyhow::anyhow!("GloorpFlorp's window couldn't be shown: {e}"))
+}
+
+/// A message box: without a window (and, in release builds, without a
+/// console) there is nowhere else to say what went wrong.
+#[cfg(windows)]
+fn show_error(text: &str) {
+    use windows::core::{HSTRING, PCWSTR};
+    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+    let text = HSTRING::from(text);
+    let title = HSTRING::from("GloorpFlorp");
+    // SAFETY: both are NUL-terminated wide strings that outlive the call.
+    unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(text.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn show_error(text: &str) {
+    eprintln!("{text}");
 }
 
 /// Development only: `GLOORP_DEV_IP=127.0.0.1` hosts and joins on that

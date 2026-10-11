@@ -240,10 +240,13 @@ impl MicPipeline {
         }
         let live = &self.shared.live;
         let level = rms_dbfs(frame);
+        // (Never set in bypass mode: nothing was processed.)
+        let auto_gain = self.processor.current.is_some_and(|p| p.auto_gain);
         let send = self.gate.update(
             live.voice_mode(),
             live.ptt_key(),
             live.vad_sensitivity(),
+            auto_gain,
             live.mic_muted(),
             level,
         );
