@@ -261,8 +261,10 @@ are going:
   them.
 - **Quality:** 1440p at 60 fps with about **20–25 Mbps** looks great.
   Fast-moving games look better with more bitrate, if your upload allows it.
-- **Frame rate: stay at 60.** 120 and 144 fps are marked "experimental": in
-  tests the screen capture only reached about 75–90 pictures per second.
+- **Frame rate: 60 is the best choice for most games.** 120 and 144 fps work
+  (in tests they sent exactly 120 and 144 pictures per second), but the
+  same bitrate is shared by more pictures, so each picture gets less detail.
+  If you pick 120 or 144, raise the bitrate too if your upload allows.
 - **Upload speed matters most.** The sharer's upload speed must be well above
   the bitrate. Test it at [speedtest.net](https://www.speedtest.net). If your
   upload is 30 Mbps, use 20 Mbps or less. With slower upload, choose 1080p

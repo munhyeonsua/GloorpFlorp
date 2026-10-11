@@ -75,6 +75,9 @@ pub struct EncoderSettings {
     pub codec: VideoCodec,
     /// `gf_sys::Monitor::index`.
     pub monitor: u32,
+    /// Frames per second sent. The capture is paced to at most one frame
+    /// per 1/`fps` s slot and fills every slot while the capture keeps up
+    /// (see [`Encoder`]), also on a still screen.
     pub fps: u32,
     /// Scale down (keeping aspect ratio) if the monitor is taller than this.
     pub max_height: Option<u32>,
@@ -118,6 +121,19 @@ pub enum EncoderEvent {
 /// A monitor that Windows shows turned (`gf_sys::Monitor::rotation`) is
 /// captured unturned by Desktop Duplication; the picture is turned upright,
 /// so the stream size is still [`output_size`] of [`monitor_size`].
+///
+/// Frame pacing: ddagrab is asked for 1001 fps (`args::CAPTURE_POLL_FPS`),
+/// so it never waits on the coarse Windows timer, and `args::pace_filter`
+/// keeps the first frame of each 1/`fps` s slot before any copying or
+/// scaling and time-stamps it in slots (time base 1/`fps`, which is also
+/// the rate NVENC budgets its bitrate for). Frames then come evenly at
+/// `fps` (also 120/144, also on a still screen); the polling costs about
+/// one extra CPU core. The output is variable-rate (`-fps_mode vfr`, no
+/// `-r`): if the capture is held up, the stream has a gap and carries on
+/// with the next new picture, with no copies of the old one and no burst,
+/// so frames sent per second show what the capture really delivered.
+/// (Asking ddagrab for `fps` itself gave ~31 ms gaps at 60 fps and only
+/// ~72–95 fps at 120/144.)
 ///
 /// NVENC flags aim for low latency: `-preset p4 -tune ull -rc cbr`, no
 /// B-frames, `-zerolatency 1`, `-delay 0`, `-g keyframe_interval`. Output is

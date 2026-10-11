@@ -128,11 +128,25 @@ Defaults: AV1 20 Mbps, HEVC 25 Mbps, H.264 35 Mbps at 1440p60; adjustable
   starts in ~0.95 s with ~0.1–0.35 CPU cores, against ~1.6 s and 0.4–2.1
   cores for CPU scaling/turning, which stays as the fallback. A GPU step
   that failed is skipped for the rest of the app run.
-- **Frame pacing.** ddagrab spaces frames in ~15.6 ms steps (Windows timer),
-  so at 60 fps there is often a ~31 ms gap every few frames (p95 ~30 ms, up
-  to ~54 ms on a still screen), and 120/144 fps only reach ~72–95 fps with
-  less bitrate per second than 60 fps. The UI marks 120 and 144
-  "experimental".
+- **Frame pacing.** Asked for the share's own rate, ddagrab waits on the
+  ~15.6 ms Windows timer, so at 60 fps there was often a ~31 ms gap every
+  few frames (p95 ~30 ms, up to ~70 ms on a still screen) and 120/144 fps
+  only reached ~66–120 fps with less bitrate per second. So every ddagrab
+  step asks for 1001 fps (`args::CAPTURE_POLL_FPS`: a frame time under
+  1 ms, so ddagrab never sleeps on that timer and polls instead), and
+  `args::pace_filter` keeps the first frame of each 1/fps slot before any
+  copy or scaling (`select`; a kept frame comes at least half a frame time
+  after the one before) and time-stamps it in slots (`setpts`/`settb`:
+  time base 1/fps and no frame rate, so FFmpeg gives NVENC the real rate
+  for its bitrate budget). The output stays variable-rate (`-fps_mode vfr`,
+  no `-r`): a capture hold-up is a gap in the stream, not a burst of copies
+  of the last frame (which is what `-r` did: CFR, ~50 copies at the start
+  of a CUDA share at 144 fps, more after each hold-up, and new frames
+  dropped). Live on the RTX 5080: exactly 30/60/120/144 fps on every step and
+  on a still screen, frame-gap p95 at most ~1.6 ms over the frame time,
+  CBR bitrate at 0.92–0.99× of the target at 60/120/144 with a moving
+  picture. Cost: ~0.6–1.3 more CPU cores while sharing on the GPU paths
+  (polling); see HANDOFF.md for the numbers.
 - **Filler.** NVENC's CBR mode pads H.264 (72–78% of the bytes in a quiet
   picture). The FLV demuxer drops H.264 (NAL 12) and HEVC (NAL 38) filler
   and AV1 padding OBUs, so the wire carries only the picture.

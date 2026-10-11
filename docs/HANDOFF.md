@@ -17,7 +17,7 @@ agents that built the crates: `.claude/handoff/phase1-agent-reports.json` (proto
 | `gf-proto`: room codes, wire format, FLV demuxer + viewer writer, jitter buffer | ✅ done | 58 unit + 7 FFmpeg stream tests pass |
 | `gf-sys`: monitors, game-audio capture (process loopback), push-to-talk keys, Tailscale IP, child-process job object | ✅ done | 23 pass |
 | `gf-net`: TCP+UDP session, handshake, reconnect, video queue, stats | ✅ done | 35 pass |
-| `gf-video`: FFmpeg encoder (ddagrab → NVENC → FLV), mpv viewer | ✅ done | 28 unit + 3 integration pass |
+| `gf-video`: FFmpeg encoder (ddagrab → NVENC → FLV), mpv viewer | ✅ done | 34 unit + 3 integration pass |
 | `.github/workflows/build.yml`, `packaging/`, `README.md` | ✅ done | actionlint clean; packaging script run end to end with the real FFmpeg zip |
 | `gf-audio`: mic, echo cancellation, Opus, jitter, mixing, playback, game audio | ✅ done | 48 pass |
 | `app`: engine, settings, logging, egui UI, end-to-end test | ✅ done | 7 + 2 (UI) unit + 4 end-to-end pass |
@@ -29,7 +29,8 @@ checks" and "Live app checks" below. Not yet: push-to-talk and viewer focus
 with a real game in front, the mouse pointer on the portrait monitor, the
 Firewall prompt, and a session between the two PCs. `dist\GloorpFlorp` holds
 a packaged copy (BtbN FFmpeg N-127271, shinchiro mpv 0.41) with the latest
-`GloorpFlorp.exe` (CUDA scaling on).
+`GloorpFlorp.exe` (CUDA scaling on, capture pacing fix in: see "Capture
+pacing fix").
 
 ## Next steps
 
@@ -52,9 +53,9 @@ a packaged copy (BtbN FFmpeg N-127271, shinchiro mpv 0.41) with the latest
    - [x] Two copies on one PC (`GLOORP_DEV_IP=127.0.0.1`, `GLOORP_FAKE_AUDIO=1`)
    - [ ] Windows Firewall prompt appears on first Host (tests only used 127.0.0.1)
    - [x] The auto-opened viewer doesn't take focus: with another window in front (3 runs: first share, no key presses, codec-change reopen) mpv opened behind it and the foreground never changed. It does come to the front after clicking Open viewer. Not checked with a real fullscreen game
-   - [x] Next-session checks prepared by the fixers (portrait direction, `CUDA_TRANSFORM = true`, pacing, H.264 bitrate): done, see "Live-desktop checks". Still open: the mouse pointer on the portrait monitor, and the owner's choice on the pacing experiment (smooth, but ~1 more CPU core). Scripts: `scratchpad/hwlive/capture/` (harness, `run.ps1`, `pointer.ps1`, `pace-experiment.diff`) and `scratchpad/hwlive/app/` (two-copy app checks). (Scratchpads are under `%TEMP%\claude\…`; they may be gone.)
+   - [x] Next-session checks prepared by the fixers (portrait direction, `CUDA_TRANSFORM = true`, pacing, H.264 bitrate): done, see "Live-desktop checks". Still open: the mouse pointer on the portrait monitor. The pacing experiment is now shipped (the owner's choice: smooth, ~1 more CPU core; see "Capture pacing fix"). Scripts: `scratchpad/hwlive/capture/` (harness, `run.ps1`, `pointer.ps1`, `pace-experiment.diff`) and `scratchpad/hwlive/app/` (two-copy app checks). (Scratchpads are under `%TEMP%\claude\…`; they may be gone.)
 4. **Push without `[skip ci]`** so GitHub builds the zip. Check both jobs go green.
-5. **First session with the friend.** The friend's 3070 Ti PC needs an up-to-date NVIDIA driver (FFmpeg master needs a recent NVENC API). Judge delay and echo by ear (nothing audible was played in the tests), and keep both PCs' log files. Use 60 fps: "120/144 fps (experimental)" only reach ~72–95 fps and get less of the bitrate.
+5. **First session with the friend.** The friend's 3070 Ti PC needs an up-to-date NVIDIA driver (FFmpeg master needs a recent NVENC API). Judge delay and echo by ear (nothing audible was played in the tests), and keep both PCs' log files. 60 fps is the default; 120/144 now send exactly that rate, but spread the same bitrate over more frames, and the pacing fix's CPU cost (~1 core) is only measured on the 9800X3D, so check Task Manager on the 3070 Ti PC.
 
 ## Decisions made after ARCHITECTURE.md was written
 
@@ -163,7 +164,7 @@ runs, every defect double-checked before fixing. Key numbers:
   ran: ~2.3–2.4 s to start, ~1.9 CPU cores. (Fixed; see below.)
 - **Capture pacing:** at 60 fps about every 10th frame gap is ~31 ms instead
   of ~16 ms; 120 and 144 fps only reach 74–89 fps. The limit is the capture
-  (`ddagrab`), not NVENC (8–39% busy). Not fixed yet.
+  (`ddagrab`), not NVENC (8–39% busy). (Fixed; see "Capture pacing fix".)
 - **Portrait monitor:** index mapping right, but the picture came out
   sideways. (Fixed; checked live, see "Live-desktop checks".)
 - **Viewer (mpv 0.41):** hardware decoding of all three codecs, `push`
@@ -215,8 +216,10 @@ App and docs (second round):
 - **Screen readers / UI Automation:** every text box, dropdown, slider and
   number box is named after its label; the banner's × is "Hide this message";
   text boxes accept UI Automation "set value".
-- **120 and 144 fps** are labelled "(experimental)", with the measured rates
-  in the tooltip and README.
+- **120 and 144 fps** were labelled "(experimental)", with the measured rates
+  in the tooltip and README. Since the pacing fix they reach their rate, so
+  the label is gone; the tooltip and README now say that the same bitrate
+  is shared by more pictures.
 - **README:** log.old.txt in the privacy list, "Wrong room code", Codec under
   "Your screen", "a few seconds" of black, mpv 0.41 needed.
 - **Packaging** fails if the downloaded mpv is older than 0.41.
@@ -249,7 +252,7 @@ with the packaged FFmpeg N-127271, 6 s per run:
   works; then the CPU step takes over.) After 1.8 s the user sees the
   "update your NVIDIA graphics driver" message (`cuInit` / `CUDA_ERROR`
   are among its patterns).
-- **Capture pacing** (not fixed): at 60 fps, frames come either evenly
+- **Capture pacing** (before the fix; see "Capture pacing fix"): at 60 fps, frames come either evenly
   (frame-gap sd ~3.2–5.5 ms) or with a ~31 ms gap and a ~3 ms gap every few
   frames (sd ~7–9 ms, p95 ~30–34 ms). Native GPU-direct shares were in the
   uneven state 5 of 5 times, CUDA-scaled ones 10 of 13 and CPU-scaled ones 3
@@ -258,8 +261,9 @@ with the packaged FFmpeg N-127271, 6 s per run:
   144 fps reach 72–95 fps. A tested fix (ddagrab `framerate=1001` + a
   `select` to the target rate + `-r`) holds exactly 60/120/144 fps, also on
   a still screen, but costs ~0.8–1.0 more CPU core (ddagrab then polls);
-  `scratchpad/hwlive/capture/pace-experiment.diff`. Not shipped: the
-  owner's choice. (`dup_frames=0` + `fps` stops sending on a still screen.)
+  `scratchpad/hwlive/capture/pace-experiment.diff`. The owner chose to ship
+  it (see "Capture pacing fix"). (`dup_frames=0` + `fps` stops sending on a
+  still screen, so that variant is not used.)
 - **H.264 on the wire** (filler dropped): 7.0 Mbps at 1440p and 5.1 Mbps
   native against a 35 Mbps target, no filler left (FFmpeg's own output was
   35 Mbps, 85% filler). HEVC 0.2× and AV1 0.83–0.90× of target, no padding.
@@ -285,8 +289,10 @@ Two packaged copies of the current `GloorpFlorp.exe` on 127.0.0.1
 - **Viewer closed / Open viewer:** the host shows "friend's viewer is
   closed" in 0.21–0.28 s and sends nothing; picture back 1.4–2.2 s after
   Open viewer.
-- **120 fps (experimental):** 71–79 fps sent and only 10–13 of 20 Mbps
-  (CBR budgets each frame at 1/120 of the bitrate), 0 dropped.
+- **120 fps (experimental, before the pacing fix):** 71–79 fps sent and
+  only 10–13 of 20 Mbps (CBR budgets each frame at 1/120 of the bitrate),
+  0 dropped. Not re-run in the app since the fix; through the real encoder
+  120 fps now gives 120.0 fps and 0.92–0.97× of the bitrate.
 - **Push-to-talk (F24, bound with the key button):** see the checklist;
   with the key up only background traffic (8–9 datagrams/s) goes out.
 - **Viewer focus:** an auto-opened viewer stayed behind the window in
@@ -296,6 +302,122 @@ Two packaged copies of the current `GloorpFlorp.exe` on 127.0.0.1
   FFmpeg/mpv is left. Logs: no ERROR, only the dev-override WARN.
 - Small UI nit: with Voice activation, "Your mic: Talking" can show while
   not connected (nothing is sent then).
+
+## Capture pacing fix (owner at the PC, 2026-10-11)
+
+Shipped by the owner's choice (smooth video for ~1 more CPU core).
+`args::encoder_args`: every ddagrab step (GPU-direct, CUDA scale/turn, CPU
+fallback) asks ddagrab for `framerate=1001` (`CAPTURE_POLL_FPS`: a frame
+time under 1 ms, so ddagrab never sleeps on the 15.6 ms timer) and puts
+`pace_filter` before any other filter:
+`select='if(gte(floor(t*fps),ld(0))*gte(t,ld(1)),st(0,floor(t*fps)+1)+st(1,t+1/(2·fps)),0)'`
+keeps the first frame of each 1/fps slot (at least half a frame time after
+the last kept one), then `setpts=floor(T*fps)/fps/TB:strip_fps=1,settb=1/fps`
+time-stamps it in slots and removes ddagrab's 1001 fps frame rate, so FFmpeg
+hands NVENC the time base's rate (`fps`) for its bitrate budget. The output
+is `-fps_mode vfr` (FLV's default, spelled out), with no `-r`. The test
+pattern is unchanged. The numbers in the filter are whole numbers (FFmpeg
+divides), so no float formatting or locale is involved. Tests: the filter
+text and its quoting for FFmpeg's parsers, every step × 30/60/120/144 fps ×
+codec × monitor shape (no `-r`, `-fps_mode vfr`), the pacing rule on
+simulated 1 ms frames with a 100 ms hold-up (every slot filled, a gap for
+the hold-up, no burst), and the real FFmpeg on a 1001 fps `testsrc2` with a
+100 ms hold-up giving exactly the frames and slot timestamps of the Rust
+model at 30/60/120/144 fps (skipped without FFmpeg; with `-r` it gives 13
+extra frames at 144 and fails).
+
+**First version used `-r fps` (review follow-up).** `-r` makes FFmpeg
+constant-rate: it fills any hold-up with copies of the last frame, sent in a
+burst just before the new one, and drops new frames that land too close to
+its grid (FFmpeg refuses `-r` with `-fps_mode vfr`). So the half-frame rule
+never reached the stream, and "sent N fps" counted the copies. Live (6 s,
+output to NUL): monitor 0 native 144 fps dup=26 drop=9; CUDA 1440p 144 fps
+dup=51, mostly a startup burst (ddagrab's first frame comes ~0.3 s after
+its clock starts and FFmpeg filled that time with copies); the same runs
+with the variable-rate filters: dup=0 drop=0. Bitrate is unchanged
+(lavfi noise, 1280×720, AV1/HEVC/H.264 at 144 fps: 1.01–1.02× of target
+both ways; without either fix 0.15×), and the H.264/HEVC/AV1 headers are
+byte-identical.
+
+Re-measured live with the shipped (variable-rate) arguments against the
+`-r` version, alternating, same 7 paths × 30/60/120/144 fps
+(`scratchpad/hwpace/fix/results-vfr.txt`): steady rate the same (29.99–30.00,
+60.00–60.03, 119.97–120.01, 143.96–144.02); whole-run rate now matches it
+(144: 144.1–144.6 fps against 146.9–149.1 with `-r`; 120: 120.2–120.5
+against 122.4–124.3; 60: 60.2–60.5 against 60.3–62.1), because the startup
+copies are gone (CUDA paths at 144 fps: 2–6 frame gaps under 4 ms in the
+whole run against 37–53). Gap sd 0.4–1.5 ms at 60–144 fps (with `-r`
+0.8–2.9), p95 within 1.8 ms of the frame time, max ≤ 12.2 ms at 144 apart
+from one 6 s run per CPU-fallback case at 16–18 ms (repeated 3× each: 0–1
+gaps over 1.5×, max 7.9–12.2 ms, same as `-r`). Bitrate per second, start
+time (730–940 ms GPU, 815–1540 ms CPU fallback), CPU cores (0.6–1.5 GPU
+paths, 1.6–4.3 CPU fallback) and keyframes every `2·fps` frames are the same
+as with `-r`; every stream decoded in full (AV1 0 errors; H.264 only the
+known prologue message). Real mpv viewer (AV1 1440p60, 8 s, 2 runs each,
+alternating): first picture 30.7–34.8 ms after the keyframe (`-r`:
+30.2–36.4, so the earlier 36–40 was run-to-run spread), display gap max
+19.3–21.1 ms, 0 over 25 ms, 481 of 481 frames shown, push-to-display
+median 0.28–0.29 ms, 0 mpv errors. The table below is from the `-r`
+version; its steady numbers hold for the shipped one.
+
+Live, through the real `gf_video::Encoder` (packaged FFmpeg N-127271), HEAD
+and the fix alternating in one session, 6 s per run, 7 paths: monitor 0
+native AV1 (GPU-direct), monitor 0 1440p AV1 and H.264 (CUDA), monitor 1
+(portrait, a still screen) 1440p AV1 and native AV1 (CUDA turn), and the
+CPU fallback (monitor 0 1440p AV1, monitor 1 1440p H.264; forced with a
+scratch copy of gf-video built with `CUDA_TRANSFORM = false`, so the
+shipped `Step::Cpu` arguments ran). Per frame rate, ranges over the 7 paths
+(steady fps after the first second; gap = time between frames):
+
+| fps | build | steady fps | gap sd ms | gap p95 ms | gap max ms | gaps > 1.5× (sum) |
+|---|---|---|---|---|---|---|
+| 30 | HEAD | 29.9–30.1 | 7.1–21.4 | 43.8–71.1 | 53–123 | 80 |
+| 30 | fix | 30.00 | 2.3–5.8 | 33.9–34.9 | 34.1–35.9 | 0 |
+| 60 | HEAD | 56.8–59.0 | 5.2–16.1 | 29.8–52.8 | 38–71 | 475 |
+| 60 | fix | 59.99–60.01 | 1.0–2.9 | 17.0–17.9 | 17.3–18.5 | 0 |
+| 120 | HEAD | 66–107 | 4.7–9.6 | 18.8–26.4 | 32–68 | 1758 |
+| 120 | fix | 119.98–120.01 | 0.6–1.5 | 9.0–9.6 | 9.5–10.2 | 0 |
+| 144 | HEAD | 84–120 | 6.4–8.5 | 19.3–23.2 | 32–62 | 1844 |
+| 144 | fix | 143.96–144.01 | 0.8–1.2 | 7.4–7.9 | 7.9–11.6 | 1 |
+
+- **Still screen** (portrait monitor, ~0.3–2.6 KB per frame): the fix
+  keeps the exact rate (HEAD there was the worst: p95 up to 71 ms at 30 fps,
+  53 ms at 60), keyframes every 2 s, streams decode.
+- **Keyframes:** every `2·fps` frames = every 2.0 s in every run of the fix
+  (at 120/144 HEAD's 240/288-frame spacing took 2.2–3.6 s); every keyframe
+  decodable on its own (0 bad).
+- **Bitrate** with a moving picture (a non-focused mpv window playing a
+  1920×1080 test pattern on monitor 0), 1440p, target 20 Mbps AV1 / 35 Mbps
+  H.264: 60 fps HEAD 0.91/0.90× → fix 0.99/0.98×; 120 fps 0.59/0.58× →
+  0.92/0.97×; 144 fps 0.55/0.57× → 0.95/0.95×. On the mostly still desktop
+  bitrate follows the picture (AV1 0.04–1.0×, H.264 filler dropped), the
+  same in both builds.
+- **CPU (FFmpeg, cores, steady):** native GPU-direct 0.01–0.08 → 0.63–0.97;
+  CUDA 0.08–0.53 → 1.08–1.52; CPU fallback 0.43–3.45 → 1.65–4.27. GPU and
+  NVENC load rise with the frames encoded (monitor 0 1440p AV1 at 144 fps:
+  GPU 20% → 32%, NVENC 10% → 18%).
+- **Start-up** (`Started`): native 743–823 → 740–760 ms, CUDA 902–988 →
+  902–966 ms, CPU fallback 824–1670 → 815–1585 ms: not slower. Stop 53–69
+  ms, no FFmpeg left behind.
+- **Decoding:** every stream decoded with FFmpeg, all frames (with
+  `-fps_mode passthrough`; raw H.264 at 120/144 needs it, else FFmpeg's
+  null output drops frames by timestamp), 0 errors for AV1. H.264 shows the
+  one pre-existing message for the 6-byte opening access unit of the viewer
+  prologue ("missing picture in access unit"), in both builds.
+- **With motion at 120/144** (GPU also drawing the test window): 1–17 gaps
+  over 1.5× the frame time per 6 s run, max 14–18 ms (HEAD: ~300–340).
+- **Real mpv viewer** (Encoder monitor 0 → `Viewer` with mpv 0.41, AV1
+  1440p60, 8 s after the first keyframe, 2 runs each): frames shown on
+  screen arrive evenly — gap max 18.9–20.6 ms, 0 over 25 ms (HEAD: max
+  34–40 ms, 33–34 gaps over 25 ms); push-to-display median 0.29 ms (HEAD
+  0.31–0.32), so no added delay; every pushed frame shown (481 of 481), no
+  skips, 0 mpv errors. First picture after the keyframe 36–40 ms (HEAD
+  31–33 ms; mpv start-up/decoder, n=2; re-run later with 2 more runs per
+  build: 30–36 ms either way, so not a regression).
+
+Scripts and evidence: `scratchpad/hwpace/` (`run1.ps1`, `matrix.ps1`,
+`motion.ps1`, `results.txt`, `motion.txt`, `ev/`); raw streams were
+deleted after decoding.
 
 ## What the finished crates need from `gf-audio` and `app`
 
@@ -376,13 +498,16 @@ From the agents' reports (also check the code's doc comments):
   the app shows its plain "Windows refused to let GloorpFlorp capture the
   screen…" message) and synthesized key presses. Test sharing with someone
   at the PC.
-- **Capture pacing:** ddagrab delivers frames in ~15.6 ms steps (the
-  Windows timer), so 60 fps often has a ~31 ms gap every few frames (p95
-  ~30 ms; worse on a still screen, p95 up to ~54 ms) and 120/144 fps reach
-  only ~72–95 fps (in the app at 120: 71–79 fps with ~11.5 of 20 Mbps).
-  Since the CUDA path is on, scaled shares pace like native ones; the CPU
-  way delivered evenly more often (see "Live-desktop checks"). The tested
-  fix (`pace-experiment.diff`) costs ~1 CPU core; the owner decides.
+- **Capture pacing: fixed, at a CPU cost.** ddagrab is asked for 1001 fps
+  and paced to the share's rate with `select` (see "Capture pacing fix"):
+  exactly 30/60/120/144 fps, also on a still screen. The cost is ddagrab
+  polling: +0.6–1.0 CPU core for a native GPU-direct share, +0.9–1.3 for a
+  CUDA-scaled/turned one, +0.8–2.7 on the CPU fallback (part of that is
+  the CPU scaling the frames that used to be missing) — measured on the
+  9800X3D only. If the friend's PC struggles, 60 fps is cheaper than
+  120/144. Untested: a heavily loaded CPU (a game using every core) could
+  delay the polling thread and bring back uneven gaps, and with the GPU busy
+  drawing another window, 120/144 fps showed a few gaps up to ~18 ms.
 - **CUDA scaling/turning** (`args::CUDA_TRANSFORM`) has only run on the RTX
   5080. Each frame goes GPU → system memory → GPU (a few % GPU, ~97 MB).
   `scale_d3d11` (fails on NVIDIA with FFmpeg 8, error 80070057) is no longer

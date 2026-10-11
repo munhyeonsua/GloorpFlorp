@@ -377,14 +377,12 @@ impl GloorpApp {
             ui.end_row();
 
             let label = ui.label("Frame rate").on_hover_text(
-                "Pictures per second. 60 is smooth; more needs more bitrate for the same \
-                 quality. 120 and 144 are experimental: in tests the screen capture only \
-                 reached about 75 to 90 pictures per second.",
+                "Pictures per second. 60 is smooth and enough for most games. 120 and 144 \
+                 send that many pictures, but the same bitrate is shared by more pictures, \
+                 so each one gets less detail: raise the bitrate too if your upload allows. \
+                 Higher rates also use a little more of the computer's power.",
             );
-            let fps_label = |f: u32| match f {
-                f if f > 60 => format!("{f} fps (experimental)"),
-                f => format!("{f} fps"),
-            };
+            let fps_label = |f: u32| format!("{f} fps");
             ComboBox::from_id_salt("fps")
                 .selected_text(fps_label(s.fps))
                 .width(240.0)

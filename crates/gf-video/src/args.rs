@@ -201,11 +201,69 @@ pub(crate) fn bufsize_kbps(bitrate_kbps: u32, fps: u32) -> u32 {
     (b / 8).max(b.saturating_mul(2) / fps.max(1)).max(1)
 }
 
+/// The rate ddagrab is asked for. ddagrab waits for its next frame in whole
+/// milliseconds on the Windows timer, which only ticks every ~15.6 ms, so
+/// asking it for the share's own rate gave uneven frames: at 60 fps a ~31 ms
+/// gap every few frames, and 120/144 fps only reached ~72–95 fps. 1001 is the
+/// first rate whose frame time (0.999 ms) rounds down to a 0 ms wait, so
+/// ddagrab never sleeps on that timer and checks for a new frame about every
+/// millisecond instead (it repeats the last frame when the screen is still).
+/// That checking costs about one CPU core; [`pace_filter`] then picks the
+/// share's own rate out of these frames.
+pub(crate) const CAPTURE_POLL_FPS: u32 = 1001;
+
+/// A kept frame must come at least `1 / (fps * PACE_RESYNC_DIVISOR)` s
+/// after the one before. Without it, a frame held up until the end of its
+/// slot would be followed at once by the first frame of the next slot (two
+/// pictures ~1 ms apart). Half a frame time, not a whole one, so the ~1 ms
+/// unevenness of ddagrab's frames never pushes a frame out of its slot and
+/// lowers the rate.
+pub(crate) const PACE_RESYNC_DIVISOR: u32 = 2;
+
+/// Filters that keep one of ddagrab's ~1000 frames a second per 1/`fps` s
+/// slot and time-stamp it in slots:
+///
+/// - `select` keeps the first frame in each new slot (`floor(t*fps)`, `t`
+///   is the frame's time in seconds) that also comes at least
+///   [`PACE_RESYNC_DIVISOR`] of a frame time after the last kept one;
+///   `ld(0)` holds the next slot that may be filled, `ld(1)` the earliest
+///   time for the next frame. Everything else is dropped.
+/// - `setpts` puts each kept frame at the start of its slot and drops the
+///   1001 fps frame rate (`strip_fps`); `settb` then makes the time base
+///   1/`fps`, so each frame's time is its slot number. With no frame rate
+///   set, FFmpeg gives NVENC the time base's rate, `fps`, and its CBR rate
+///   control spreads the bitrate over `fps` frames a second.
+///
+/// The output stays variable-rate (`-fps_mode vfr`, no `-r`): after a
+/// hold-up the stream simply has a gap and carries on with the next new
+/// picture. (`-r fps` would make FFmpeg fill the gap with copies of the
+/// last frame, sent in a burst before the new one, and drop new frames
+/// that land too close to its grid; FFmpeg refuses `-r` with `vfr`.)
+///
+/// The numbers are whole numbers written by Rust (never locale-dependent);
+/// FFmpeg does the division itself, so `1/144` is as exact as a double.
+/// The single quotes keep `select`'s commas from FFmpeg's filtergraph parser
+/// (the argument goes to FFmpeg as is, there is no shell); that expression
+/// has no `:` or `=`, so `select` takes all of it as its `expr` option, and
+/// `setpts`'s expression has no `,` `:` or `=`.
+pub(crate) fn pace_filter(fps: u32) -> String {
+    let fps = fps.max(1);
+    let resync = u64::from(fps) * u64::from(PACE_RESYNC_DIVISOR);
+    format!(
+        "select='if(gte(floor(t*{fps}),ld(0))*gte(t,ld(1)),\
+         st(0,floor(t*{fps})+1)+st(1,t+1/{resync}),0)',\
+         setpts=floor(T*{fps})/{fps}/TB:strip_fps=1,settb=1/{fps}"
+    )
+}
+
 fn s(v: &[&str]) -> Vec<String> {
     v.iter().map(|x| x.to_string()).collect()
 }
 
-/// Full FFmpeg argument list for one ladder step.
+/// Full FFmpeg argument list for one ladder step. Every step that captures
+/// with ddagrab asks it for [`CAPTURE_POLL_FPS`] and paces the frames with
+/// [`pace_filter`] (variable rate, no `-r`); the test pattern already runs
+/// at `fps`.
 pub(crate) fn encoder_args(step: Step, settings: &EncoderSettings, screen: Screen) -> Vec<String> {
     let fps = settings.fps.max(1);
     let gop = settings.keyframe_interval.max(1);
@@ -262,13 +320,19 @@ pub(crate) fn encoder_args(step: Step, settings: &EncoderSettings, screen: Scree
     } else {
         a.extend(s(&["-f", "lavfi", "-i"]));
         a.push(format!(
-            "ddagrab=output_idx={}:framerate={fps}:draw_mouse=1",
+            "ddagrab=output_idx={}:framerate={CAPTURE_POLL_FPS}:draw_mouse=1",
             settings.monitor
         ));
-        if let Some(vf) = capture_filters(step, screen, (w, h)) {
-            a.push("-vf".into());
-            a.push(vf);
-        }
+        // Pace first, so only the kept frames are copied, scaled or turned.
+        let pace = pace_filter(fps);
+        a.push("-vf".into());
+        a.push(match capture_filters(step, screen, (w, h)) {
+            Some(vf) => format!("{pace},{vf}"),
+            None => pace,
+        });
+        // Keep the paced frames as they are: no copies after a hold-up (the
+        // FLV default; spelled out so a `-r` added later fails loudly).
+        a.extend(s(&["-fps_mode", "vfr"]));
         a.extend(s(&[
             "-c:v",
             nvenc_encoder(settings.codec),
@@ -605,7 +669,9 @@ mod tests {
             upright(2560, 1440),
         );
         let j = joined(&a);
-        assert!(j.contains("-vf scale_d3d11=width=1920:height=1080:format=nv12 -c:v hevc_nvenc"));
+        assert!(
+            j.contains("settb=1/60,scale_d3d11=width=1920:height=1080:format=nv12 -fps_mode vfr -c:v hevc_nvenc")
+        );
         assert!(j.contains("-bf 0 -forced-idr 1 -an"));
     }
 
@@ -632,11 +698,301 @@ mod tests {
             upright(2560, 1440),
         );
         let expected = "-hide_banner -nostdin -loglevel warning -nostats \
-            -f lavfi -i ddagrab=output_idx=1:framerate=60:draw_mouse=1 \
+            -f lavfi -i ddagrab=output_idx=1:framerate=1001:draw_mouse=1 \
+            -vf select='if(gte(floor(t*60),ld(0))*gte(t,ld(1)),st(0,floor(t*60)+1)+st(1,t+1/120),0)',\
+            setpts=floor(T*60)/60/TB:strip_fps=1,settb=1/60 -fps_mode vfr \
             -c:v av1_nvenc -preset p4 -tune ull -rc cbr -b:v 20000k -maxrate 20000k \
             -bufsize 2500k -g 120 -zerolatency 1 -delay 0 -bf 0 \
             -an -f flv -flvflags no_duration_filesize -flush_packets 1 pipe:1";
         assert_eq!(joined(&a), expected);
+    }
+
+    const CAPTURE_STEPS: [Step; 3] = [Step::GpuDirect, Step::GpuCuda, Step::Cpu];
+
+    #[test]
+    fn pace_filter_text() {
+        assert_eq!(
+            pace_filter(60),
+            "select='if(gte(floor(t*60),ld(0))*gte(t,ld(1)),\
+             st(0,floor(t*60)+1)+st(1,t+1/120),0)',\
+             setpts=floor(T*60)/60/TB:strip_fps=1,settb=1/60"
+        );
+        assert_eq!(
+            pace_filter(144),
+            "select='if(gte(floor(t*144),ld(0))*gte(t,ld(1)),\
+             st(0,floor(t*144)+1)+st(1,t+1/288),0)',\
+             setpts=floor(T*144)/144/TB:strip_fps=1,settb=1/144"
+        );
+        // fps 0 can't divide by zero.
+        assert!(pace_filter(0)
+            .ends_with("st(1,t+1/2),0)',setpts=floor(T*1)/1/TB:strip_fps=1,settb=1/1"));
+    }
+
+    /// Brackets open and close in order.
+    fn balanced(expr: &str) -> bool {
+        let mut depth = 0i32;
+        for c in expr.chars() {
+            depth += match c {
+                '(' => 1,
+                ')' => -1,
+                _ => 0,
+            };
+            if depth < 0 {
+                return false;
+            }
+        }
+        depth == 0
+    }
+
+    /// What FFmpeg's parsers need: the filtergraph parser splits filters at
+    /// `,` (and `;` `[` `]`) outside single quotes and removes one level of
+    /// quotes; then each filter splits its options at `:` and `=`. So the
+    /// argument is exactly three filters, `select`'s expression is one
+    /// quoted token with none of those inside, `setpts` gets its expression
+    /// and `strip_fps`, and there are no spaces or double quotes for
+    /// Windows' command line.
+    #[test]
+    fn pace_filter_survives_ffmpeg_parsing() {
+        for fps in [1, 24, 30, 60, 120, 144, 165, 240, 1000] {
+            let f = pace_filter(fps);
+            for bad in [' ', '"', ';', '[', ']', '\\'] {
+                assert!(!f.contains(bad), "{bad:?} in {f}");
+            }
+            // Split at commas outside quotes, as the filtergraph parser does.
+            let mut filters = vec![String::new()];
+            let mut quoted = false;
+            for c in f.chars() {
+                if c == ',' && !quoted {
+                    filters.push(String::new());
+                    continue;
+                }
+                if c == '\'' {
+                    quoted = !quoted;
+                }
+                filters.last_mut().unwrap().push(c);
+            }
+            assert!(!quoted, "{f}");
+            assert_eq!(filters.len(), 3, "{f}");
+            let expr = filters[0]
+                .strip_prefix("select='")
+                .and_then(|r| r.strip_suffix('\''))
+                .unwrap_or_else(|| panic!("{f}"));
+            for bad in ['\'', ':', '='] {
+                assert!(!expr.contains(bad), "{bad:?} in {f}");
+            }
+            assert!(balanced(expr), "{f}");
+            assert!(expr.contains(&format!("floor(t*{fps})")), "{f}");
+            assert!(expr.contains(&format!("t+1/{}", 2 * fps)), "{f}");
+            let setpts: Vec<&str> = filters[1]
+                .strip_prefix("setpts=")
+                .unwrap_or_else(|| panic!("{f}"))
+                .split(':')
+                .collect();
+            let want = format!("floor(T*{fps})/{fps}/TB");
+            assert_eq!(setpts, [want.as_str(), "strip_fps=1"], "{f}");
+            assert!(balanced(setpts[0]) && !setpts[0].contains('='), "{f}");
+            assert_eq!(filters[2], format!("settb=1/{fps}"), "{f}");
+            // Only whole numbers are formatted into it: no locale, no float text.
+            assert!(!f.contains('.'), "{f}");
+        }
+    }
+
+    /// Every ddagrab step asks for 1001 fps, paces to `fps` before any
+    /// other filter and keeps the output variable-rate (no `-r`, which
+    /// would make FFmpeg copy frames into hold-ups), for all codecs, rates
+    /// and monitor shapes.
+    #[test]
+    fn every_capture_step_is_paced() {
+        let portrait = Screen {
+            width: 2160,
+            height: 3840,
+            rotation: 90,
+        };
+        let screens = [
+            (upright(2560, 1440), None),
+            (upright(3840, 2160), Some(1440)),
+            (portrait, None),
+            (portrait, Some(1440)),
+        ];
+        for step in CAPTURE_STEPS {
+            for fps in [30, 60, 120, 144] {
+                for codec in VideoCodec::ALL {
+                    for (screen, max_height) in screens {
+                        let mut st = settings(codec, max_height);
+                        st.fps = fps;
+                        let a = encoder_args(step, &st, screen);
+                        let ctx = format!("{step:?} {fps} {codec:?} {screen:?} {max_height:?}");
+                        let at = |x: &str| a.iter().position(|v| v == x);
+                        let input = at("-i").map(|i| a[i + 1].as_str());
+                        assert_eq!(
+                            input,
+                            Some("ddagrab=output_idx=1:framerate=1001:draw_mouse=1"),
+                            "{ctx}"
+                        );
+                        let vf = at("-vf").expect("-vf");
+                        let filters = &a[vf + 1];
+                        let rest = filters
+                            .strip_prefix(&pace_filter(fps))
+                            .unwrap_or_else(|| panic!("{ctx}: {filters}"));
+                        assert!(rest.is_empty() || rest.starts_with(','), "{ctx}: {rest}");
+                        assert!(at("-r").is_none() && at("-fpsmax").is_none(), "{ctx}");
+                        let mode = at("-fps_mode").expect("-fps_mode");
+                        assert_eq!(a[mode + 1], "vfr", "{ctx}");
+                        let cv = at("-c:v").expect("-c:v");
+                        assert!(vf < mode && mode < cv, "{ctx}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_pattern_is_not_paced() {
+        for fps in [30, 60, 144] {
+            let mut st = settings(VideoCodec::H264, Some(240));
+            st.fps = fps;
+            let a = encoder_args(Step::TestSource, &st, upright(1920, 1080));
+            let j = joined(&a);
+            assert!(
+                j.contains(&format!("testsrc2=size=426x240:rate={fps}")),
+                "{j}"
+            );
+            assert!(
+                !j.contains("select") && !j.contains(" -r ") && !j.contains("-fps_mode"),
+                "{j}"
+            );
+        }
+    }
+
+    /// The pacing rule of [`pace_filter`] in Rust, computed the way FFmpeg
+    /// evaluates the expression (doubles, same operations). Returns the
+    /// kept frames' times and slots (= their timestamps in 1/`fps`).
+    fn paced(times: &[f64], fps: u32) -> Vec<(f64, i64)> {
+        let f = f64::from(fps);
+        let resync = 1.0 / f64::from(fps * PACE_RESYNC_DIVISOR);
+        let (mut next_slot, mut earliest) = (0.0f64, 0.0f64); // ld(0), ld(1)
+        let mut kept = Vec::new();
+        for &t in times {
+            let slot = (t * f).floor();
+            if slot >= next_slot && t >= earliest {
+                next_slot = slot + 1.0;
+                earliest = t + resync;
+                kept.push((t, slot as i64));
+            }
+        }
+        kept
+    }
+
+    /// ddagrab at 1001 fps hands over a frame about every millisecond (a
+    /// little uneven). Pacing fills every slot with one frame, about one
+    /// frame time apart; after a 100 ms hold-up the stream has a gap, then
+    /// carries on with no burst.
+    #[test]
+    fn pacing_rule_holds_the_rate() {
+        let mut seed = 1u32;
+        let mut jitter = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            f64::from(seed >> 8) / f64::from(1u32 << 24) * 0.0006 - 0.0003
+        };
+        let poll = 1.0 / f64::from(CAPTURE_POLL_FPS);
+        let times: Vec<f64> = (0..10_010)
+            .map(|i| f64::from(i) * poll + jitter())
+            .collect();
+        for fps in [30, 60, 120, 144] {
+            let (f, period) = (f64::from(fps), 1.0 / f64::from(fps));
+            let kept = paced(&times, fps);
+            let n = kept.len() as i64;
+            let want = i64::from(fps) * 10;
+            assert!((n - want).abs() <= 1, "{fps}: {n} frames in 10 s");
+            for w in kept.windows(2) {
+                assert_eq!(w[1].1, w[0].1 + 1, "{fps}: a slot without a frame");
+                let g = w[1].0 - w[0].0;
+                assert!((g - period).abs() < 0.0017, "{fps}: gap {g}");
+            }
+
+            let stalled: Vec<f64> = times
+                .iter()
+                .copied()
+                .filter(|t| !(5.0..5.1).contains(t))
+                .collect();
+            let kept = paced(&stalled, fps);
+            let after = kept.iter().position(|k| k.0 >= 5.1).unwrap();
+            assert!(
+                kept[after].0 < 5.1 + 0.0017,
+                "{fps}: first frame after the hold-up"
+            );
+            // The hold-up is a gap of ~0.1 s worth of slots: nothing fills it.
+            let gap = (kept[after].1 - kept[after - 1].1) as f64;
+            assert!((gap - 0.1 * f).abs() <= 1.5, "{fps}: gap of {gap} slots");
+            // No burst: frames at least half a frame time apart, and every
+            // slot after the hold-up gets exactly one frame again.
+            for w in kept[after..].windows(2) {
+                let g = w[1].0 - w[0].0;
+                assert!(
+                    g >= period / 2.0 - 1e-9,
+                    "{fps}: burst after the hold-up ({g})"
+                );
+                assert_eq!(w[1].1, w[0].1 + 1, "{fps}: slots after the hold-up");
+            }
+        }
+    }
+
+    /// The real FFmpeg with the filters as built here (one argument, no
+    /// shell) and the encoder's `-fps_mode vfr`: a 1001 fps source with a
+    /// 100 ms hold-up comes out as exactly the frames the Rust model keeps,
+    /// time-stamped in 1/fps slots. So the hold-up stays a gap (no copies
+    /// of the last frame fill it, no burst after it) and no new frame is
+    /// dropped. Skipped without FFmpeg.
+    #[test]
+    fn ffmpeg_paces_a_fast_source() {
+        let Ok(tools) = crate::tools::locate() else {
+            println!("note: skipping, ffmpeg is not available");
+            return;
+        };
+        // testsrc2's frame k is at k/1001 s; FFmpeg's `t` is pts * (1/1001).
+        let source: Vec<f64> = (0..3 * CAPTURE_POLL_FPS)
+            .map(|k| f64::from(k) * (1.0 / f64::from(CAPTURE_POLL_FPS)))
+            .filter(|&t| !(1.0..=1.1).contains(&t))
+            .collect();
+        for fps in [30, 60, 120, 144] {
+            let mut a = s(&["-hide_banner", "-nostdin", "-loglevel", "error"]);
+            a.extend(s(&["-f", "lavfi", "-i"]));
+            a.push(format!(
+                "testsrc2=size=64x36:rate={CAPTURE_POLL_FPS}:duration=3,\
+                 select='not(between(t,1,1.1))'"
+            ));
+            a.extend(["-vf".into(), pace_filter(fps)]);
+            a.extend(s(&["-fps_mode", "vfr", "-f", "framecrc", "-"]));
+            let run =
+                crate::tools::run_short(&tools.ffmpeg, &a, std::time::Duration::from_secs(60));
+            let Some((ok, out, err)) = run else {
+                panic!("ffmpeg didn't finish: {a:?}");
+            };
+            assert!(ok, "{fps}: {err}");
+            assert!(out.contains(&format!("#tb 0: 1/{fps}")), "{fps}: {out}");
+            let pts: Vec<i64> = out
+                .lines()
+                .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+                .map(|l| l.split(',').nth(2).unwrap().trim().parse().unwrap())
+                .collect();
+            let want: Vec<i64> = paced(&source, fps).iter().map(|k| k.1).collect();
+            assert_eq!(pts, want, "{fps}");
+            // One frame per slot except one gap of ~0.1 s for the hold-up.
+            let gaps: Vec<i64> = pts
+                .windows(2)
+                .map(|w| w[1] - w[0])
+                .filter(|&d| d != 1)
+                .collect();
+            assert_eq!(gaps.len(), 1, "{fps}: {gaps:?}");
+            let want_gap = 0.1 * f64::from(fps);
+            assert!((gaps[0] as f64 - want_gap).abs() <= 1.5, "{fps}: {gaps:?}");
+            let want_n = 2.9 * f64::from(fps);
+            assert!(
+                (pts.len() as f64 - want_n).abs() <= 2.0,
+                "{fps}: {}",
+                pts.len()
+            );
+        }
     }
 
     #[test]
@@ -644,24 +1000,24 @@ mod tests {
         let st = settings(VideoCodec::Hevc, Some(1080));
         let j = joined(&encoder_args(Step::GpuCuda, &st, upright(2560, 1440)));
         assert!(j.contains(
-            "-vf hwdownload,format=bgra,hwupload_cuda,scale_cuda=w=1920:h=1080:interp_algo=bicubic \
-             -c:v hevc_nvenc"
+            "settb=1/60,hwdownload,format=bgra,hwupload_cuda,scale_cuda=w=1920:h=1080:interp_algo=bicubic \
+             -fps_mode vfr -c:v hevc_nvenc"
         ));
         assert!(j.contains("-bf 0 -forced-idr 1 -an"));
         let st = settings(VideoCodec::H264, Some(1080));
         let j = joined(&encoder_args(Step::Cpu, &st, upright(2560, 1440)));
         assert!(j.contains(
-            "-vf hwdownload,format=bgra,scale=1920:1080:flags=bicubic,format=nv12,\
-             setparams=colorspace=bt470bg -c:v h264_nvenc"
+            "settb=1/60,hwdownload,format=bgra,scale=1920:1080:flags=bicubic,format=nv12,\
+             setparams=colorspace=bt470bg -fps_mode vfr -c:v h264_nvenc"
         ));
         let j = joined(&encoder_args(
             Step::Cpu,
             &settings(VideoCodec::H264, None),
             upright(2560, 1440),
         ));
-        assert!(
-            j.contains("-vf hwdownload,format=bgra,format=nv12,setparams=colorspace=bt470bg -c:v")
-        );
+        assert!(j.contains(
+            "settb=1/60,hwdownload,format=bgra,format=nv12,setparams=colorspace=bt470bg -fps_mode vfr -c:v"
+        ));
     }
 
     /// The portrait monitor of the PC this was tested on: Windows turns it
@@ -678,17 +1034,17 @@ mod tests {
         assert_eq!(output_size(2160, 3840, Some(1440)), (810, 1440));
         let j = joined(&encoder_args(Step::Cpu, &st, portrait(90)));
         assert!(j.contains(
-            "-vf hwdownload,format=bgra,scale=1440:810:flags=bicubic,format=nv12,\
-             transpose=clock,setparams=colorspace=bt470bg -c:v"
+            "settb=1/60,hwdownload,format=bgra,scale=1440:810:flags=bicubic,format=nv12,\
+             transpose=clock,setparams=colorspace=bt470bg -fps_mode vfr -c:v"
         ));
         let j = joined(&encoder_args(Step::GpuCuda, &st, portrait(90)));
         assert!(j.contains(
-            "-vf hwdownload,format=bgra,hwupload_cuda,\
-             scale_cuda=w=1440:h=810:interp_algo=bicubic,transpose_cuda=dir=clock -c:v"
+            "settb=1/60,hwdownload,format=bgra,hwupload_cuda,\
+             scale_cuda=w=1440:h=810:interp_algo=bicubic,transpose_cuda=dir=clock -fps_mode vfr -c:v"
         ));
         let j = joined(&encoder_args(Step::GpuCuda, &st, portrait(270)));
         assert!(j.contains(
-            "scale_cuda=w=1440:h=810:interp_algo=bicubic,transpose_cuda=dir=cclock -c:v"
+            "scale_cuda=w=1440:h=810:interp_algo=bicubic,transpose_cuda=dir=cclock -fps_mode vfr -c:v"
         ));
         let j = joined(&encoder_args(Step::Cpu, &st, portrait(270)));
         assert!(j.contains("format=nv12,transpose=cclock,setparams"));
@@ -696,11 +1052,13 @@ mod tests {
         // Native size: only the turn.
         let st = settings(VideoCodec::Av1, None);
         let j = joined(&encoder_args(Step::Cpu, &st, portrait(90)));
-        assert!(j.contains("-vf hwdownload,format=bgra,format=nv12,transpose=clock,setparams"));
-        let j = joined(&encoder_args(Step::GpuCuda, &st, portrait(90)));
         assert!(
-            j.contains("-vf hwdownload,format=bgra,hwupload_cuda,transpose_cuda=dir=clock -c:v")
+            j.contains("settb=1/60,hwdownload,format=bgra,format=nv12,transpose=clock,setparams")
         );
+        let j = joined(&encoder_args(Step::GpuCuda, &st, portrait(90)));
+        assert!(j.contains(
+            "settb=1/60,hwdownload,format=bgra,hwupload_cuda,transpose_cuda=dir=clock -fps_mode vfr -c:v"
+        ));
 
         // Upside down: same size, flipped both ways.
         let upside_down = Screen {
@@ -713,7 +1071,7 @@ mod tests {
         assert!(j.contains("scale=1920:1080:flags=bicubic,format=nv12,hflip,vflip,setparams"));
         let j = joined(&encoder_args(Step::GpuCuda, &st, upside_down));
         assert!(j.contains(
-            "scale_cuda=w=1920:h=1080:interp_algo=bicubic,transpose_cuda=dir=reversal -c:v"
+            "scale_cuda=w=1920:h=1080:interp_algo=bicubic,transpose_cuda=dir=reversal -fps_mode vfr -c:v"
         ));
     }
 
