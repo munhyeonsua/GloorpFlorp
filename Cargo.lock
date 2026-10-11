@@ -1419,7 +1419,6 @@ dependencies = [
  "rtrb",
  "rubato",
  "sonora",
- "windows",
 ]
 
 [[package]]

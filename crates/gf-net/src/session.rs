@@ -331,6 +331,26 @@ fn bind_error(e: &io::Error, port: u16) -> String {
     }
 }
 
+/// Binds the host's TCP listener and UDP socket to the same port. With
+/// port 0 the OS picks the TCP port, which may already be taken for UDP
+/// (e.g. by another program's socket), so a few ports are tried.
+fn bind_host(bind_ip: Ipv4Addr, port: u16) -> anyhow::Result<(TcpListener, UdpSocket)> {
+    let mut attempts = 0;
+    loop {
+        let listener = TcpListener::bind((bind_ip, port))
+            .map_err(|e| anyhow::anyhow!(bind_error(&e, port)))?;
+        let actual = listener.local_addr()?.port();
+        match UdpSocket::bind((bind_ip, actual)) {
+            Ok(udp) => return Ok((listener, udp)),
+            Err(e) if port == 0 && attempts < 20 => {
+                log::debug!("UDP port {actual} is taken ({e}); trying another port");
+                attempts += 1;
+            }
+            Err(e) => return Err(anyhow::anyhow!(bind_error(&e, actual))),
+        }
+    }
+}
+
 const UNREACHABLE: &str = "Couldn't reach your friend's PC over Tailscale. Check that both PCs show as connected in Tailscale and that your friend allowed GloorpFlorp through Windows Firewall.";
 
 fn connect_error(e: &io::Error) -> String {
@@ -348,11 +368,7 @@ pub(crate) fn start(
     let port = cfg.port;
     let (listener, udp) = match cfg.role {
         Role::Host { bind_ip } => {
-            let listener = TcpListener::bind((bind_ip, port))
-                .map_err(|e| anyhow::anyhow!(bind_error(&e, port)))?;
-            let actual = listener.local_addr()?.port();
-            let udp = UdpSocket::bind((bind_ip, actual))
-                .map_err(|e| anyhow::anyhow!(bind_error(&e, actual)))?;
+            let (listener, udp) = bind_host(bind_ip, port)?;
             listener.set_nonblocking(true)?;
             (Some(listener), udp)
         }

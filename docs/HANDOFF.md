@@ -19,34 +19,39 @@ agents that built the crates: `.claude/handoff/phase1-agent-reports.json` (proto
 | `gf-net`: TCP+UDP session, handshake, reconnect, video queue, stats | ✅ done | 29 pass |
 | `gf-video`: FFmpeg encoder (ddagrab → NVENC → FLV), mpv viewer | ✅ done | 22 unit + 4 integration pass (software encoders) |
 | `.github/workflows/build.yml`, `packaging/`, `README.md` | ✅ done | actionlint clean; packaging script run end to end with the real FFmpeg zip |
-| `gf-audio`: mic, echo cancellation, Opus, jitter, mixing, playback, game audio | ✅ written (cloud, phase 2) | 42 pass; clippy clean on Linux + windows-gnu |
-| `app`: engine, settings, logging, egui UI, end-to-end test | ✅ written (cloud, phase 2) | 5 unit + 3 end-to-end pass; clippy clean on Linux + windows-gnu; UI driven under Xvfb |
-| Integration (everything together, release build) | 🟡 partly: `cargo test --workspace` passes on Linux; the integration pass (cross-crate requests, workspace clippy, release exe, README wording) has not run | |
+| `gf-audio`: mic, echo cancellation, Opus, jitter, mixing, playback, game audio | ✅ done | 41 pass (Linux + native Windows) |
+| `app`: engine, settings, logging, egui UI, end-to-end test | ✅ done | 5 unit + 3 end-to-end pass (Linux + native Windows) |
+| Integration (everything together, release build) | ✅ done on the owner's PC (Windows 11, MSVC): `cargo build --workspace`, `cargo test --workspace`, `cargo clippy --workspace --all-targets -D warnings`, `cargo build --release -p gloorpflorp` → `target\release\GloorpFlorp.exe` | all pass |
 
-Nothing has run on real Windows/NVIDIA hardware yet.
+What has run on the real PC (no FFmpeg/mpv installed there yet): the
+release exe opens its window, finds Tailscale, both monitors, the real
+microphone and headphones, lists programs, and closes cleanly in < 1 s;
+`cargo run -p gf-sys --example sys_probe` captured real process-loopback
+audio ("everything except" and a single program); every test binary runs on
+Windows. **Screen sharing (FFmpeg/NVENC) and the mpv viewer have not run on
+Windows yet**, and the end-to-end test skipped its video part there (no
+FFmpeg).
 
 ## Next steps
 
-1. **Integrate.** `gf-audio` and `app` are written (phase 2, built in a Linux
-   cloud container). Do NOT re-run the Build phase of `finish-v1`; run only its
-   integrator step (the last `agent(...)` in `.claude/workflows/finish-v1.js`),
-   giving it the two phase-2 reports above. Open items it must handle are in
-   the reports' "Requests" sections (game-audio start/stop off the engine
-   thread, README label wording, `game_capturing` doc, etc.).
+1. ~~Integrate.~~ Done (see the status table and "Integration" below).
 2. **Review.** Run an adversarial review across the workspace: Windows API
    correctness, real-time audio safety, protocol edge cases, UI wording.
    Verify each finding before fixing it.
 3. **Test on real hardware** (this PC). Get `ffmpeg.exe` (BtbN
    `ffmpeg-master-latest-win64-gpl.zip`) and `mpv` (shinchiro
    `mpv-x86_64-*.7z`) next to the exe, or use `packaging/package-windows.ps1`.
-   Then check:
+   With FFmpeg on PATH, also re-run `cargo test --workspace` so the video
+   part of the end-to-end test and the gf-video/gf-proto FFmpeg tests run on
+   Windows. Then check:
    - [ ] `probe_encoders` finds AV1, HEVC and H.264 NVENC on the 5080
    - [ ] A short real share: ddagrab → av1_nvenc → viewer window shows it, delay feels low
-   - [ ] Scaling path if the monitor is above 1440p (the ladder falls through as expected)
-   - [ ] Monitor list matches the real monitors and ddagrab indices
-   - [ ] Game-audio capture: "everything except GloorpFlorp" and "only one program" (e.g. a YouTube tab in a browser)
+   - [ ] Scaling path: this PC's main monitor is 3840×2160 and the default cap is 1440p, so the ladder's GPU scaling is used (check which step wins in the log)
+   - [ ] The portrait monitor (2160×3840, index 1) shares correctly
+   - [x] Monitor list matches the real monitors (2 found: 3840×2160 primary, 2160×3840); ddagrab indices still to confirm
+   - [x] Game-audio capture works ("everything except" and one program, via `sys_probe`), and through the engine with real devices (a throwaway example: capture starts, level moves, stops; closing the picked program stops game audio within ~1.5 s with the plain message). Still to try from the window itself
    - [ ] Mic → echo cancellation → voice; push-to-talk key works while a game window has focus
-   - [ ] Two instances on one PC can't share port 47800, so test against the friend's PC, or add a dev-only port override
+   - [ ] Two copies on one PC: start both with `GLOORP_DEV_IP=127.0.0.1` (use `GLOORP_FAKE_AUDIO=1` on one of them, or headphones, to avoid feedback)
    - [ ] Windows Firewall prompt appears on first Host
 4. **Push without `[skip ci]`** so GitHub builds the zip. Check both jobs go green.
 5. **First session with the friend.** The friend's 3070 Ti PC needs an up-to-date NVIDIA driver (FFmpeg master needs a recent NVENC API).
@@ -65,6 +70,31 @@ Nothing has run on real Windows/NVIDIA hardware yet.
 - **NVENC VBV:** `-bufsize` = bitrate / 8. A keyframe can add up to ~125 ms
   on a link barely faster than the bitrate. Tune on the real link.
 - **Room code checksum:** the top 3 bits of SplitMix64 over the 52-bit payload.
+
+### Integration (phase 3)
+
+- **Audio thread in the engine.** `AudioEngine::start` (up to ~8 s) and
+  `start_game_audio` / `stop_game_audio` (up to ~10 s / ~2 s) run in order on
+  one `audio-control` thread, so network events are never delayed. The
+  engine shows game audio as "starting" (`Snapshot::game_audio_starting`)
+  and tells the friend `GameAudio{active:true}` only once the capture runs.
+  The UI's game-audio button is disabled for the few seconds audio takes to
+  start after launch.
+- **Host keeps its media when the friend drops.** The host can't tell a blip
+  from leaving, so its sharing and game audio keep running while the room
+  waits and are re-announced on rejoin. A joiner's own sharing/game audio
+  stop only when it gives up reconnecting or the host closes the room.
+  **Leave** always stops your own sharing and game audio.
+- **MMCSS "Pro Audio" thread boost** moved from gf-audio into gf-sys
+  (`gf_sys::raise_audio_thread_priority`), so gf-audio no longer depends on
+  the `windows` crate.
+- **gf-net, port 0:** the host retries when the OS-picked TCP port is already
+  taken for UDP (seen as a flaky test on Windows).
+- **New clippy (Rust 1.99):** `chunks_exact(N)` with a constant N is now
+  `as_chunks::<N>()` (needs Rust ≥ 1.88).
+- gf-audio's non-fatal device notes (e.g. "the microphone X isn't connected,
+  so the default microphone is used instead") are shown in orange under
+  "Voice", not in the red error banner.
 
 ## What the finished crates need from `gf-audio` and `app`
 
@@ -120,8 +150,10 @@ From the agents' reports (also check the code's doc comments):
 
 ## Known risks / unverified
 
-- All Windows-only code (DXGI monitor enumeration, WASAPI process loopback,
-  GetAsyncKeyState, job objects, CREATE_NO_WINDOW) is compile-checked only.
+- Windows-only code that has run on the real PC: DXGI monitor enumeration,
+  WASAPI process loopback, cpal/WASAPI device open, job object,
+  CREATE_NO_WINDOW, MMCSS, the egui window. Not yet exercised for real:
+  GetAsyncKeyState push-to-talk in a game, ddagrab/NVENC, mpv.
 - `wasapi`'s `new_application_loopback_client` waits with no timeout. If
   Windows never activates capture, `start()` gives up after 10 s and leaves
   a stuck thread (logged).

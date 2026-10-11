@@ -52,7 +52,6 @@ mod level;
 mod mic;
 mod mixer;
 mod playout;
-mod prio;
 mod resample;
 mod shared;
 
@@ -144,6 +143,9 @@ pub struct AudioStatus {
     pub peer_talking: bool,
     /// Our outgoing game audio level, 0..1.
     pub game_level: f32,
+    /// Game-audio capture is running and hasn't reported a problem. Becomes
+    /// false when it stops or fails (e.g. the chosen program exited); the
+    /// reason is then in `error`.
     pub game_capturing: bool,
     pub voice_jitter: JitterStats,
     pub game_jitter: JitterStats,

@@ -88,7 +88,7 @@ pub(crate) fn fake_tone(
     let mut sent: u32 = 0;
     ready();
     while !stop.load(Ordering::Relaxed) {
-        for frame in buf.chunks_exact_mut(2) {
+        for frame in buf.as_chunks_mut::<2>().0 {
             let s = (phase.sin() * 0.1) as f32;
             frame[0] = s;
             frame[1] = s;
@@ -138,7 +138,7 @@ mod tests {
         );
         let peak = samples.iter().fold(0f32, |m, s| m.max(s.abs()));
         assert!(peak > 0.09 && peak <= 0.1001, "peak {peak}");
-        assert!(samples.chunks_exact(2).all(|f| f[0] == f[1]));
+        assert!(samples.as_chunks::<2>().0.iter().all(|f| f[0] == f[1]));
         // 440 Hz: about 2 * 440 sign changes per second on one channel.
         let left: Vec<f32> = samples.iter().step_by(2).copied().collect();
         let crossings = left

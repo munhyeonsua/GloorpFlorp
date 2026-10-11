@@ -123,7 +123,7 @@ impl GameEncoder {
     }
 
     fn run(mut self, mut consumer: rtrb::Consumer<f32>, stop: &AtomicBool) {
-        let _priority = crate::prio::raise();
+        let _priority = gf_sys::raise_audio_thread_priority();
         let mut buf = vec![0f32; 4096];
         let mut pending: Vec<f32> = Vec::with_capacity(RING_SAMPLES);
         let mut last_data = Instant::now();

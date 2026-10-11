@@ -243,7 +243,7 @@ pub(crate) fn run(
     mut reference: rtrb::Producer<f32>,
     feeds: Receiver<Option<OutputFeed>>,
 ) {
-    let _priority = crate::prio::raise();
+    let _priority = gf_sys::raise_audio_thread_priority();
     let mut device: Option<DeviceOut> = None;
     let mut frame = vec![0f32; AUDIO_FRAME_SAMPLES * 2];
     let mut mono = vec![0f32; AUDIO_FRAME_SAMPLES];

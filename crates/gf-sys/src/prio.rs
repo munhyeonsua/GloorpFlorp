@@ -4,12 +4,13 @@
 //! normally do), falling back to a higher thread priority. Elsewhere: nothing.
 
 /// Keeps the raised priority until dropped (on the same thread).
-pub(crate) struct AudioThreadPriority {
+#[must_use = "the priority is restored when this is dropped"]
+pub struct AudioThreadPriority {
     #[cfg(windows)]
     mmcss: Option<windows::Win32::Foundation::HANDLE>,
 }
 
-pub(crate) fn raise() -> AudioThreadPriority {
+pub fn raise_audio_thread_priority() -> AudioThreadPriority {
     #[cfg(windows)]
     {
         use windows::Win32::System::Threading::{
@@ -59,7 +60,7 @@ impl Drop for AudioThreadPriority {
 mod tests {
     #[test]
     fn raise_and_restore() {
-        let guard = super::raise();
+        let guard = super::raise_audio_thread_priority();
         drop(guard);
     }
 }

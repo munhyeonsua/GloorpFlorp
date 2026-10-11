@@ -265,7 +265,7 @@ impl MicPipeline {
 /// The mic thread: waits for microphone samples and pushes them through
 /// the pipeline 10 ms at a time.
 pub(crate) fn run(mut pipeline: MicPipeline, feeds: Receiver<Option<InputFeed>>) {
-    let _priority = crate::prio::raise();
+    let _priority = gf_sys::raise_audio_thread_priority();
     let shared = pipeline.shared.clone();
     let mut input: Option<(rtrb::Consumer<f32>, Resampler)> = None;
     let mut raw = vec![0f32; 4096];

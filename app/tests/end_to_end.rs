@@ -1,7 +1,7 @@
 //! Two engines (host + joiner) talking over 127.0.0.1 with fake audio
 //! (`GLOORP_FAKE_AUDIO=1`) and FFmpeg's test pattern instead of the screen
 //! (`GLOORP_FAKE_VIDEO=1`, always the case off Windows). The video part is
-//! skipped when FFmpeg isn't installed.
+//! skipped when FFmpeg (with a software encoder) isn't installed.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Once;
@@ -126,7 +126,12 @@ fn join(host: &Engine, joiner: &Engine) {
 fn two_engines_end_to_end() {
     init();
     let video = match gf_video::Tools::locate() {
-        Ok(_) => true,
+        // GLOORP_FAKE_VIDEO is set, so this checks the software encoders.
+        Ok(tools) if !gf_video::probe_encoders(&tools).is_empty() => true,
+        Ok(_) => {
+            println!("note: this FFmpeg has no usable software encoder, so the video part of this test is skipped");
+            false
+        }
         Err(_) => {
             println!("note: FFmpeg isn't available, so the video part of this test is skipped");
             false
@@ -204,7 +209,13 @@ fn two_engines_end_to_end() {
         !s.peer_game_audio
     });
 
-    // The joiner leaves: the host sees it and keeps the room open.
+    host.send(Command::StartGameAudio);
+    wait_for(&joiner, "the host's game audio again", T, |s| {
+        s.peer_game_audio
+    });
+
+    // The joiner leaves: the host sees it and keeps the room open (and its
+    // game audio, for when the friend comes back).
     joiner.send(Command::Leave);
     wait_for(&joiner, "the joiner to be idle", T, |s| {
         s.phase == Phase::Idle
@@ -216,10 +227,18 @@ fn two_engines_end_to_end() {
         s.info.as_deref().is_some_and(|i| i.contains("left")),
         "{s:#?}"
     );
+    assert!(s.my_game_audio, "{s:#?}");
 
-    // Rejoin, then the host leaves: the joiner sees the room close.
+    // Rejoin: the friend is told about the game audio again. Then the host
+    // leaves: the joiner sees the room close, the host's game audio stops.
     join(&host, &joiner);
+    wait_for(&joiner, "the host's game audio after rejoining", T, |s| {
+        s.peer_game_audio && s.audio.game_jitter.received > 0
+    });
     host.send(Command::Leave);
+    wait_for(&host, "the host's game audio to stop on Leave", T, |s| {
+        !s.my_game_audio && s.phase == Phase::Idle
+    });
     let s = wait_for(&joiner, "the joiner to see the host leave", T, |s| {
         s.phase == Phase::Idle
     });

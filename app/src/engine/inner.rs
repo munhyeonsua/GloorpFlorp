@@ -63,6 +63,65 @@ enum Internal {
         gen: u64,
         result: EncoderStart,
     },
+    /// The audio engine started (or couldn't).
+    AudioReady(Result<Arc<AudioEngine>, String>),
+    GameAudioReady {
+        gen: u64,
+        result: Result<(), String>,
+    },
+}
+
+/// Work for the audio thread: starting audio and starting or stopping game
+/// audio can each block for seconds, so they never run on the engine thread.
+/// Jobs run one at a time, in order.
+enum AudioJob {
+    StartGame { gen: u64, source: GameAudioSource },
+    StopGame,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GameAudio {
+    Off,
+    /// Asked the audio thread to start (or switch) the capture.
+    Starting,
+    On,
+}
+
+/// The audio thread: starts the audio engine, then runs game-audio jobs
+/// until the engine thread hangs up.
+fn audio_thread(
+    settings: AudioSettings,
+    sink: PacketSink,
+    jobs: Receiver<AudioJob>,
+    tx: Sender<Internal>,
+) {
+    let audio = match AudioEngine::start(settings, sink) {
+        Ok(a) => Arc::new(a),
+        Err(e) => {
+            let _ = tx.send(Internal::AudioReady(Err(e.to_string())));
+            return;
+        }
+    };
+    if tx.send(Internal::AudioReady(Ok(audio.clone()))).is_err() {
+        return;
+    }
+    while let Ok(mut job) = jobs.recv() {
+        // Each job sets the final state by itself, so only the newest counts.
+        while let Ok(next) = jobs.try_recv() {
+            job = next;
+        }
+        match job {
+            AudioJob::StartGame { gen, source } => {
+                log::info!("starting game audio from {source:?}");
+                let result = audio.start_game_audio(source).map_err(|e| e.to_string());
+                let _ = tx.send(Internal::GameAudioReady { gen, result });
+            }
+            AudioJob::StopGame => {
+                audio.stop_game_audio();
+                log::info!("game audio stopped");
+            }
+        }
+    }
 }
 
 /// Drops `value` (stopping a child process, a session, ...) on a helper
@@ -94,9 +153,15 @@ struct Core {
     tools: Option<Tools>,
     tools_error: Option<String>,
 
-    audio: Option<AudioEngine>,
+    /// Set once the audio thread has started the audio engine.
+    audio: Option<Arc<AudioEngine>>,
+    /// Jobs for the audio thread; `None` if audio couldn't start.
+    audio_jobs: Option<Sender<AudioJob>>,
     /// Where the audio engine's packets go (the current session, if any).
     audio_net: Arc<Mutex<Option<NetTx>>>,
+    game_audio: GameAudio,
+    /// Bumped for every game-audio start or stop, so a late result is discarded.
+    game_gen: u64,
 
     net: Option<Net>,
     net_rx: Receiver<NetEvent>,
@@ -151,7 +216,10 @@ pub(super) fn run(
         tools: None,
         tools_error: None,
         audio: None,
+        audio_jobs: None,
         audio_net: Arc::new(Mutex::new(None)),
+        game_audio: GameAudio::Off,
+        game_gen: 0,
         net: None,
         net_rx: never(),
         session_gen: 0,
@@ -290,12 +358,18 @@ impl Core {
                 tx.send_audio(stream, seq, ts, data);
             }
         });
-        match AudioEngine::start(AudioSettings::from(&self.settings.audio), sink) {
-            Ok(a) => {
-                self.audio = Some(a);
-                self.snap.audio_running = true;
+        let (jobs_tx, jobs_rx) = crossbeam_channel::unbounded();
+        let settings = AudioSettings::from(&self.settings.audio);
+        let tx = self.internal_tx.clone();
+        match std::thread::Builder::new()
+            .name("audio-control".into())
+            .spawn(move || audio_thread(settings, sink, jobs_rx, tx))
+        {
+            Ok(_) => self.audio_jobs = Some(jobs_tx),
+            Err(e) => {
+                log::error!("couldn't start the audio thread: {e}");
+                self.error(NO_AUDIO);
             }
-            Err(e) => self.error(e.to_string()),
         }
         self.publish(true);
     }
@@ -308,9 +382,10 @@ impl Core {
         self.enc_rx = never();
         self.encoder = None;
         self.viewer = None;
-        if let Some(audio) = self.audio.take() {
-            audio.stop_game_audio();
-        }
+        // The audio thread ends once it has no more jobs; whichever of us
+        // drops the audio engine last stops it (game audio included).
+        self.audio_jobs = None;
+        self.audio = None;
         self.snap = Snapshot::default();
         self.publish(true);
         log::info!("engine stopped");
@@ -377,6 +452,8 @@ impl Core {
         self.snap.info = None;
         self.session_gen += 1;
         self.hosting = true;
+        self.snap.room_code = None;
+        self.snap.listen_addr = None;
         self.snap.phase = Phase::Hosting {
             code: String::new(),
             waiting: false,
@@ -782,7 +859,8 @@ impl Core {
             |s: ShareInfo| (s.codec, s.width, s.height) == (info.codec, info.width, info.height);
         match self.viewer_for {
             Some((shown, _)) if open && same_picture(shown) => {
-                // Same picture format: keep the window (e.g. after a reconnect).
+                // Same picture format (the friend restarted their encoder,
+                // e.g. a new frame rate): keep the window.
                 self.send(TcpMsg::Watching { on: true });
             }
             Some(_) if open => self.open_viewer(info),
@@ -820,12 +898,22 @@ impl Core {
         }
     }
 
+    fn set_game_audio(&mut self, state: GameAudio) {
+        self.game_audio = state;
+        self.game_dead_since = None;
+        self.snap.my_game_audio = state != GameAudio::Off;
+        self.snap.game_audio_starting = state == GameAudio::Starting;
+        self.urgent = true;
+    }
+
     /// Starts game audio, or switches it to the source now in the settings.
+    /// The capture starts on the audio thread (Windows can take a while to
+    /// activate it); the friend is told once it runs.
     fn start_game_audio(&mut self) {
-        if self.audio.is_none() {
+        let Some(jobs) = self.audio_jobs.clone() else {
             self.error(NO_AUDIO);
             return;
-        }
+        };
         let source = match self.game_audio_source() {
             Ok(s) => s,
             Err(msg) => {
@@ -834,39 +922,39 @@ impl Core {
                 return;
             }
         };
-        let Some(audio) = &self.audio else { return };
-        let was_on = self.snap.my_game_audio;
-        if was_on {
-            audio.stop_game_audio();
+        self.game_gen += 1;
+        let gen = self.game_gen;
+        if jobs.send(AudioJob::StartGame { gen, source }).is_err() {
+            self.stop_game_audio(true);
+            self.error(NO_AUDIO);
+            return;
         }
-        // May take a moment (Windows activates the capture).
-        log::info!("starting game audio from {source:?}");
-        match audio.start_game_audio(source) {
+        self.set_game_audio(GameAudio::Starting);
+    }
+
+    fn game_audio_started(&mut self, result: Result<(), String>) {
+        match result {
             Ok(()) => {
-                self.snap.my_game_audio = true;
-                if !was_on {
-                    self.send(TcpMsg::GameAudio { active: true });
-                }
+                self.set_game_audio(GameAudio::On);
+                self.send(TcpMsg::GameAudio { active: true });
             }
-            Err(e) => {
-                self.snap.my_game_audio = false;
-                if was_on {
-                    self.send(TcpMsg::GameAudio { active: false });
-                }
-                self.error(e.to_string());
+            Err(msg) => {
+                self.set_game_audio(GameAudio::Off);
+                self.send(TcpMsg::GameAudio { active: false });
+                self.error(msg);
             }
         }
     }
 
     fn stop_game_audio(&mut self, announce: bool) {
-        if !self.snap.my_game_audio {
+        if self.game_audio == GameAudio::Off {
             return;
         }
-        if let Some(a) = &self.audio {
-            a.stop_game_audio();
+        self.game_gen += 1;
+        if let Some(jobs) = &self.audio_jobs {
+            let _ = jobs.send(AudioJob::StopGame);
         }
-        log::info!("game audio stopped");
-        self.snap.my_game_audio = false;
+        self.set_game_audio(GameAudio::Off);
         if announce {
             self.send(TcpMsg::GameAudio { active: false });
         }
@@ -997,6 +1085,25 @@ impl Core {
                     }
                 }
             }
+            Internal::AudioReady(Ok(audio)) => {
+                // The settings may have changed while it started.
+                audio.set_settings(AudioSettings::from(&self.settings.audio));
+                self.snap.audio = audio.status();
+                self.snap.audio_running = true;
+                self.audio = Some(audio);
+            }
+            Internal::AudioReady(Err(msg)) => {
+                self.audio_jobs = None;
+                if self.game_audio != GameAudio::Off {
+                    self.set_game_audio(GameAudio::Off);
+                }
+                self.error(msg);
+            }
+            Internal::GameAudioReady { gen, result } => {
+                if gen == self.game_gen {
+                    self.game_audio_started(result);
+                }
+            }
         }
     }
 
@@ -1057,7 +1164,7 @@ impl Core {
                 if let ShareState::Live(i) = self.snap.my_share {
                     self.announce_share(i);
                 }
-                if self.snap.my_game_audio {
+                if self.game_audio == GameAudio::On {
                     self.send(TcpMsg::GameAudio { active: true });
                 }
             }
@@ -1071,24 +1178,29 @@ impl Core {
                     // Keep sharing and game audio; they're announced again on reconnect.
                     self.snap.phase = Phase::Reconnecting;
                     self.info(format!("{reason} Trying to reconnect…"));
+                } else if self.hosting {
+                    // The host can't tell a network blip from leaving, so its
+                    // sharing and game audio keep running (like before the
+                    // friend first joined) and are announced again when the
+                    // friend rejoins.
+                    let code = self.snap.room_code.clone().unwrap_or_default();
+                    self.snap.phase = Phase::Hosting {
+                        code,
+                        waiting: true,
+                    };
+                    self.info(format!(
+                        "{reason} The room stays open, so they can join again with the same code."
+                    ));
                 } else {
+                    // The joiner's session is over for good.
                     self.stop_local_media();
-                    if self.hosting {
-                        let code = self.snap.room_code.clone().unwrap_or_default();
-                        self.snap.phase = Phase::Hosting {
-                            code,
-                            waiting: true,
-                        };
-                        self.info(format!("{reason} The room stays open, so they can join again with the same code."));
+                    self.close_net();
+                    self.snap.phase = Phase::Idle;
+                    self.snap.net = Default::default();
+                    if was_reconnecting {
+                        self.error(reason);
                     } else {
-                        self.close_net();
-                        self.snap.phase = Phase::Idle;
-                        self.snap.net = Default::default();
-                        if was_reconnecting {
-                            self.error(reason);
-                        } else {
-                            self.info(reason);
-                        }
+                        self.info(reason);
                     }
                 }
             }
@@ -1151,7 +1263,7 @@ impl Core {
         }
         // A capture that reports a problem (e.g. the chosen program exited)
         // has stopped for good: tell the user and the friend.
-        if self.snap.my_game_audio && !self.snap.audio.game_capturing {
+        if self.game_audio == GameAudio::On && !self.snap.audio.game_capturing {
             let since = *self.game_dead_since.get_or_insert(now);
             if now.duration_since(since) >= GAME_DEAD_AFTER {
                 log::warn!("game audio capture stopped: {:?}", self.snap.audio.error);

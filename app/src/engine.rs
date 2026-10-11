@@ -4,7 +4,8 @@
 //!
 //! Slow work (finding the Tailscale address, probing encoders, starting
 //! FFmpeg, listing devices, stopping child processes) runs on short-lived
-//! helper threads that report back to the engine thread.
+//! helper threads that report back to the engine thread. Starting audio and
+//! starting/stopping game audio run in order on one audio thread.
 
 mod inner;
 
@@ -120,10 +121,15 @@ pub struct Snapshot {
     pub frames_received: u64,
     pub recv_fps: f32,
     pub viewer_open: bool,
+    /// Game audio is on (or starting; see `game_audio_starting`).
     pub my_game_audio: bool,
+    /// Windows is still starting the game-audio capture; the friend is told
+    /// once it runs.
+    pub game_audio_starting: bool,
     pub peer_game_audio: bool,
     pub net: NetStats,
-    /// False if audio couldn't start at all (see `error`).
+    /// False while audio is starting (a few seconds after launch), and if it
+    /// couldn't start at all (see `error`).
     pub audio_running: bool,
     pub audio: AudioStatus,
     pub monitors: Vec<Monitor>,

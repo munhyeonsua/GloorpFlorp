@@ -5,8 +5,11 @@
 pub mod keys;
 
 mod capture;
+mod prio;
 #[cfg(windows)]
 mod win;
+
+pub use prio::{raise_audio_thread_priority, AudioThreadPriority};
 
 use std::io::Read;
 use std::net::Ipv4Addr;

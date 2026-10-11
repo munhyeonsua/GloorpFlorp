@@ -24,6 +24,10 @@ Full guide: open "GloorpFlorp Guide.html" in this folder.
    Your friend's screen opens in its own window. Press f or double-click
    it for fullscreen. Close it any time; reopen it with "Open viewer".
 
+6. To send your game's sound: under "Game audio" pick "Everything except
+   GloorpFlorp" or "Only one program", then click "Start sending game
+   audio". Leave stops your sharing and game audio.
+
 Something wrong? See "Troubleshooting" in the guide. When asking for help,
 send your log file: press Windows+R, paste %APPDATA%\GloorpFlorp and press
 Enter, then send log.txt from that folder.

@@ -18,8 +18,5 @@ sonora.workspace = true
 rubato.workspace = true
 rtrb.workspace = true
 
-[target.'cfg(windows)'.dependencies]
-windows = { workspace = true, features = ["Win32_Foundation", "Win32_System_Threading"] }
-
 [dev-dependencies]
 rand.workspace = true

@@ -45,7 +45,13 @@ pub(crate) fn mix(voice: &[f32], game: &[f32], p: MixParams, out: &mut [f32]) {
         sanitize_volume(p.voice_volume),
         sanitize_volume(p.game_volume),
     );
-    for ((o, g), &v) in out.chunks_exact_mut(2).zip(game.chunks_exact(2)).zip(voice) {
+    for ((o, g), &v) in out
+        .as_chunks_mut::<2>()
+        .0
+        .iter_mut()
+        .zip(game.as_chunks::<2>().0)
+        .zip(voice)
+    {
         o[0] = (v * vv + g[0] * gv).clamp(-1.0, 1.0);
         o[1] = (v * vv + g[1] * gv).clamp(-1.0, 1.0);
     }
@@ -53,7 +59,7 @@ pub(crate) fn mix(voice: &[f32], game: &[f32], p: MixParams, out: &mut [f32]) {
 
 /// Stereo to mono (the echo canceller's reference).
 pub(crate) fn downmix(stereo: &[f32], mono: &mut [f32]) {
-    for (m, s) in mono.iter_mut().zip(stereo.chunks_exact(2)) {
+    for (m, s) in mono.iter_mut().zip(stereo.as_chunks::<2>().0) {
         *m = 0.5 * (s[0] + s[1]);
     }
 }
@@ -65,10 +71,16 @@ pub(crate) fn spread(stereo: &[f32], channels: usize, out: &mut Vec<f32>) {
     out.clear();
     match channels {
         0 => {}
-        1 => out.extend(stereo.chunks_exact(2).map(|s| 0.5 * (s[0] + s[1]))),
+        1 => out.extend(
+            stereo
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|s| 0.5 * (s[0] + s[1])),
+        ),
         2 => out.extend_from_slice(stereo),
         n => {
-            for s in stereo.chunks_exact(2) {
+            for s in stereo.as_chunks::<2>().0 {
                 out.extend_from_slice(s);
                 out.extend(std::iter::repeat_n(0.0, n - 2));
             }

@@ -153,7 +153,12 @@ Good to know:
   stops anyone joining by accident.
 - If the connection drops, the friend's PC tries to reconnect by itself for
   30 seconds. The host keeps waiting, so the friend can rejoin with the same
-  code for as long as the host leaves GloorpFlorp open.
+  code for as long as the host leaves GloorpFlorp open. The host's screen
+  sharing and game audio keep going, so the friend sees and hears them again
+  as soon as they're back.
+- **Leave** disconnects you. It also stops your screen sharing and game
+  audio. **New code** (while waiting for your friend) closes the room and
+  opens a new one with a different code.
 
 ### Share your screen
 
@@ -171,7 +176,8 @@ Good to know:
 ### Watch your friend's screen
 
 - When your friend starts sharing, their screen opens in its **own window**
-  by itself (you can turn this off in the settings).
+  by itself. To stop that, untick **Open the viewer by itself when my friend
+  starts sharing** under "Friend's screen".
 - Move and resize it like any other window. A second monitor is ideal.
 - Press **f** or **double-click** the picture to switch fullscreen on or off.
 - Close the window whenever you like. Your friend's PC then stops sending
@@ -182,14 +188,18 @@ Good to know:
 ### Game audio
 
 Game audio is separate from video: you can send your PC's sound with or
-without sharing your screen. Turn it on and choose what to send:
+without sharing your screen. Under "Game audio", choose what to send, then
+click **Start sending game audio** (and **Stop sending game audio** when
+you're done). It always starts off when you open GloorpFlorp.
 
 - **Everything except GloorpFlorp**: all sound your PC plays (game, music,
   videos, other voice chat apps) except GloorpFlorp's own sound, so your
   friend never hears their own voice coming back.
 - **Only one program**: pick it from the list, for example
   `EscapeFromTarkov.exe`. Only that program's sound is sent. Start the game
-  first so it shows up in the list. If you restart the game, choose it again.
+  first so it shows up in the list (click **Refresh** if it's missing). If
+  you close the game, game audio stops by itself: after restarting the game,
+  click **Start sending game audio** again.
 
 You keep hearing your game as normal. Your friend can set the volume of your
 game separately from your voice.
@@ -219,8 +229,9 @@ Also:
 - **Deafen**: you hear nothing from your friend (no voice, no game audio).
 - **Volume**: separate sliders for your friend's voice and your friend's game
   audio.
-- **Microphone and speakers**: choose them in the settings. "Default" follows
-  Windows' sound settings.
+- **Microphone and speakers**: choose them under "Voice". "System default"
+  follows Windows' sound settings. If the one you chose is unplugged,
+  GloorpFlorp uses the system default until it's back.
 - **Noise suppression, echo cancellation and automatic mic volume** are on by
   default. Leave them on unless you have a reason not to.
 
@@ -229,10 +240,12 @@ GloorpFlorp doesn't hook into your keyboard or touch the game in any way.
 
 ### Connection details
 
-The connection details panel shows how things are going:
+Click **Connection details** at the bottom of the window to see how things
+are going:
 
 - **Ping**: the round trip time between the PCs. Under about 50 ms is great.
-- **Bitrates**: how much video and audio is being sent and received.
+- **Bitrates: video** and **Bitrates: audio**: how much video and audio is
+  being sent and received.
 - **Dropped frames**: video frames skipped because the network couldn't keep
   up. If this keeps climbing, lower the bitrate.
 - **Audio loss**: missing audio packets. A few percent is fine; small gaps
@@ -268,14 +281,14 @@ The connection details panel shows how things are going:
 | GloorpFlorp says Tailscale isn't running | Start Tailscale from the Start menu and sign in. The tray icon should show you as connected. Then click **Host** again. |
 | The friend can't connect | Is GloorpFlorp still open on the host's PC? Are both PCs connected in Tailscale, and can each see the other in Tailscale's device list? With two Tailscale accounts, the person whose PC is *shared* must host. Check the host's firewall (next row). In Command Prompt on the friend's PC, run `tailscale ping <host's PC name>`: if that fails, the problem is in Tailscale, not GloorpFlorp. |
 | Firewall: you clicked Cancel, or only ticked Private | Press Start, type **Allow an app through Windows Firewall** and open it. Click **Change settings**, find **GloorpFlorp**, tick both **Private** and **Public**, then **OK**. If it isn't listed, click **Allow another app...** and pick `GloorpFlorp.exe`. Windows asks again if you move the GloorpFlorp folder. |
-| "Wrong code" or "typo" message | Copy and paste the code instead of typing it. If the host restarted GloorpFlorp or clicked Host again, the code may have changed: ask for the current one. |
+| "Wrong code" or "typo" message | Copy and paste the code instead of typing it. If the host restarted GloorpFlorp or clicked **New code**, the code has changed: ask for the current one. |
 | A message about different versions | You're using different builds. Both of you use the same zip (compare `VERSIONS.txt`). |
 | Everything is slow or laggy | Open Command Prompt and run `tailscale status`. If the line for your friend's PC says **relay** (instead of **direct**), your data goes through Tailscale's relay servers, which are much slower. Restart Tailscale on both PCs, turn off any other VPN and try again. Some home routers need UPnP turned on for a direct connection. Until then, use a low bitrate. |
 | The viewer window stays black | Wait a few seconds. Check that your friend is still sharing and picked the right monitor. Games in exclusive fullscreen can't always be captured: switch the game to borderless windowed. On a laptop, the shared monitor must be connected to the NVIDIA graphics card. Close the viewer and click **Open viewer**. |
 | Video is choppy or freezes now and then | Lower the bitrate (try 15 Mbps) or choose 1080p. Check `tailscale status` for **relay** (see above). Pause downloads. If **dropped frames** in the connection details keeps climbing, the network can't keep up. |
 | An error about NVENC, the encoder or the driver when you start sharing | Update your NVIDIA driver and restart the PC; this fixes most of these. Then try another codec (H.264) in the settings. Close other programs that record with the graphics card (OBS, NVIDIA Instant Replay) and try again. |
 | "Couldn't find FFmpeg", or the viewer never opens | GloorpFlorp can't find its `ffmpeg` or `mpv` folder. Extract the whole zip again and run `GloorpFlorp.exe` from the extracted folder. If your antivirus removed a file, restore it, then extract again. |
-| Your friend hears no game audio | Check that game audio is turned on and the right program is chosen. Some games play sound from a different program than the one with the window: try **Everything except GloorpFlorp**. If you restarted the game, choose it again. Ask your friend to check their game-audio slider and that they're not deafened. |
+| Your friend hears no game audio | Check that GloorpFlorp says "Sending game audio." (click **Start sending game audio**) and that the right program is chosen. Some games play sound from a different program than the one with the window: try **Everything except GloorpFlorp**. If you restarted the game, click **Start sending game audio** again. Ask your friend to check their game-audio volume slider and that they're not deafened. |
 | Your friend hears an echo of their own voice | You're probably on speakers: use a headset, or turn your speakers down and keep echo cancellation on. If you're also in a Discord call together, send only one program's game audio (see [Game audio](#game-audio)). |
 | Your friend can't hear you | Check that you're not muted, the right microphone is chosen, and the mic meter moves when you talk. With push-to-talk, hold the key while talking. In Windows Settings, under Privacy, Microphone, make sure desktop apps may use the microphone. |
 | Push-to-talk doesn't work while the game is running | If the game (or its launcher) runs as administrator, Windows hides its key presses from normal programs. Close GloorpFlorp, right-click `GloorpFlorp.exe` and choose **Run as administrator**. |
@@ -311,10 +324,9 @@ To be honest about what GloorpFlorp is and isn't:
 - **No recording, no remote control.**
 - **Not code-signed**, so Windows shows the "Windows protected your PC"
   warning the first time.
-- **Not yet tested on the real PCs.** GloorpFlorp was built without access to
-  the two PCs it's meant for (no NVIDIA card, no Windows desktop), so the
-  first real session may uncover problems. When something doesn't work, send
-  the log files from both PCs.
+- **Not fully tested yet.** Screen sharing and a real session between the two
+  PCs haven't been tried yet, so the first real session may uncover problems.
+  When something doesn't work, send the log files from both PCs.
 
 ## Updating
 
@@ -351,7 +363,21 @@ on your PATH).
 
 **Tests:** `cargo test --workspace`. Most tests also run on Linux (install
 `libasound2-dev`, `cmake` and `ffmpeg`). There, the Windows-specific parts
-are stubs and video uses FFmpeg's test pattern with software encoders.
+are stubs and video uses FFmpeg's test pattern with software encoders. Tests
+that need FFmpeg skip their video part (with a note) when it isn't found.
+
+**Environment variables for development and tests:**
+
+| Variable | Effect |
+|---|---|
+| `GLOORP_FAKE_AUDIO=1` | No sound devices: the microphone is a test tone, playback goes nowhere, game audio is a 440 Hz tone. |
+| `GLOORP_FAKE_VIDEO=1` | On Windows too: FFmpeg's test pattern with software encoders instead of the screen and NVENC; without mpv the viewer is a hidden FFmpeg process. |
+| `GLOORP_DEV_IP=127.0.0.1` | Host and join on this address instead of Tailscale, so two copies can talk on one PC. |
+| `GLOORP_DEV_PORT=47801` | Host on and join this port instead of 47800. |
+
+For two copies on one PC, start both with `GLOORP_DEV_IP=127.0.0.1`; one
+clicks Host, the other pastes the code and clicks Join. (If the host used
+`GLOORP_DEV_PORT`, give the joining copy the same port.)
 
 **CI:** [.github/workflows/build.yml](.github/workflows/build.yml) runs tests
 and clippy on Linux, and tests, the release build and packaging

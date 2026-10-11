@@ -47,7 +47,8 @@ non-NVIDIA support, internet use without Tailscale.
 ```
 crates/gf-proto   pure: wire format, room codes, FLV demuxer + viewer stream writer, jitter buffer
 crates/gf-sys     OS-specific: monitors, process loopback audio, key polling,
-                  Tailscale IP, child-process job object  (stubs on non-Windows)
+                  Tailscale IP, child-process job object,
+                  audio thread priority (MMCSS)  (stubs on non-Windows)
 crates/gf-net     the TCP+UDP session between the two PCs
 crates/gf-video   FFmpeg encoder process, mpv viewer process
 crates/gf-audio   mic → processing → Opus, game audio → Opus, jitter, mixing, playback
@@ -84,10 +85,17 @@ Everything is symmetric: both PCs run the same pipelines in both directions.
 5. Watch: on `ShareStarted` the viewer side opens mpv automatically
    (setting, default on) and sends `Watching{on:true}`. Closing the mpv
    window sends `Watching{on:false}`; an "Open viewer" button reopens it.
-6. Game audio: toggled independently of video; `GameAudio{active}` tells
-   the peer (for the UI).
-7. Disconnect: stop encoder sending, close viewer, `AudioEngine::reset_peer`.
-   Host keeps listening; joiner retries for 30 s.
+6. Game audio: toggled independently of video (always off at launch);
+   `GameAudio{active}` tells the peer (for the UI) once the capture runs.
+   Starting/stopping the capture can block for seconds, so the engine hands
+   it to its audio thread (which also starts the `AudioEngine`) and keeps
+   handling network events meanwhile.
+7. Disconnect: stop sending frames, close viewer, `AudioEngine::reset_peer`,
+   forget the peer's state. Host keeps listening, and its own sharing and
+   game audio keep running (re-announced when the friend rejoins). Joiner
+   retries for 30 s, keeping its own sharing and game audio; if it gives up
+   (or the host closed the room) they stop. **Leave** always stops your own
+   sharing and game audio.
 
 ## Codec choice
 
@@ -120,6 +128,7 @@ click Allow. The README explains this.
 - `app`: an end-to-end test runs two engines (host + joiner) on 127.0.0.1
   with fake capture (`GLOORP_FAKE_AUDIO=1`, test video source) and checks
   that video frames and audio packets arrive both ways.
-- Windows: the whole workspace is cross-compiled for `x86_64-pc-windows-gnu`
-  locally and built natively for `x86_64-pc-windows-msvc` in GitHub Actions.
-  Real NVENC / WASAPI / mpv behaviour can only be confirmed on the two PCs.
+- Windows: the workspace builds and its tests run natively on
+  `x86_64-pc-windows-msvc` (the owner's PC and GitHub Actions); on Linux it
+  can be cross-checked for `x86_64-pc-windows-gnu`. Real NVENC / mpv
+  behaviour can only be confirmed on the two PCs.

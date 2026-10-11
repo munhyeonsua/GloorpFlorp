@@ -234,7 +234,7 @@ impl GloorpApp {
                     }
                     if ui
                         .button("Leave")
-                        .on_hover_text("Close the room. Your friend can't join any more.")
+                        .on_hover_text("Close the room. Your friend can't join any more. Also stops your sharing and game audio.")
                         .clicked()
                     {
                         self.cmd(Command::Leave);
@@ -264,7 +264,9 @@ impl GloorpApp {
                 }
                 if ui
                     .button("Leave")
-                    .on_hover_text("Disconnect from your friend.")
+                    .on_hover_text(
+                        "Disconnect from your friend. Also stops your sharing and game audio.",
+                    )
                     .clicked()
                 {
                     self.cmd(Command::Leave);
@@ -277,7 +279,9 @@ impl GloorpApp {
                 });
                 if ui
                     .button("Leave")
-                    .on_hover_text("Stop trying to reconnect.")
+                    .on_hover_text(
+                        "Stop trying to reconnect. Also stops your sharing and game audio.",
+                    )
                     .clicked()
                 {
                     self.cmd(Command::Leave);
@@ -577,12 +581,17 @@ impl GloorpApp {
                     egui::Button::new("Start sending game audio"),
                 )
                 .on_hover_text("Your friend hears the sound chosen above. You keep hearing it too.")
+                .on_disabled_hover_text(
+                    "Sound is still starting, or isn't working (see the message above).",
+                )
                 .clicked()
             {
                 self.commands.push(Command::StartGameAudio);
             }
         });
-        ui.label(if snap.my_game_audio {
+        ui.label(if snap.game_audio_starting {
+            "Starting game audio…"
+        } else if snap.my_game_audio {
             "Sending game audio."
         } else {
             "Not sending game audio."
