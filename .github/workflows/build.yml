@@ -1,6 +1,7 @@
 # Tests GloorpFlorp on Linux and Windows and builds the ready-to-run Windows
 # zip (GloorpFlorp.exe + FFmpeg + mpv). Download it from a run's "Artifacts"
-# section. Pushing a tag like v0.1.0 also publishes it as a GitHub Release.
+# section. Pushing a tag like v1.0.0 also publishes it as a GitHub Release,
+# together with the source code of the exact FFmpeg and mpv builds inside.
 name: Build
 
 on:
@@ -32,10 +33,73 @@ jobs:
         with:
           persist-credentials: false
 
+      # ALSA headers for cpal, CMake for the Opus library. (FFmpeg comes
+      # from BtbN below; Ubuntu's own is too old.)
       - name: Install system packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libasound2-dev ffmpeg cmake pkg-config
+          sudo apt-get install -y --no-install-recommends libasound2-dev cmake pkg-config
+
+      # The tests run the real FFmpeg, and the screen-capture pacing needs
+      # FFmpeg 8.0 or newer (setpts's strip_fps); Ubuntu 24.04 ships 6.1.
+      # So use BtbN's static Linux build of FFmpeg master from the newest
+      # dated release, found the same way the Windows job finds the FFmpeg it
+      # ships (the same kind of build, though a new daily release can land
+      # between the two jobs). If BtbN can't be reached this
+      # fails instead of falling back to Ubuntu's FFmpeg: the Windows job
+      # can't package without BtbN either, and a fallback would turn the
+      # pacing test into a silent skip and run the rest against an FFmpeg
+      # nobody tested with.
+      - name: Install FFmpeg
+        timeout-minutes: 10
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FFMPEG_REPO: BtbN/FFmpeg-Builds
+          # e.g. ffmpeg-N-127271-gba987fe24d-linux64-gpl.tar.xz (master, GPL).
+          FFMPEG_REGEX: '^ffmpeg-N-.*-linux64-gpl\.tar\.xz$'
+          FFMPEG_LATEST_URL: https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
+        run: |
+          set -euo pipefail
+          # "<tag> <url>" of the newest dated release with exactly one match.
+          found=$(gh api "repos/$FFMPEG_REPO/releases?per_page=10" --jq '
+            [.[] | select((.draft | not) and (.tag_name | startswith("autobuild-")))]
+            | sort_by(.published_at) | reverse
+            | map({tag: .tag_name, urls: [.assets[] | select(.name | test(env.FFMPEG_REGEX)) | .browser_download_url]})
+            | map(select(.urls | length == 1)) | first // empty
+            | "\(.tag) \(.urls[0])"') || found=''
+          if [ -n "$found" ]; then
+            release=${found%% *}
+            url=${found#* }
+          else
+            release=latest
+            url=$FFMPEG_LATEST_URL
+            echo "::warning::Could not find a dated FFmpeg build matching '$FFMPEG_REGEX' in the releases of $FFMPEG_REPO, so the 'latest' one is used. If BtbN renamed the files, update FFMPEG_REGEX in .github/workflows/build.yml."
+          fi
+          archive="$RUNNER_TEMP/ffmpeg.tar.xz"
+          dir="$RUNNER_TEMP/ffmpeg"
+          if ! curl --fail --location --retry 3 --retry-delay 10 --connect-timeout 30 --max-time 600 \
+               --silent --show-error --output "$archive" "$url"; then
+            echo "::error::Could not download FFmpeg from $url. The tests need FFmpeg 8.0 or newer, which Ubuntu doesn't have. Re-run the job; if the file was renamed upstream, update FFMPEG_REGEX or FFMPEG_LATEST_URL in .github/workflows/build.yml."
+            exit 1
+          fi
+          mkdir -p "$dir"
+          tar -xJf "$archive" -C "$dir" --strip-components=1
+          if [ ! -x "$dir/bin/ffmpeg" ]; then
+            echo "::error::The FFmpeg archive from $url has no bin/ffmpeg."
+            exit 1
+          fi
+          # Fail here, not in a test, if the build can't pace the capture.
+          help=$("$dir/bin/ffmpeg" -hide_banner -h filter=setpts 2>&1) || true
+          case "$help" in
+            *strip_fps*) ;;
+            *)
+              echo "::error::The FFmpeg from $url has no setpts strip_fps option (FFmpeg 8.0+), which screen sharing needs."
+              exit 1
+              ;;
+          esac
+          echo "$dir/bin" >> "$GITHUB_PATH"
+          echo "FFmpeg from $url (release $release):"
+          "$dir/bin/ffmpeg" -hide_banner -version | sed -n 1p
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -43,10 +107,16 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # --no-fail-fast: run every test program and report all failures,
+      # not just the first program's.
       - name: Test
-        run: cargo test --workspace
+        id: test
+        timeout-minutes: 30
+        run: cargo test --workspace --no-fail-fast
 
+      # Also after failed tests, so one run shows both.
       - name: Clippy
+        if: ${{ !cancelled() && steps.test.outcome != 'skipped' }}
         run: cargo clippy --workspace --all-targets -- -D warnings
 
   windows:
@@ -57,7 +127,13 @@ jobs:
       run:
         shell: pwsh
     env:
-      FFMPEG_URL: https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip
+      FFMPEG_REPO: BtbN/FFmpeg-Builds
+      # The static GPL build of FFmpeg's master branch in BtbN's dated
+      # "autobuild-..." releases, e.g. ffmpeg-N-127271-gba987fe24d-win64-gpl.zip.
+      # (Capital N = master; release branches are named ffmpeg-n8.1....)
+      FFMPEG_PATTERN: 'ffmpeg-N-*-win64-gpl.zip'
+      # Used only if the dated release can't be found. "latest" moves every day.
+      FFMPEG_LATEST_URL: https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip
       MPV_REPO: shinchiro/mpv-winbuild-cmake
       # The plain x86_64 build, e.g. mpv-x86_64-20250101-git-abc1234.7z.
       # The digit after "x86_64-" excludes mpv-x86_64-v3-... and mpv-dev-....
@@ -72,21 +148,46 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast
 
       - name: Build GloorpFlorp.exe
         run: cargo build --release -p gloorpflorp
 
+      # BtbN's "latest" release changes every day. Download the same build from
+      # the dated release it comes from instead, so VERSIONS.txt and the GitHub
+      # Release can point at the exact build scripts that made it.
       - name: Download FFmpeg
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          $zip = Join-Path $env:RUNNER_TEMP 'ffmpeg-win64-gpl.zip'
-          curl.exe --fail --location --retry 3 --retry-delay 10 --silent --show-error --output $zip $env:FFMPEG_URL
+          $release = 'unknown'
+          $url = $env:FFMPEG_LATEST_URL
+          $json = gh api "repos/$env:FFMPEG_REPO/releases?per_page=10"
+          if ($LASTEXITCODE -eq 0) {
+            $dated = @(($json -join "`n" | ConvertFrom-Json) |
+              Where-Object { -not $_.draft -and $_.tag_name -like 'autobuild-*' } |
+              Sort-Object published_at -Descending)
+            # The newest dated release that has exactly one matching file.
+            foreach ($r in $dated) {
+              $assets = @($r.assets | Where-Object { $_.name -clike $env:FFMPEG_PATTERN })
+              if ($assets.Count -eq 1) {
+                $release = $r.tag_name
+                $url = $assets[0].browser_download_url
+                break
+              }
+            }
+          }
+          if ($release -eq 'unknown') {
+            Write-Host "::warning::Could not find a dated FFmpeg build ('$env:FFMPEG_PATTERN') in the releases of $env:FFMPEG_REPO, so the 'latest' one is used and VERSIONS.txt can't name its exact build scripts. If BtbN renamed the files, update FFMPEG_PATTERN in .github/workflows/build.yml."
+          }
+          $zip = Join-Path $env:RUNNER_TEMP $url.Substring($url.LastIndexOf('/') + 1)
+          curl.exe --fail --location --retry 3 --retry-delay 10 --silent --show-error --output $zip $url
           if ($LASTEXITCODE -ne 0) {
-            Write-Host "::error::Could not download FFmpeg from $env:FFMPEG_URL (curl exit code $LASTEXITCODE). If the file was renamed upstream, update FFMPEG_URL in .github/workflows/build.yml."
+            Write-Host "::error::Could not download FFmpeg from $url (curl exit code $LASTEXITCODE). If the file was renamed upstream, update FFMPEG_PATTERN or FFMPEG_LATEST_URL in .github/workflows/build.yml."
             exit 1
           }
-          Write-Host "FFmpeg: downloaded $([math]::Round((Get-Item $zip).Length / 1MB)) MB"
-          Add-Content -LiteralPath $env:GITHUB_ENV -Value "FFMPEG_ZIP=$zip"
+          Write-Host "FFmpeg: downloaded $([math]::Round((Get-Item $zip).Length / 1MB)) MB from $url (release $release)"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "FFMPEG_ZIP=$zip", "FFMPEG_URL=$url", "FFMPEG_RELEASE=$release"
 
       - name: Download mpv
         env:
@@ -115,16 +216,19 @@ jobs:
       - name: Package
         run: |
           $params = @{
-            AppExe     = 'target/release/GloorpFlorp.exe'
-            FfmpegZip  = $env:FFMPEG_ZIP
-            FfmpegUrl  = $env:FFMPEG_URL
-            MpvArchive = $env:MPV_ARCHIVE
-            MpvRelease = $env:MPV_RELEASE
-            MpvRepo    = $env:MPV_REPO
-            OutDir     = 'dist/GloorpFlorp'
-            Commit     = $env:GITHUB_SHA
-            Ref        = $env:GITHUB_REF_NAME
-            RepoUrl    = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY"
+            AppExe        = 'target/release/GloorpFlorp.exe'
+            FfmpegZip     = $env:FFMPEG_ZIP
+            FfmpegUrl     = $env:FFMPEG_URL
+            FfmpegRelease = $env:FFMPEG_RELEASE
+            FfmpegRepo    = $env:FFMPEG_REPO
+            MpvArchive    = $env:MPV_ARCHIVE
+            MpvRelease    = $env:MPV_RELEASE
+            MpvRepo       = $env:MPV_REPO
+            OutDir        = 'dist/GloorpFlorp'
+            Commit        = $env:GITHUB_SHA
+            Ref           = $env:GITHUB_REF_NAME
+            RefType       = $env:GITHUB_REF_TYPE
+            RepoUrl       = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY"
           }
           ./packaging/package-windows.ps1 @params
 
@@ -155,19 +259,84 @@ jobs:
 
       - name: Zip
         run: |
-          if [ ! -f dist/GloorpFlorp/GloorpFlorp.exe ]; then
-            echo "::error::The downloaded package has no GloorpFlorp/GloorpFlorp.exe."
+          if [ ! -f dist/GloorpFlorp/GloorpFlorp.exe ] || [ ! -f dist/GloorpFlorp/VERSIONS.txt ]; then
+            echo "::error::The downloaded package has no GloorpFlorp/GloorpFlorp.exe or GloorpFlorp/VERSIONS.txt."
+            exit 1
+          fi
+          # People compare versions with VERSIONS.txt, so the tag must match
+          # the version in Cargo.toml (VERSIONS.txt's first line).
+          v=$(head -n 1 dist/GloorpFlorp/VERSIONS.txt | tr -d '\r' | sed 's/^GloorpFlorp //')
+          if [ "v$v" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::The tag $GITHUB_REF_NAME doesn't match the version '$v' in Cargo.toml. Set version in Cargo.toml to match, push, and tag that commit again."
             exit 1
           fi
           (cd dist && zip -r -9 -q ../GloorpFlorp-windows-x64.zip GloorpFlorp)
           unzip -l GloorpFlorp-windows-x64.zip
 
+      # FFmpeg and mpv are GPL software, so the release also carries their
+      # source code at the exact commits in the zip, plus the build scripts
+      # that made them, in case the upstream links ever disappear.
+      # packaging/package-windows.ps1 writes the commits to licenses/SOURCES.txt.
+      - name: Download FFmpeg and mpv source code
+        run: |
+          set -euo pipefail
+          list=dist/GloorpFlorp/licenses/SOURCES.txt
+          if [ ! -f "$list" ]; then
+            echo "::error::The package has no licenses/SOURCES.txt, so the FFmpeg and mpv source code can't be attached."
+            exit 1
+          fi
+          # value <key> [regex]: the key's value from SOURCES.txt (CRLF file).
+          value() {
+            local v
+            v=$(sed -n "s/^$1=//p" "$list" | tr -d '\r' | head -n 1)
+            if [ -z "$v" ] || [ "$v" = unknown ] || ! printf '%s' "$v" | grep -Eq "^$2\$"; then
+              echo "::error::licenses/SOURCES.txt has no usable '$1' (got '$v'). Re-run all jobs of this workflow run; if it happens again, check the warnings of the 'Package' step." >&2
+              exit 1
+            fi
+            printf '%s' "$v"
+          }
+          hash='[0-9a-f]{7,40}'
+          tag='[A-Za-z0-9][A-Za-z0-9._-]*'
+          repo='[A-Za-z0-9._-]+/[A-Za-z0-9._-]+'
+          ff=$(value ffmpeg_commit "$hash")
+          ff_repo=$(value ffmpeg_build_repo "$repo")
+          ff_rel=$(value ffmpeg_build_release "$tag")
+          mpv=$(value mpv_commit "$hash")
+          mpv_repo=$(value mpv_build_repo "$repo")
+          mpv_rel=$(value mpv_build_release "$tag")
+          mpv_ffmpeg=$(value mpv_ffmpeg_commit "$hash")
+          mkdir -p sources
+          fetch() {
+            echo "Downloading $1 -> sources/$2"
+            curl --fail --location --retry 3 --retry-delay 10 --silent --show-error --output "sources/$2" "$1"
+            gzip -t "sources/$2"
+          }
+          fetch "https://github.com/FFmpeg/FFmpeg/archive/$ff.tar.gz" "ffmpeg-source-$ff.tar.gz"
+          fetch "https://github.com/mpv-player/mpv/archive/$mpv.tar.gz" "mpv-source-$mpv.tar.gz"
+          # mpv.exe has its own copy of FFmpeg built in, usually from another
+          # commit. (The hashes can differ in length, so compare prefixes.)
+          same=no
+          case "$ff" in "$mpv_ffmpeg"*) same=yes ;; esac
+          case "$mpv_ffmpeg" in "$ff"*) same=yes ;; esac
+          if [ "$same" = yes ]; then
+            echo "The FFmpeg inside mpv is the same commit as ffmpeg.exe ($ff); no second FFmpeg archive needed."
+          else
+            fetch "https://github.com/FFmpeg/FFmpeg/archive/$mpv_ffmpeg.tar.gz" "ffmpeg-source-for-mpv-$mpv_ffmpeg.tar.gz"
+          fi
+          fetch "https://github.com/$ff_repo/archive/refs/tags/$ff_rel.tar.gz" "ffmpeg-build-scripts-${ff_repo%%/*}-$ff_rel.tar.gz"
+          fetch "https://github.com/$mpv_repo/archive/refs/tags/$mpv_rel.tar.gz" "mpv-build-scripts-${mpv_repo%%/*}-$mpv_rel.tar.gz"
+          ls -l sources
+
       - name: Publish
         uses: softprops/action-gh-release@v2
         with:
-          files: GloorpFlorp-windows-x64.zip
+          files: |
+            GloorpFlorp-windows-x64.zip
+            sources/*.tar.gz
           fail_on_unmatched_files: true
           generate_release_notes: true
           body: |
-            **To install:** download `GloorpFlorp-windows-x64.zip` below, right-click it, choose *Extract All*, then open `START HERE.txt` in the extracted `GloorpFlorp` folder.
+            **To install:** download `GloorpFlorp-windows-x64.zip` below, right-click it, choose *Extract All*, then open `START HERE.txt` in the extracted `GloorpFlorp` folder. No GitHub account needed.
             You and your friend need the same version.
+
+            **Licenses:** GloorpFlorp's own code is under the MIT license. The zip also contains FFmpeg and mpv, which are under the GNU GPL. Source code for the included FFmpeg and mpv builds, and the build scripts that made them, is attached below (the `*-source-*` and `*-build-scripts-*` files). mpv has its own copy of FFmpeg built in; when that is a different version, its source is the `ffmpeg-source-for-mpv-*` file. `THIRD-PARTY-NOTICES.txt` and `VERSIONS.txt` in the zip have the details.

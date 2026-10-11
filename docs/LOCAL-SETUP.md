@@ -56,8 +56,9 @@ cd GloorpFlorp
 git checkout claude/lucid-fermi-dew58r
 ```
 
-The repository is private, so the first `git clone` opens a browser window
-asking you to sign in to GitHub. Sign in and approve it.
+The repository is public, so cloning needs no sign-in. The first time
+something is pushed to GitHub, a browser window asks you to sign in to
+GitHub. Sign in and approve it.
 
 ## 3. Open it in Claude
 

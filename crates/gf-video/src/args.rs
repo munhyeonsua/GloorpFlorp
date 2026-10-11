@@ -467,6 +467,11 @@ pub(crate) fn clean_title(title: &str) -> String {
     }
 }
 
+/// Advice for an FFmpeg that refuses an option GloorpFlorp passes.
+const TOO_OLD: &str = "The FFmpeg GloorpFlorp found is too old for screen sharing (it \
+    needs FFmpeg 8.0 or newer). Extract the whole GloorpFlorp zip again (it comes with \
+    the right FFmpeg), then restart GloorpFlorp.";
+
 /// Plain-language advice for FFmpeg's error output.
 pub(crate) fn advice(stderr: &str, codec: VideoCodec) -> String {
     let low = stderr.to_lowercase();
@@ -476,6 +481,14 @@ pub(crate) fn advice(stderr: &str, codec: VideoCodec) -> String {
          to fullscreen), so sharing stopped. Click Start sharing again. Running the game \
          in borderless windowed mode avoids this."
             .to_string()
+    } else if has(&[
+        // FFmpeg before 8.0 doesn't know setpts's strip_fps (`pace_filter`):
+        // "Error applying option 'strip_fps' to filter 'setpts': Option not found".
+        "strip_fps",
+        // FFmpeg before 5.1 doesn't know -fps_mode.
+        "Unrecognized option 'fps_mode'",
+    ]) {
+        TOO_OLD.to_string()
     } else if has(&[
         "No NVENC capable devices",
         "OpenEncodeSessionEx failed",
@@ -507,6 +520,12 @@ pub(crate) fn advice(stderr: &str, codec: VideoCodec) -> String {
          monitor is selected, close any admin (UAC) prompt or protected video player, \
          switch the game to borderless windowed mode, then click Start sharing again."
             .to_string()
+    } else if has(&["Option not found", "Unrecognized option"]) {
+        // Some other option this FFmpeg doesn't know: most likely an old one
+        // too. Checked after the NVENC and capture cases, so when the ladder
+        // joins several steps' output, a step's real driver or capture error
+        // isn't hidden behind another step's refused option.
+        TOO_OLD.to_string()
     } else if has(&["Unknown encoder", "Encoder not found", "No such filter"]) {
         "The FFmpeg next to GloorpFlorp.exe is missing a needed feature. Extract the \
          whole GloorpFlorp zip again, then restart GloorpFlorp."
@@ -942,13 +961,27 @@ mod tests {
     /// 100 ms hold-up comes out as exactly the frames the Rust model keeps,
     /// time-stamped in 1/fps slots. So the hold-up stays a gap (no copies
     /// of the last frame fill it, no burst after it) and no new frame is
-    /// dropped. Skipped without FFmpeg.
+    /// dropped. Skipped without FFmpeg, or with one older than 8.0.
     #[test]
     fn ffmpeg_paces_a_fast_source() {
         let Ok(tools) = crate::tools::locate() else {
             println!("note: skipping, ffmpeg is not available");
             return;
         };
+        match crate::tools::can_pace(&tools.ffmpeg) {
+            Some(true) => {}
+            Some(false) => {
+                println!(
+                    "note: skipping, {} is older than FFmpeg 8.0 (its setpts has no strip_fps)",
+                    tools.ffmpeg.display()
+                );
+                return;
+            }
+            None => panic!(
+                "couldn't read `{} -h filter=setpts`",
+                tools.ffmpeg.display()
+            ),
+        }
         // testsrc2's frame k is at k/1001 s; FFmpeg's `t` is pts * (1/1001).
         let source: Vec<f64> = (0..3 * CAPTURE_POLL_FPS)
             .map(|k| f64::from(k) * (1.0 / f64::from(CAPTURE_POLL_FPS)))
@@ -993,6 +1026,40 @@ mod tests {
                 pts.len()
             );
         }
+    }
+
+    /// A real FFmpeg refusing a filter option it doesn't know, as one older
+    /// than 8.0 refuses `strip_fps`: the advice says it is too old.
+    /// Skipped without FFmpeg.
+    #[test]
+    fn ffmpeg_refusing_a_filter_option_is_too_old() {
+        let Ok(tools) = crate::tools::locate() else {
+            println!("note: skipping, ffmpeg is not available");
+            return;
+        };
+        let mut a = s(&["-hide_banner", "-nostdin", "-loglevel", "warning"]);
+        a.extend(s(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=64x36:rate=30:duration=1",
+        ]));
+        a.extend(s(&[
+            "-vf",
+            "setpts=PTS:gloorpflorp_no_such_option=1,settb=1/30",
+        ]));
+        a.extend(s(&["-f", "null", "-"]));
+        let run = crate::tools::run_short(&tools.ffmpeg, &a, std::time::Duration::from_secs(60));
+        let Some((ok, _, err)) = run else {
+            panic!("ffmpeg didn't finish: {a:?}");
+        };
+        assert!(!ok, "{err}");
+        let lines: Vec<String> = err.lines().map(String::from).collect();
+        let m = error_message(&lines, VideoCodec::H264);
+        assert!(
+            m.starts_with("The FFmpeg GloorpFlorp found is too old"),
+            "{m}"
+        );
     }
 
     #[test]
@@ -1184,6 +1251,18 @@ mod tests {
         );
         assert!(rc.contains("changed resolution"));
         assert!(advice("No such filter: 'scale_d3d11'", VideoCodec::H264).contains("zip again"));
+        // What FFmpeg 6.1 to 7.1 print for the pacing filter (fftools'
+        // filter_opt_apply at n6.1.1), and an FFmpeg older than -fps_mode.
+        for old in [
+            "[fc#-1 @ 0x1] Error applying option 'strip_fps' to filter 'setpts': Option not found\n\
+             Error opening output file -.\n\
+             Error opening output files: Option not found",
+            "Unrecognized option 'fps_mode'.\nError splitting the argument list: Option not found",
+        ] {
+            let a = advice(old, VideoCodec::Av1);
+            assert!(a.contains("needs FFmpeg 8.0 or newer"), "{a}");
+            assert!(a.contains("Extract the whole GloorpFlorp zip again"), "{a}");
+        }
         assert!(advice("something odd", VideoCodec::H264).contains("stopped unexpectedly"));
         let m = error_message(&["line 1".into(), "line 2".into()], VideoCodec::H264);
         assert!(m.ends_with("Details from FFmpeg:\nline 1\nline 2"));

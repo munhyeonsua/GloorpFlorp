@@ -4,40 +4,59 @@ Third-party software in GloorpFlorp
 This folder contains two separate open-source programs, FFmpeg and mpv.
 GloorpFlorp starts them as their own processes and talks to them through
 pipes; they are unmodified builds made by their packagers. Both are licensed
-under the GNU General Public License (GPL). You may share them under the
-terms of the GPL, which includes passing on where to get their source code
-(the links below). The exact builds are listed in VERSIONS.txt.
+under the GNU General Public License (GPL). You may copy and share them
+under the terms of the GPL. The GPL also gives you the right to get their
+source code: the links below lead to the exact source of the builds in this
+folder. VERSIONS.txt lists the exact versions.
+
+{{RELEASE_SOURCES}}
 
 
 FFmpeg  (ffmpeg\ffmpeg.exe)
 ---------------------------
 Used for: capturing your screen and encoding the video with NVENC.
-License:  GNU GPL version 3 or later. This is a "gpl" build that also
-          includes other GPL-compatible libraries (for example x264 and x265).
-          License text: licenses\FFmpeg-LICENSE.txt
+License:  GNU GPL version 3 or later. This is a "gpl" build, made with
+          FFmpeg's --enable-gpl and --enable-version3 options, that also
+          includes other GPL-compatible libraries (for example x264 and
+          x265).
+          License text: licenses\FFmpeg-LICENSE.txt (the GNU GPL version 3,
+          the same text as licenses\GPL-3.0.txt)
 Built by: BtbN's automated FFmpeg builds.
-Source:   FFmpeg:                       https://ffmpeg.org/download.html
-          Build scripts and the exact
-          versions of all libraries:    https://github.com/BtbN/FFmpeg-Builds
+Source:   FFmpeg, at the exact version of this build:
+            {{FFMPEG_SOURCE}}
+          Build scripts for this build. They pin the exact version of every
+          library included and say where its source comes from:
+            {{FFMPEG_BUILD}}
 
 
 mpv  (mpv\)
 -----------
 Used for: showing your friend's screen in the viewer window.
-License:  GNU GPL version 2 or later. This Windows build also contains
-          FFmpeg and other libraries.
-          License text: licenses\GPL-2.0.txt (and any licenses\mpv-* files)
+License:  mpv's own code is under the GNU GPL version 2 or later. This
+          Windows build also contains its own copy of FFmpeg (again made
+          with --enable-gpl and --enable-version3) and other GPL libraries,
+          so this build as a whole is under the GNU GPL version 3 or later.
+          License texts: licenses\GPL-3.0.txt and licenses\GPL-2.0.txt
+          (and any licenses\mpv-* files)
+{{MPV_DLLS}}
 Built by: shinchiro's automated mpv builds for Windows.
-Source:   mpv:                          https://github.com/mpv-player/mpv
-          Build scripts and the exact
-          versions of all libraries:    https://github.com/shinchiro/mpv-winbuild-cmake
+Source:   mpv, at the exact version of this build:
+            {{MPV_SOURCE}}
+          The copy of FFmpeg built into mpv.exe, at its exact version
+          (usually a different version from ffmpeg\ffmpeg.exe):
+            {{MPV_FFMPEG_SOURCE}}
+          Build scripts for this build. They list every library included
+          and where its source comes from:
+            {{MPV_BUILD}}
 
 
 GloorpFlorp.exe
 ---------------
-GloorpFlorp's own code is under the MIT license. GloorpFlorp.exe is built
-from the open-source Rust libraries ("crates") listed below, each under the
-license shown in brackets (mostly MIT and/or Apache-2.0). It also contains
+GloorpFlorp's own code is under the MIT license
+(licenses\GloorpFlorp-LICENSE.txt). Its source code is linked in
+VERSIONS.txt ("Built from"). GloorpFlorp.exe is built from the open-source
+Rust libraries ("crates") listed below, each under the license shown in
+brackets (mostly MIT and/or Apache-2.0). It also contains
 libopus, the Opus audio codec (BSD 3-Clause license, https://opus-codec.org),
 built into the opusic-sys crate. Each crate's license text can be found on
 its page at https://crates.io.

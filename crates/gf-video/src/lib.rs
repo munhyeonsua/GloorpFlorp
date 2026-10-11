@@ -56,6 +56,12 @@ impl Tools {
     /// `ffmpeg.exe`, `mpv/mpv.exe`, `mpv.exe`), then on PATH. Errors with a
     /// plain-language message if FFmpeg is missing. mpv being missing is not
     /// an error here (only viewing needs it).
+    ///
+    /// Sharing the screen needs FFmpeg 8.0 or newer (the capture pacing uses
+    /// `setpts`'s `strip_fps` option), which the bundled build is; the test
+    /// pattern (non-Windows, `GLOORP_FAKE_VIDEO=1`) isn't paced and works
+    /// with older ones. An FFmpeg found on PATH may be older and isn't
+    /// checked here: sharing then stops with advice saying it is too old.
     pub fn locate() -> anyhow::Result<Tools> {
         tools::locate()
     }

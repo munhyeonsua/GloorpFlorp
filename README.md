@@ -18,13 +18,15 @@ GloorpFlorp connects your two PCs directly through
 [Tips](#recommended-settings-and-tips) ·
 [Troubleshooting](#troubleshooting) ·
 [Limitations](#limitations) ·
+[License](#license) ·
 [For developers](#for-developers)
 
 ## Quick start
 
 1. Both of you: install [Tailscale](https://tailscale.com/download) and sign in.
-2. Both of you: extract the whole GloorpFlorp zip and double-click
-   `GloorpFlorp.exe`.
+2. Both of you: download `GloorpFlorp-windows-x64.zip` from the
+   [Releases page](https://github.com/munhyeonsua/GloorpFlorp/releases),
+   extract the whole zip and double-click `GloorpFlorp.exe`.
 3. One of you clicks **Host** and sends the code to the other.
 4. The other pastes the code and clicks **Join**. You can now talk.
 5. Click **Start sharing** to show your screen. Your friend's screen opens in
@@ -85,22 +87,24 @@ friend always joins.
 
 ### Download
 
-The GitHub repository is private, so only its owner (signed in to GitHub) can
-download builds:
+Both of you download the same zip from the
+[Releases page](https://github.com/munhyeonsua/GloorpFlorp/releases). You
+don't need a GitHub account:
 
-- **From a release** (when there is one): on the repository's GitHub page,
-  click **Releases** on the right, open the newest one and click
-  `GloorpFlorp-windows-x64.zip` under **Assets**.
-- **From the latest automatic build:** open the **Actions** tab, click the
-  newest run with a green check mark, scroll down to **Artifacts** and click
-  **GloorpFlorp-windows-x64**. These downloads are deleted after 14 days;
-  every new change to the code makes a new one.
+1. Open the [Releases page](https://github.com/munhyeonsua/GloorpFlorp/releases)
+   (on the repository's GitHub page, it's **Releases** on the right).
+2. Under the newest release, in **Assets**, click
+   **`GloorpFlorp-windows-x64.zip`**. The other files there are source code
+   (see [License](#license)); you don't need them.
 
-**Your friend needs the same zip.** They can't download it from GitHub, so
-send it to them yourself, for example as a Google Drive, OneDrive or Dropbox
-link, or with WeTransfer. It's over 100 MB, too big for most chat apps. You
-must both use the same version: `VERSIONS.txt` in the folder shows which one
-you have.
+You must both use the same version: `VERSIONS.txt` in the folder shows which
+one you have.
+
+**Developers:** every change pushed to GitHub also builds a zip. To try one
+before it's released, open the **Actions** tab, click the run with a green
+check mark, scroll down to **Artifacts** and click
+**GloorpFlorp-windows-x64** (you need to be signed in to GitHub). These
+downloads are deleted after 14 days.
 
 ### Extract it
 
@@ -344,6 +348,16 @@ Download the new zip, extract it and use the new folder (you can delete the
 old one). Your settings are kept, because they're stored in
 `%APPDATA%\GloorpFlorp`. Both of you need to update.
 
+## License
+
+GloorpFlorp's own code is free to use under the [MIT license](LICENSE).
+
+The zip also contains two separate programs, FFmpeg (in the `ffmpeg` folder)
+and mpv (in the `mpv` folder), which are under the GNU GPL. Their source
+code, for the exact builds in the zip, is attached to each release on the
+[Releases page](https://github.com/munhyeonsua/GloorpFlorp/releases), and
+`THIRD-PARTY-NOTICES.txt` in the zip says where it comes from.
+
 ## For developers
 
 GloorpFlorp is a Rust workspace. [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
@@ -369,12 +383,18 @@ cargo build --release
 
 The app is `target\release\GloorpFlorp.exe`. To run it, copy the `ffmpeg`
 and `mpv` folders from a release zip next to it (or have `ffmpeg` and `mpv`
-on your PATH). The viewer needs mpv 0.41 or newer.
+on your PATH). Screen sharing needs FFmpeg 8.0 or newer (the capture pacing
+uses `setpts`'s `strip_fps` option; an older FFmpeg makes sharing stop with
+"too old" advice), and the viewer needs mpv 0.41 or newer. The FFmpeg and
+mpv folders next to the exe win over PATH.
 
-**Tests:** `cargo test --workspace`. Most tests also run on Linux (install
-`libasound2-dev`, `cmake` and `ffmpeg`). There, the Windows-specific parts
-are stubs and video uses FFmpeg's test pattern with software encoders. Tests
-that need FFmpeg skip their video part (with a note) when it isn't found.
+**Tests:** `cargo test --workspace --no-fail-fast`. Most tests also run on
+Linux (install `libasound2-dev`, `cmake`, `pkg-config` and an FFmpeg; CI
+uses [BtbN's static build](https://github.com/BtbN/FFmpeg-Builds/releases),
+since Ubuntu's own FFmpeg is older than 8.0). There, the Windows-specific
+parts are stubs and video uses FFmpeg's test pattern with software encoders.
+Tests that need FFmpeg skip their video part (with a note) when it isn't
+found, and the pacing test also skips with an FFmpeg older than 8.0.
 
 **Environment variables for development and tests:**
 
@@ -390,8 +410,13 @@ clicks Host, the other pastes the code and clicks Join. (If the host used
 `GLOORP_DEV_PORT`, give the joining copy the same port.)
 
 **CI:** [.github/workflows/build.yml](.github/workflows/build.yml) runs tests
-and clippy on Linux, and tests, the release build and packaging
+and clippy on Linux (with BtbN's Linux build from the same dated FFmpeg
+release the Windows zip ships), and tests, the release build and packaging
 ([packaging/package-windows.ps1](packaging/package-windows.ps1)) on Windows.
-Pushing a tag that starts with `v` (for example
-`git tag v0.1.0 && git push origin v0.1.0`) publishes a GitHub Release with
-the zip.
+To release, set `version` in `Cargo.toml` (shown in `VERSIONS.txt` and the
+log), then push a tag that starts with `v` and matches it (for example
+`git tag v1.0.0 && git push origin v1.0.0`). Once both jobs pass, the
+`release` job publishes a GitHub Release with `GloorpFlorp-windows-x64.zip`
+and the source code of the exact FFmpeg and mpv builds inside it (plus the
+build scripts that made them), taken from `licenses/SOURCES.txt` in the
+package.

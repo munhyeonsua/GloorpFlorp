@@ -17,7 +17,7 @@ agents that built the crates: `.claude/handoff/phase1-agent-reports.json` (proto
 | `gf-proto`: room codes, wire format, FLV demuxer + viewer writer, jitter buffer | ✅ done | 58 unit + 7 FFmpeg stream tests pass |
 | `gf-sys`: monitors, game-audio capture (process loopback), push-to-talk keys, Tailscale IP, child-process job object | ✅ done | 23 pass |
 | `gf-net`: TCP+UDP session, handshake, reconnect, video queue, stats | ✅ done | 35 pass |
-| `gf-video`: FFmpeg encoder (ddagrab → NVENC → FLV), mpv viewer | ✅ done | 34 unit + 3 integration pass |
+| `gf-video`: FFmpeg encoder (ddagrab → NVENC → FLV), mpv viewer | ✅ done | 37 unit + 3 integration pass |
 | `.github/workflows/build.yml`, `packaging/`, `README.md` | ✅ done | actionlint clean; packaging script run end to end with the real FFmpeg zip |
 | `gf-audio`: mic, echo cancellation, Opus, jitter, mixing, playback, game audio | ✅ done | 48 pass |
 | `app`: engine, settings, logging, egui UI, end-to-end test | ✅ done | 7 + 2 (UI) unit + 4 end-to-end pass |
@@ -55,7 +55,15 @@ pacing fix").
    - [x] The auto-opened viewer doesn't take focus: with another window in front (3 runs: first share, no key presses, codec-change reopen) mpv opened behind it and the foreground never changed. It does come to the front after clicking Open viewer. Not checked with a real fullscreen game
    - [x] Next-session checks prepared by the fixers (portrait direction, `CUDA_TRANSFORM = true`, pacing, H.264 bitrate): done, see "Live-desktop checks". Still open: the mouse pointer on the portrait monitor. The pacing experiment is now shipped (the owner's choice: smooth, ~1 more CPU core; see "Capture pacing fix"). Scripts: `scratchpad/hwlive/capture/` (harness, `run.ps1`, `pointer.ps1`, `pace-experiment.diff`) and `scratchpad/hwlive/app/` (two-copy app checks). (Scratchpads are under `%TEMP%\claude\…`; they may be gone.)
 4. **Push without `[skip ci]`** so GitHub builds the zip. Check both jobs go green.
-5. **First session with the friend.** The friend's 3070 Ti PC needs an up-to-date NVIDIA driver (FFmpeg master needs a recent NVENC API). Judge delay and echo by ear (nothing audible was played in the tests), and keep both PCs' log files. 60 fps is the default; 120/144 now send exactly that rate, but spread the same bitrate over more frames, and the pacing fix's CPU cost (~1 core) is only measured on the 9800X3D, so check Task Manager on the 3070 Ti PC.
+5. **Release v1.0.0.** Prepared: MIT `LICENSE`, version 1.0.0 in
+   `Cargo.toml`, exact FFmpeg/mpv source links in the package and source
+   archives attached by the release job (see "How to release" below). Done
+   by tagging `v1.0.0` once CI is green on the release commit; the friend
+   then downloads `GloorpFlorp-windows-x64.zip` from the Releases page (no
+   GitHub account needed). Check the published release lists the zip and
+   the source archives: four, or five when the FFmpeg inside mpv is a
+   different commit from ffmpeg.exe's (`licenses/SOURCES.txt` says which).
+6. **First session with the friend.** The friend's 3070 Ti PC needs an up-to-date NVIDIA driver (FFmpeg master needs a recent NVENC API). Judge delay and echo by ear (nothing audible was played in the tests), and keep both PCs' log files. 60 fps is the default; 120/144 now send exactly that rate, but spread the same bitrate over more frames, and the pacing fix's CPU cost (~1 core) is only measured on the 9800X3D, so check Task Manager on the 3070 Ti PC.
 
 ## Decisions made after ARCHITECTURE.md was written
 
@@ -323,8 +331,10 @@ codec × monitor shape (no `-r`, `-fps_mode vfr`), the pacing rule on
 simulated 1 ms frames with a 100 ms hold-up (every slot filled, a gap for
 the hold-up, no burst), and the real FFmpeg on a 1001 fps `testsrc2` with a
 100 ms hold-up giving exactly the frames and slot timestamps of the Rust
-model at 30/60/120/144 fps (skipped without FFmpeg; with `-r` it gives 13
-extra frames at 144 and fails).
+model at 30/60/120/144 fps (skipped without FFmpeg or with one older than
+8.0, which has no `strip_fps`; with `-r` it gives 13 extra frames at 144
+and fails). `strip_fps` makes FFmpeg 8.0 the minimum for sharing: see
+"Known risks".
 
 **First version used `-r fps` (review follow-up).** `-r` makes FFmpeg
 constant-rate: it fills any hold-up with copies of the last frame, sent in a
@@ -538,12 +548,80 @@ From the agents' reports (also check the code's doc comments):
   Windows never activates capture, `start()` gives up after 10 s and leaves
   a stuck thread (logged).
 - `list_monitors` only lists adapter 0's outputs (what ddagrab uses).
-- CI on a private repo: Windows minutes count double, and each zip is
-  ~110–130 MB against a 500 MB free artifact quota. The workflow cancels
-  older runs on the same branch and keeps artifacts 14 days. Consider
-  building the package only on main/tags/manual runs.
-- FFmpeg/mpv downloads take "latest", so builds aren't reproducible.
-  VERSIONS.txt in each zip records exactly what went in.
-- Licensing: the workspace says MIT, but there is no LICENSE file. The owner
-  should confirm. FFmpeg and mpv are GPL; the notices cover private use
-  between two people.
+- **FFmpeg 8.0 or newer is required** for sharing the screen: the pacing
+  filter uses `setpts=…:strip_fps=1`, an option FFmpeg 8.0 added (absent at
+  n6.1.1, n7.0, n7.1). The zip ships BtbN's master build, so the app is
+  fine; but `Tools::locate` falls back to an `ffmpeg` on PATH when none is
+  next to the exe, and an older one makes every ladder step fail at once
+  with "Error applying option 'strip_fps' to filter 'setpts': Option not
+  found". `args::advice` turns that (and "Unrecognized option") into "The
+  FFmpeg GloorpFlorp found is too old … needs FFmpeg 8.0 or newer"; the log
+  line "FFmpeg: … (from PATH; …)" shows when PATH was used. The test
+  pattern (Linux, `GLOORP_FAKE_VIDEO=1`) isn't paced and works with older
+  FFmpeg. The real-FFmpeg pacing test (`args::tests::ffmpeg_paces_a_fast_source`)
+  skips with a note when `ffmpeg -h filter=setpts` doesn't list
+  `strip_fps` (`tools::can_pace`).
+- **Linux CI uses BtbN's FFmpeg, not Ubuntu's.** The first CI run with
+  Linux tests (run 38160494259, 64f2c23) failed because ubuntu-latest's apt
+  FFmpeg is 6.1. The Linux job now downloads BtbN's static
+  `ffmpeg-N-…-linux64-gpl.tar.xz` from the newest dated `autobuild-…`
+  release (same lookup as the Windows job; `latest` as a fallback), checks
+  that its `setpts` has `strip_fps`, and puts it on PATH; apt FFmpeg is no
+  longer installed (nothing else needed it). If BtbN can't be reached the
+  job fails with a clear error rather than falling back to Ubuntu's FFmpeg
+  (the Windows job can't package without BtbN anyway, and the other
+  real-FFmpeg tests have only been run against FFmpeg 8). ubuntu-latest
+  moves to Ubuntu 26 from 2026-10-19; only `libasound2-dev`, `cmake` and
+  `pkg-config` come from apt now. Tests run with `--no-fail-fast` (every
+  failure is reported, not just the first test program's) and clippy runs
+  even when tests fail. Linux clippy had never run before; a Windows
+  emulation (the workspace copied with `cfg(windows)` renamed, built
+  without it) found no warnings in the non-Windows code.
+- CI: the repository is **public**, so GitHub Actions minutes on standard
+  runners are free and artifacts don't count against a private-repo quota.
+  The workflow still cancels older runs on the same branch and keeps
+  artifacts 14 days (each zip is ~110–130 MB).
+- FFmpeg/mpv downloads take the newest build, so builds aren't
+  reproducible. VERSIONS.txt and `licenses/SOURCES.txt` in each zip record
+  exactly what went in. FFmpeg now comes from BtbN's newest dated
+  `autobuild-…` release (not the moving `latest`), so its build scripts are
+  known exactly; if the GitHub API lookup fails, the step falls back to
+  `latest` with a warning and the release job then refuses to publish
+  (re-run all jobs).
+- Licensing: resolved. GloorpFlorp's own code is MIT (`LICENSE`, copyright
+  munhyeonsua; copied into the zip as `licenses\GloorpFlorp-LICENSE.txt`).
+  FFmpeg (BtbN "gpl" build: `--enable-gpl --enable-version3`) is GPL v3 or
+  later; mpv is GPL v2 or later, but shinchiro's build includes an FFmpeg
+  made with `--enable-gpl --enable-version3`, so that build as a whole is
+  GPL v3. mpv.exe has that FFmpeg built in, usually at a different commit
+  from ffmpeg.exe; only `mpv --version` ("FFmpeg version: N-…-g<hash>")
+  records it, and the packaging reads it from there (`mpv_ffmpeg_commit` in
+  `licenses/SOURCES.txt`). The mpv folder also holds Microsoft's
+  `d3dcompiler_43.dll` (not GPL), which the notices name. The zip ships both
+  GPL texts, and THIRD-PARTY-NOTICES.txt / VERSIONS.txt link the exact
+  FFmpeg, mpv and mpv-built-in FFmpeg commits and build-script releases.
+  Each GitHub Release also attaches source archives of those commits and
+  build scripts. Not attached: the source of every library
+  inside the two builds (x264, x265, libass, …). BtbN's scripts at the
+  attached tag pin each library's exact version; shinchiro's scripts mostly
+  fetch each library's newest code at build time, so for mpv the exact
+  library versions are only in that build's logs.
+
+## How to release
+
+1. Set `version` in `Cargo.toml` (`[workspace.package]`; every crate
+   inherits it) and build once so `Cargo.lock` follows. The app logs it at
+   start and `VERSIONS.txt` shows it.
+2. Push the commit and wait for both jobs to go green.
+3. Tag that commit with the matching version and push the tag:
+   `git tag v1.0.0 && git push origin v1.0.0`. The `release` job refuses
+   to publish if the tag doesn't match the first line of `VERSIONS.txt`.
+4. The tag build runs the tests and packaging again, then the `release`
+   job zips the package as `GloorpFlorp-windows-x64.zip`, downloads the
+   source archives named in `licenses/SOURCES.txt` (FFmpeg and mpv at the
+   exact commits, the FFmpeg built into mpv.exe at its own commit when it
+   differs from ffmpeg.exe's, and BtbN's and shinchiro's build scripts at
+   the exact releases), and publishes the zip and those four or five
+   archives as a GitHub Release with
+   install and license notes plus generated release notes. Anyone can
+   download it from the Releases page without a GitHub account.

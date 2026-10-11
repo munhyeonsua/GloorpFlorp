@@ -45,7 +45,16 @@ pub(crate) fn locate_in(
         )
     })?;
     let mpv = find_program("mpv", exe_dir, path_var);
-    log::info!("FFmpeg: {}", ffmpeg.display());
+    if exe_dir.is_some_and(|d| ffmpeg.starts_with(d)) {
+        log::info!("FFmpeg: {}", ffmpeg.display());
+    } else {
+        // Not the bundled build: one older than 8.0 makes screen sharing
+        // fail (see `Tools::locate`).
+        log::info!(
+            "FFmpeg: {} (from PATH; sharing the screen needs FFmpeg 8.0 or newer)",
+            ffmpeg.display()
+        );
+    }
     match &mpv {
         Some(p) => log::info!("mpv: {}", p.display()),
         None => log::warn!("mpv not found; the viewer window won't be available"),
@@ -170,9 +179,79 @@ pub(crate) fn probe_encoders(tools: &Tools) -> Vec<VideoCodec> {
     found
 }
 
+/// Whether `ffmpeg -h filter=<name>` output (stdout and stderr together)
+/// lists `option`. FFmpeg prints one option per line, its name first
+/// (`   strip_fps   <boolean>  ..FV....... Unset framerate metadata`;
+/// codec options get a `-` in front).
+#[cfg(test)]
+pub(crate) fn help_lists_option(help: &str, option: &str) -> bool {
+    help.lines()
+        .filter_map(|l| l.split_whitespace().next())
+        .any(|name| name.trim_start_matches('-') == option)
+}
+
+/// Test support: whether `ffmpeg` can run [`args::pace_filter`]. Its
+/// `setpts` option `strip_fps` came with FFmpeg 8.0; older builds (Ubuntu
+/// 24.04 ships 6.1) refuse the filter. `None` if the help couldn't be read
+/// (spawn failure or timeout), so callers don't mistake that for an old
+/// FFmpeg. Asked once per program.
+#[cfg(test)]
+pub(crate) fn can_pace(ffmpeg: &Path) -> Option<bool> {
+    use std::sync::Mutex;
+    static KNOWN: Mutex<Vec<(PathBuf, Option<bool>)>> = Mutex::new(Vec::new());
+    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, ok)) = known.iter().find(|(p, _)| p == ffmpeg) {
+        return ok;
+    }
+    let a = ["-hide_banner", "-h", "filter=setpts"].map(String::from);
+    let ok = run_short(ffmpeg, &a, PROBE_TIMEOUT)
+        .map(|(_, out, err)| help_lists_option(&format!("{out}\n{err}"), "strip_fps"));
+    known.push((ffmpeg.to_path_buf(), ok));
+    ok
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `ffmpeg -hide_banner -h filter=setpts` of FFmpeg 6.1 (built from
+    /// libavfilter/setpts.c and fftools/opt_common.c at tag n6.1.1).
+    const SETPTS_HELP_6_1: &str = "Filter setpts\n  Set PTS for the output video frame.\n    \
+        Inputs:\n       #0: default (video)\n    Outputs:\n       #0: default (video)\n\
+        setpts AVOptions:\n   \
+        expr              <string>     ..FV.....T. Expression determining the frame timestamp (default \"PTS\")\n\n";
+
+    /// The same from the bundled FFmpeg 8 (BtbN N-127271).
+    const SETPTS_HELP_8: &str = "Filter setpts\r\n  Set PTS for the output video frame.\r\n    \
+        Inputs:\r\n       #0: default (video)\r\n    Outputs:\r\n       #0: default (video)\r\n\
+        setpts AVOptions:\r\n   \
+        expr              <string>     ..FV.....T. Expression determining the frame timestamp (default \"PTS\")\r\n   \
+        strip_fps         <boolean>    ..FV....... Unset framerate metadata (default false)\r\n\r\n\r\n\
+        Exiting with exit code 0\r\n";
+
+    #[test]
+    fn pacing_support_from_filter_help() {
+        assert!(!help_lists_option(SETPTS_HELP_6_1, "strip_fps"));
+        assert!(help_lists_option(SETPTS_HELP_6_1, "expr"));
+        assert!(help_lists_option(SETPTS_HELP_8, "strip_fps"));
+        // Only option names count, not words in the descriptions.
+        assert!(!help_lists_option(SETPTS_HELP_8, "framerate"));
+        assert!(!help_lists_option(
+            "Unknown filter 'setpts'.\n",
+            "strip_fps"
+        ));
+        assert!(!help_lists_option("", "strip_fps"));
+        assert!(help_lists_option(
+            "  -forced-idr       <boolean>    E..V.......",
+            "forced-idr"
+        ));
+    }
+
+    #[test]
+    fn missing_ffmpeg_is_unknown_not_old() {
+        assert_eq!(can_pace(Path::new("gloorpflorp-no-such-ffmpeg")), None);
+        assert_eq!(can_pace(Path::new("gloorpflorp-no-such-ffmpeg")), None);
+    }
 
     fn touch(p: &Path) {
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();

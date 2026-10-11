@@ -14,8 +14,22 @@
         VERSIONS.txt
         THIRD-PARTY-NOTICES.txt
 
+    licenses\SOURCES.txt lists the exact FFmpeg and mpv commits and the
+    build-script releases in a key=value form; the release job in build.yml
+    reads it to attach those source archives to the GitHub Release.
+
     Used by .github/workflows/build.yml. Also runs locally with PowerShell 7
     and 7-Zip ("7z") on PATH, e.g. to test the layout on Linux.
+
+.PARAMETER FfmpegRelease
+    The dated BtbN release the FFmpeg zip came from (e.g.
+    autobuild-2026-10-10-13-04). 'unknown' (the default, e.g. for local
+    runs) links to BtbN's repository in general instead.
+
+.PARAMETER RefType
+    'tag' for a tag build (GITHUB_REF_TYPE). Only a tag build named like
+    v1.0.0 says in THIRD-PARTY-NOTICES.txt that the source code is attached
+    to a GitHub release, because only tags are published (see build.yml).
 #>
 #Requires -Version 7.0
 [CmdletBinding()]
@@ -26,9 +40,12 @@ param(
     [Parameter(Mandatory)] [string] $MpvArchive,
     [Parameter(Mandatory)] [string] $MpvRelease,
     [Parameter(Mandatory)] [string] $OutDir,
+    [string] $FfmpegRelease = 'unknown',
+    [string] $FfmpegRepo = 'BtbN/FFmpeg-Builds',
     [string] $MpvRepo = 'shinchiro/mpv-winbuild-cmake',
     [string] $Commit = 'unknown',
     [string] $Ref = 'local build',
+    [string] $RefType = 'branch',
     [string] $RepoUrl = ''
 )
 
@@ -89,14 +106,17 @@ function Copy-LicenseFile([string] $Root, [string] $Prefix) {
     return $files.Count
 }
 
-# First line printed by `exe args`, or $null if it fails or takes over 30 s
-# (a hung probe must not stall the build until the job timeout).
-function Get-FirstLine([string] $Exe, [string[]] $Arguments) {
+# The non-empty lines printed by `exe args`, or $null if it fails or takes
+# over 30 s (a hung probe must not stall the build until the job timeout).
+function Get-OutputLines([string] $Exe, [string[]] $Arguments) {
     try {
         $psi = [Diagnostics.ProcessStartInfo]::new($Exe)
         foreach ($a in $Arguments) { $psi.ArgumentList.Add($a) }
         $psi.UseShellExecute = $false
         $psi.RedirectStandardOutput = $true
+        # ffmpeg and mpv print UTF-8 (e.g. mpv's "Copyright ©"), not the
+        # console code page .NET would assume.
+        $psi.StandardOutputEncoding = [Text.UTF8Encoding]::new($false)
         $p = [Diagnostics.Process]::Start($psi)
         $stdout = $p.StandardOutput.ReadToEndAsync()
         if (-not $p.WaitForExit(30000)) {
@@ -104,10 +124,34 @@ function Get-FirstLine([string] $Exe, [string[]] $Arguments) {
             return $null
         }
         if ($p.ExitCode -ne 0 -or -not $stdout.Wait(5000)) { return $null }
-        return @($stdout.Result -split "`r?`n" | Where-Object { $_.Trim() }) | Select-Object -First 1
+        $lines = @($stdout.Result -split "`r?`n" | Where-Object { $_.Trim() } | ForEach-Object { $_.TrimEnd() })
+        if ($lines.Count -eq 0) { return $null }
+        return , $lines
     } catch {
         return $null
     }
+}
+
+# First line printed by `exe args`, or $null (see Get-OutputLines).
+function Get-FirstLine([string] $Exe, [string[]] $Arguments) {
+    $lines = Get-OutputLines $Exe $Arguments
+    if ($lines) { return $lines[0] }
+    return $null
+}
+
+# The first git commit hash that $Pattern (with the hash as group 1) finds in
+# $Texts, or $null.
+function Find-CommitHash([string[]] $Texts, [string] $Pattern) {
+    foreach ($t in $Texts) {
+        if ($t -and $t -match $Pattern) { return $Matches[1].ToLowerInvariant() }
+    }
+    return $null
+}
+
+# A release tag safe to put in a URL and a file name, or 'unknown'.
+function Get-SafeTag([string] $Tag) {
+    if ($Tag -match '^[A-Za-z0-9][A-Za-z0-9._-]*$' -and $Tag -ne 'unknown') { return $Tag }
+    return 'unknown'
 }
 
 # --- Check inputs --------------------------------------------------------
@@ -123,6 +167,9 @@ if (-not (Test-Path -LiteralPath $MpvArchive -PathType Leaf)) {
 }
 if (-not (Test-Path -LiteralPath (Join-Path $RepoRoot 'README.md') -PathType Leaf)) {
     Fail "README.md was not found in $RepoRoot; it becomes 'GloorpFlorp Guide.html' in the package."
+}
+if (-not (Test-Path -LiteralPath (Join-Path $RepoRoot 'LICENSE') -PathType Leaf)) {
+    Fail "LICENSE was not found in $RepoRoot; it becomes licenses\GloorpFlorp-LICENSE.txt in the package."
 }
 if ((Split-Path $OutDir -Leaf) -ne 'GloorpFlorp') {
     # Guards the Remove-Item below and keeps the folder name users see stable.
@@ -178,15 +225,40 @@ try {
     $dlls = @(Get-ChildItem -LiteralPath $mpvSource.DirectoryName -File -Filter '*.dll')
     foreach ($dll in $dlls) { Copy-Item -LiteralPath $dll.FullName -Destination $mpvDir }
     Write-Host "mpv: copied mpv.exe and $($dlls.Count) DLL(s)"
+    # The notices call the mpv folder GPL software, so name any DLL that
+    # comes with it. shinchiro's build ships Microsoft's d3dcompiler_43.dll.
+    $mpvDllNote = @(foreach ($dll in $dlls) {
+        if ($dll.Name -match '^d3dcompiler_\d+\.dll$') {
+            "Also:     mpv\$($dll.Name) is Microsoft's Direct3D shader compiler,"
+            '          which this mpv build includes for older Windows versions.'
+            '          It is Microsoft software under Microsoft''s own terms,'
+            '          not under the GPL.'
+        } else {
+            Write-Host "::warning::The mpv download contains $($dll.Name), which THIRD-PARTY-NOTICES.txt doesn't describe. Check its license and update packaging/package-windows.ps1."
+            "Also:     mpv\$($dll.Name) came with the mpv build; the build scripts"
+            '          linked below say where it comes from.'
+        }
+    }) -join "`n"
     $mpvLicenses = Copy-LicenseFile $mpvWork 'mpv'
     Write-Host "mpv: found $mpvLicenses license file(s) in the download"
 
     $mpvVersion = '(not checked: packaged on a non-Windows machine)'
+    # mpv.exe has its own copy of FFmpeg built in, usually from a different
+    # commit than ffmpeg.exe; only `mpv --version` tells which. For example:
+    #   libplacebo version: v7.375.0 (v7.360.0-153-g1dd0226-dirty)
+    #   FFmpeg version: N-127313-g8d8c75f2b
+    $mpvFfmpegVersion = $null
+    $mpvPlaceboVersion = $null
     if ($IsWindows) {
         # mpv.com is the console front end of mpv.exe; it prints to our pipe reliably.
         $mpvCom = Join-Path $mpvSource.DirectoryName 'mpv.com'
         $probe = if (Test-Path -LiteralPath $mpvCom) { $mpvCom } else { Join-Path $mpvDir 'mpv.exe' }
-        $mpvVersion = Get-FirstLine $probe @('--no-config', '--version')
+        $mpvLines = Get-OutputLines $probe @('--no-config', '--version')
+        $mpvVersion = if ($mpvLines) { $mpvLines[0] } else { $null }
+        foreach ($line in @($mpvLines)) {
+            if (-not $mpvFfmpegVersion -and $line -match '^\s*FFmpeg version:\s*(\S.*)$') { $mpvFfmpegVersion = $Matches[1].Trim() }
+            if (-not $mpvPlaceboVersion -and $line -match '^\s*libplacebo version:\s*(\S.*)$') { $mpvPlaceboVersion = $Matches[1].Trim() }
+        }
         if (-not $mpvVersion) {
             Write-Host "::warning::Could not read the mpv version ('mpv --version' failed). The package is still built; test the viewer on a real PC."
             $mpvVersion = '(unknown: mpv --version failed on the build machine)'
@@ -196,15 +268,85 @@ try {
         }
     }
 
-    # GPL v2 text for mpv (GPL v2 or later); FFmpeg's own license file is GPL v3.
+    # License texts: GPL v3 (FFmpeg, and mpv as built here, which includes a
+    # GPL v3 FFmpeg), GPL v2 (mpv's own code is GPL v2 or later) and
+    # GloorpFlorp's own MIT license.
+    Copy-Item -LiteralPath (Join-Path $PackagingDir 'licenses/GPL-3.0.txt') -Destination $LicensesDir
     Copy-Item -LiteralPath (Join-Path $PackagingDir 'licenses/GPL-2.0.txt') -Destination $LicensesDir
+    Copy-Item -LiteralPath (Join-Path $RepoRoot 'LICENSE') -Destination (Join-Path $LicensesDir 'GloorpFlorp-LICENSE.txt')
+
+    # --- Exact source of FFmpeg and mpv -----------------------------------
+    # FFmpeg prints e.g. "ffmpeg version N-127271-gba987fe24d-20261010" (a
+    # master build, commit ba987fe24d); BtbN's dated zips are named
+    # ffmpeg-N-127271-gba987fe24d-win64-gpl.zip. mpv prints e.g.
+    # "mpv v0.41.0-1122-gaccb7b282" and shinchiro's archive is named
+    # mpv-x86_64-20261011-git-accb7b2821.7z (a longer hash of the same commit).
+    # Anything that can't be worked out becomes 'unknown' plus a general link,
+    # with a warning, instead of failing the build.
+
+    $mpvAsset = Split-Path $MpvArchive -Leaf
+    $ffCommit = Find-CommitHash @($ffVersion, (Split-Path $FfmpegZip -Leaf), (Split-Path $FfmpegUrl -Leaf)) '(?:^|[\s-])(?:N|n\d+(?:\.\d+)*)-\d+-g([0-9a-fA-F]{7,40})(?![0-9a-fA-F])'
+    $mpvCommit = Find-CommitHash @($mpvVersion) '\bv?\d+(?:\.\d+)+-\d+-g([0-9a-fA-F]{7,40})(?![0-9a-fA-F])'
+    $mpvAssetCommit = Find-CommitHash @($mpvAsset) '-git-([0-9a-fA-F]{7,40})(?![0-9a-fA-F])'
+    if (-not $mpvCommit -or ($mpvAssetCommit -and $mpvAssetCommit.StartsWith($mpvCommit))) {
+        $mpvCommit = $mpvAssetCommit
+    }
+    $mpvFfCommit = Find-CommitHash @($mpvFfmpegVersion) '^(?:N|n\d+(?:\.\d+)*)-\d+-g([0-9a-fA-F]{7,40})(?![0-9a-fA-F])'
+    $FfmpegRelease = Get-SafeTag $FfmpegRelease
+    $MpvRelease = Get-SafeTag $MpvRelease
+
+    $ffSourceUrl = if ($ffCommit) { "https://github.com/FFmpeg/FFmpeg/tree/$ffCommit" } else { 'https://ffmpeg.org/download.html' }
+    $ffBuildUrl = if ($FfmpegRelease -ne 'unknown') { "https://github.com/$FfmpegRepo/tree/$FfmpegRelease" } else { "https://github.com/$FfmpegRepo" }
+    $mpvSourceUrl = if ($mpvCommit) { "https://github.com/mpv-player/mpv/tree/$mpvCommit" } else { 'https://github.com/mpv-player/mpv' }
+    $mpvBuildUrl = if ($MpvRelease -ne 'unknown') { "https://github.com/$MpvRepo/tree/$MpvRelease" } else { "https://github.com/$MpvRepo" }
+    $mpvFfSourceUrl = if ($mpvFfCommit) { "https://github.com/FFmpeg/FFmpeg/tree/$mpvFfCommit" } else { 'https://ffmpeg.org/download.html' }
+    $ffReleaseText = if ($FfmpegRelease -ne 'unknown') { "release $FfmpegRelease of https://github.com/$FfmpegRepo" } else { 'unknown' }
+
+    $unknown = @(
+        if (-not $ffCommit) { 'the FFmpeg commit' }
+        if (-not $mpvCommit) { 'the mpv commit' }
+        if (-not $mpvFfCommit) { 'the commit of the FFmpeg inside mpv' }
+        if ($FfmpegRelease -eq 'unknown') { "the $FfmpegRepo release" }
+        if ($MpvRelease -eq 'unknown') { "the $MpvRepo release" }
+    )
+    if ($unknown) {
+        Write-Host "::warning::Could not work out $($unknown -join ', ') of this build; VERSIONS.txt and THIRD-PARTY-NOTICES.txt link to the project in general instead."
+    }
+    Write-Host "Sources: FFmpeg $ffSourceUrl ($ffBuildUrl), mpv $mpvSourceUrl ($mpvBuildUrl), FFmpeg inside mpv $mpvFfSourceUrl"
+
+    Write-WindowsText (Join-Path $LicensesDir 'SOURCES.txt') @(
+        '# The exact source code of the FFmpeg and mpv builds in this package.'
+        '# VERSIONS.txt and THIRD-PARTY-NOTICES.txt say the same in words.'
+        '# (GloorpFlorp''s release workflow reads this file; keep the key=value lines.)'
+        "ffmpeg_commit=$(if ($ffCommit) { $ffCommit } else { 'unknown' })"
+        "ffmpeg_build_repo=$FfmpegRepo"
+        "ffmpeg_build_release=$FfmpegRelease"
+        "mpv_commit=$(if ($mpvCommit) { $mpvCommit } else { 'unknown' })"
+        "mpv_build_repo=$MpvRepo"
+        "mpv_build_release=$MpvRelease"
+        "mpv_ffmpeg_commit=$(if ($mpvFfCommit) { $mpvFfCommit } else { 'unknown' })"
+    )
 
     # --- Text files ------------------------------------------------------
 
-    $mpvAsset = Split-Path $MpvArchive -Leaf
+    # GloorpFlorp's own version, from Cargo.toml.
+    $appVersion = 'unknown'
+    Push-Location $RepoRoot
+    try {
+        $metadata = & cargo metadata --no-deps --format-version 1 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            $pkg = @(($metadata -join "`n" | ConvertFrom-Json).packages | Where-Object { $_.name -eq 'gloorpflorp' })
+            if ($pkg.Count -eq 1) { $appVersion = $pkg[0].version }
+        }
+    } catch {
+        $appVersion = 'unknown'
+    } finally {
+        Pop-Location
+    }
+
     $source = if ($RepoUrl) { "$RepoUrl/commit/$Commit" } else { $Commit }
     Write-WindowsText (Join-Path $OutDir 'VERSIONS.txt') @(
-        'GloorpFlorp'
+        "GloorpFlorp $appVersion"
         "  Built from:  $source"
         "  Branch/tag:  $Ref"
         "  Built at:    $([DateTime]::UtcNow.ToString('yyyy-MM-dd HH:mm')) UTC"
@@ -212,11 +354,20 @@ try {
         'FFmpeg (ffmpeg\ffmpeg.exe)'
         "  Version:     $ffVersion"
         "  Downloaded:  $FfmpegUrl"
+        "  Build:       $ffReleaseText"
+        "  Source code: $ffSourceUrl"
+        "  Built with:  $ffBuildUrl"
         ''
         'mpv (mpv\mpv.exe)'
         "  Version:     $mpvVersion"
         "  Downloaded:  $mpvAsset from release $MpvRelease of https://github.com/$MpvRepo"
         "               https://github.com/$MpvRepo/releases/tag/$MpvRelease"
+        "  Source code: $mpvSourceUrl"
+        "  Built with:  $mpvBuildUrl"
+        '  Built into mpv.exe (separate from ffmpeg\ffmpeg.exe):'
+        "    FFmpeg:      $(if ($mpvFfmpegVersion) { $mpvFfmpegVersion } else { 'unknown' })"
+        "    Source code: $mpvFfSourceUrl"
+        "    libplacebo:  $(if ($mpvPlaceboVersion) { $mpvPlaceboVersion } else { 'unknown' })"
         ''
         'You and your friend should use the same GloorpFlorp build.'
     )
@@ -236,7 +387,36 @@ try {
         ForEach-Object { ($_ -replace '\s*\(\*\)\s*$', '').Trim() } |
         Where-Object { $_ -and $_ -notmatch '^(gf-[a-z]+|gloorpflorp) v' } |
         Sort-Object -Unique)
-    $notices = @(Get-Content -LiteralPath (Join-Path $PackagingDir 'third-party-notices.txt')) + @('') + @($crates | ForEach-Object { "  $_" })
+
+    # A tag build (v1.0.0, ...) becomes a GitHub Release with the source
+    # archives attached (see the release job in build.yml).
+    $releaseNote = if ($RepoUrl -and $RefType -eq 'tag' -and $Ref -match '^v\d') {
+        @(
+            'Copies of this exact FFmpeg and mpv source code, and of the build'
+            'scripts that made these builds, are also attached to the GitHub'
+            'release this zip comes from, so they stay available even if the'
+            'links below stop working:'
+            "  $RepoUrl/releases/tag/$Ref"
+        ) -join "`n"
+    } else {
+        "This copy is not from a GitHub release; the links below lead to the`nsource code."
+    }
+    $notices = Get-Content -LiteralPath (Join-Path $PackagingDir 'third-party-notices.txt') -Raw
+    if (-not $mpvDllNote) { $notices = $notices -replace '\{\{MPV_DLLS\}\}\r?\n', '' }
+    $fill = [ordered]@{
+        '{{RELEASE_SOURCES}}' = $releaseNote
+        '{{FFMPEG_SOURCE}}'   = $ffSourceUrl
+        '{{FFMPEG_BUILD}}'    = $ffBuildUrl
+        '{{MPV_SOURCE}}'      = $mpvSourceUrl
+        '{{MPV_BUILD}}'       = $mpvBuildUrl
+        '{{MPV_FFMPEG_SOURCE}}' = $mpvFfSourceUrl
+        '{{MPV_DLLS}}'        = $mpvDllNote
+    }
+    foreach ($key in $fill.Keys) { $notices = $notices.Replace($key, $fill[$key]) }
+    if ($notices -match '\{\{[A-Z_]+\}\}') {
+        Fail "Packaging bug: packaging/third-party-notices.txt has a placeholder this script doesn't fill in ($($Matches[0]))."
+    }
+    $notices = @($notices.TrimEnd() -split "`r?`n") + @('') + @($crates | ForEach-Object { "  $_" })
     Write-WindowsText (Join-Path $OutDir 'THIRD-PARTY-NOTICES.txt') $notices
 
     # README.md as a self-contained web page, readable with a double-click.
@@ -266,7 +446,7 @@ try {
     $required = @(
         'GloorpFlorp.exe', 'ffmpeg/ffmpeg.exe', 'mpv/mpv.exe',
         'START HERE.txt', 'GloorpFlorp Guide.html', 'VERSIONS.txt', 'THIRD-PARTY-NOTICES.txt',
-        'licenses/GPL-2.0.txt'
+        'licenses/GPL-2.0.txt', 'licenses/GPL-3.0.txt', 'licenses/GloorpFlorp-LICENSE.txt', 'licenses/SOURCES.txt'
     )
     foreach ($r in $required) {
         if (-not (Test-Path -LiteralPath (Join-Path $OutDir $r) -PathType Leaf)) {
