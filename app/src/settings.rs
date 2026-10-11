@@ -305,7 +305,8 @@ impl Settings {
                 );
             }
         };
-        match serde_json::from_str::<Settings>(&text) {
+        // Notepad and PowerShell 5.1 can save with a byte-order mark.
+        match serde_json::from_str::<Settings>(text.trim_start_matches('\u{feff}')) {
             Ok(mut s) => {
                 s.sanitize();
                 log::info!("settings loaded from {}", path.display());
@@ -415,6 +416,20 @@ mod tests {
         let (s, warning) = Settings::load(&path);
         assert_eq!(s, Settings::default());
         assert!(warning.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_saved_with_a_byte_order_mark_loads() {
+        let dir = scratch("settings-bom");
+        let path = dir.join("settings.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut bytes = "\u{feff}".as_bytes().to_vec();
+        bytes.extend_from_slice(br#"{ "name": "Alex", "fps": 30 }"#);
+        std::fs::write(&path, bytes).unwrap();
+        let (s, warning) = Settings::load(&path);
+        assert_eq!(warning, None);
+        assert_eq!((s.name.as_str(), s.fps), ("Alex", 30));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

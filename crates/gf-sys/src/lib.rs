@@ -29,10 +29,16 @@ pub struct Monitor {
     pub width: u32,
     pub height: u32,
     pub primary: bool,
+    /// How far Windows turns the picture for this monitor, in degrees
+    /// clockwise: 0, 90, 180 or 270 (`DXGI_OUTPUT_DESC::Rotation`). `width`
+    /// and `height` are already the turned (desktop) size, but Desktop
+    /// Duplication delivers frames unturned: for 90 and 270 they are
+    /// `height`×`width` and must be rotated by this much to look right.
+    pub rotation: u32,
 }
 
 impl Monitor {
-    fn new(index: u32, width: u32, height: u32, primary: bool) -> Monitor {
+    fn new(index: u32, width: u32, height: u32, primary: bool, rotation: u32) -> Monitor {
         let tag = if primary { ", primary" } else { "" };
         Monitor {
             index,
@@ -40,6 +46,7 @@ impl Monitor {
             width,
             height,
             primary,
+            rotation,
         }
     }
 }
@@ -58,7 +65,7 @@ pub fn list_monitors() -> Vec<Monitor> {
     }
     #[cfg(not(windows))]
     {
-        vec![Monitor::new(0, 1920, 1080, true)]
+        vec![Monitor::new(0, 1920, 1080, true, 0)]
     }
 }
 
@@ -361,12 +368,12 @@ mod tests {
     #[test]
     fn monitor_names() {
         assert_eq!(
-            Monitor::new(0, 2560, 1440, true).name,
+            Monitor::new(0, 2560, 1440, true, 0).name,
             "Monitor 1 (2560×1440, primary)"
         );
         assert_eq!(
-            Monitor::new(1, 1920, 1080, false).name,
-            "Monitor 2 (1920×1080)"
+            Monitor::new(1, 1080, 1920, false, 90).name,
+            "Monitor 2 (1080×1920)"
         );
     }
 
@@ -374,7 +381,7 @@ mod tests {
     #[test]
     fn fake_monitor_list() {
         let m = list_monitors();
-        assert_eq!(m, vec![Monitor::new(0, 1920, 1080, true)]);
+        assert_eq!(m, vec![Monitor::new(0, 1920, 1080, true, 0)]);
         assert!(list_audio_apps().is_empty());
     }
 

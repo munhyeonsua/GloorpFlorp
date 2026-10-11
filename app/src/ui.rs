@@ -160,16 +160,19 @@ impl GloorpApp {
     fn room(&mut self, ui: &mut Ui) {
         ui.heading("Room");
         ui.horizontal(|ui| {
-            ui.label("Your name:");
-            ui.add(
-                TextEdit::singleline(&mut self.settings.name)
-                    .hint_text(self.default_name.as_str())
-                    .desired_width(200.0)
-                    .char_limit(40),
-            )
-            .on_hover_text(
-                "Your friend sees this name. Changes apply the next time you host or join.",
-            );
+            let label = ui.label("Your name:");
+            let r = ui
+                .add(
+                    TextEdit::singleline(&mut self.settings.name)
+                        .hint_text(self.default_name.as_str())
+                        .desired_width(200.0)
+                        .char_limit(40),
+                )
+                .labelled_by(label.id)
+                .on_hover_text(
+                    "Your friend sees this name. Changes apply the next time you host or join.",
+                );
+            accept_set_value(&r, &mut self.settings.name, 40);
         });
         match self.snap.phase.clone() {
             Phase::Idle => {
@@ -183,7 +186,7 @@ impl GloorpApp {
                 {
                     self.cmd(Command::Host);
                 }
-                ui.label("or paste your friend's room code:");
+                let label = ui.label("or paste your friend's room code:");
                 ui.horizontal(|ui| {
                     let edit = ui
                         .add(
@@ -193,10 +196,12 @@ impl GloorpApp {
                                 .char_limit(40)
                                 .font(egui::TextStyle::Monospace),
                         )
+                        .labelled_by(label.id)
                         .on_hover_text(
                             "The code your friend got when they clicked Host. \
                              Upper or lower case, spaces and dashes don't matter.",
                         );
+                    accept_set_value(&edit, &mut self.join_code, 40);
                     let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     let can_join = !self.join_code.trim().is_empty();
                     let join = ui
@@ -321,7 +326,7 @@ impl GloorpApp {
             }
         }
         Grid::new("my-screen").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-            ui.label("Monitor").on_hover_text("Which monitor to share. Everything on it is visible to your friend.");
+            let label = ui.label("Monitor").on_hover_text("Which monitor to share. Everything on it is visible to your friend.");
             let selected = monitor
                 .as_ref()
                 .map(|m| m.name.clone())
@@ -336,10 +341,12 @@ impl GloorpApp {
                     if snap.monitors.is_empty() {
                         ui.label("No monitors found");
                     }
-                });
+                })
+                .response
+                .labelled_by(label.id);
             ui.end_row();
 
-            ui.label("Resolution").on_hover_text(
+            let label = ui.label("Resolution").on_hover_text(
                 "Your screen is scaled down to this height if it is bigger. \
                  Lower needs less upload speed.",
             );
@@ -364,23 +371,33 @@ impl GloorpApp {
                     for h in HEIGHT_CHOICES {
                         ui.selectable_value(&mut s.max_height, h, height_label(h));
                     }
-                });
+                })
+                .response
+                .labelled_by(label.id);
             ui.end_row();
 
-            ui.label("Frame rate").on_hover_text(
-                "Pictures per second. 60 is smooth; more needs more bitrate for the same quality.",
+            let label = ui.label("Frame rate").on_hover_text(
+                "Pictures per second. 60 is smooth; more needs more bitrate for the same \
+                 quality. 120 and 144 are experimental: in tests the screen capture only \
+                 reached about 75 to 90 pictures per second.",
             );
+            let fps_label = |f: u32| match f {
+                f if f > 60 => format!("{f} fps (experimental)"),
+                f => format!("{f} fps"),
+            };
             ComboBox::from_id_salt("fps")
-                .selected_text(format!("{} fps", s.fps))
+                .selected_text(fps_label(s.fps))
                 .width(240.0)
                 .show_ui(ui, |ui| {
                     for f in FPS_CHOICES {
-                        ui.selectable_value(&mut s.fps, f, format!("{f} fps"));
+                        ui.selectable_value(&mut s.fps, f, fps_label(f));
                     }
-                });
+                })
+                .response
+                .labelled_by(label.id);
             ui.end_row();
 
-            ui.label("Codec").on_hover_text(
+            let caption = ui.label("Codec").on_hover_text(
                 "The video format. Leave it on Auto: AV1 looks best for the bandwidth \
                  (RTX 40 series and newer), then HEVC, then H.264.",
             );
@@ -416,10 +433,12 @@ impl GloorpApp {
                             s.codec = c;
                         }
                     }
-                });
+                })
+                .response
+                .labelled_by(caption.id);
             ui.end_row();
 
-            ui.label("Bitrate").on_hover_text(
+            let label = ui.label("Bitrate").on_hover_text(
                 "How much data per second the video may use. More looks better but needs \
                  more upload speed: keep it well below your upload speed.",
             );
@@ -439,7 +458,7 @@ impl GloorpApp {
                 }
                 match &mut s.bitrate_mbps {
                     Some(b) => {
-                        ui.add(Slider::new(b, MIN_BITRATE_MBPS..=MAX_BITRATE_MBPS).suffix(" Mbps"));
+                        labelled_slider(ui, b, MIN_BITRATE_MBPS..=MAX_BITRATE_MBPS, " Mbps", label.id);
                     }
                     None => {
                         ui.label(format!("{} Mbps for {}", default_bitrate_mbps(codec), codec.label()));
@@ -548,7 +567,7 @@ impl GloorpApp {
                 (false, true) => current.clone(),
                 (false, false) => format!("{current} (not running)"),
             };
-            ComboBox::from_id_salt("game-app")
+            let programs = ComboBox::from_id_salt("game-app")
                 .selected_text(selected)
                 .width(190.0)
                 .show_ui(ui, |ui| {
@@ -577,6 +596,7 @@ impl GloorpApp {
                 })
                 .response
                 .on_hover_text("Programs with a window that are running right now.");
+            set_accessible_name(&programs, "Program to send game audio from");
             if ui.button("Refresh").on_hover_text("Look for running programs again.").clicked() {
                 refresh = true;
             }
@@ -590,12 +610,14 @@ impl GloorpApp {
                 {
                     self.commands.push(Command::StopGameAudio);
                 }
-                ui.add(
-                    ProgressBar::new(snap.audio.game_level.clamp(0.0, 1.0))
-                        .desired_width(120.0)
-                        .desired_height(10.0),
-                )
-                .on_hover_text("How loud the sound you're sending is.");
+                let level = ui
+                    .add(
+                        ProgressBar::new(snap.audio.game_level.clamp(0.0, 1.0))
+                            .desired_width(120.0)
+                            .desired_height(10.0),
+                    )
+                    .on_hover_text("How loud the sound you're sending is.");
+                set_accessible_name(&level, "Game audio level");
             } else if ui
                 .add_enabled(
                     snap.audio_running,
@@ -674,8 +696,8 @@ impl GloorpApp {
         )
         .on_hover_text("When off, click Open viewer to watch.");
         ui.horizontal(|ui| {
-            ui.label("Friend's game audio volume");
-            percent_slider(ui, &mut self.settings.audio.game_volume)
+            let label = ui.label("Friend's game audio volume");
+            percent_slider(ui, &mut self.settings.audio.game_volume, label.id)
                 .on_hover_text("How loud your friend's game sound is for you (100% = unchanged).");
         });
     }
@@ -696,13 +718,13 @@ impl GloorpApp {
         {
             let a = &mut self.settings.audio;
             Grid::new("devices").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-                ui.label("Microphone");
-                device_combo(ui, "mic", &mut a.input_device, &snap.input_devices)
+                let label = ui.label("Microphone");
+                device_combo(ui, "mic", &mut a.input_device, &snap.input_devices, label.id)
                     .on_hover_text("\"System default\" follows Windows' sound settings.");
                 ui.end_row();
-                ui.label("Speakers");
+                let label = ui.label("Speakers");
                 ui.horizontal(|ui| {
-                    device_combo(ui, "speakers", &mut a.output_device, &snap.output_devices)
+                    device_combo(ui, "speakers", &mut a.output_device, &snap.output_devices, label.id)
                         .on_hover_text("Where you hear your friend. \"System default\" follows Windows' sound settings.");
                     if ui.button("Refresh").on_hover_text("Look for microphones and speakers again.").clicked() {
                         refresh = true;
@@ -754,10 +776,9 @@ impl GloorpApp {
                 }
                 VoiceModeChoice::VoiceActivity => {
                     ui.horizontal(|ui| {
-                        ui.label("Sensitivity");
+                        let label = ui.label("Sensitivity");
                         let mut pct = (a.vad_sensitivity * 100.0).round();
-                        if ui
-                            .add(Slider::new(&mut pct, 0.0..=100.0).suffix(" %"))
+                        if labelled_slider(ui, &mut pct, 0.0..=100.0, " %", label.id)
                             .on_hover_text(
                                 "If the start of your words gets cut off, raise it. \
                                  If keyboard clicks get through, lower it.",
@@ -777,17 +798,18 @@ impl GloorpApp {
                     .on_hover_text("You hear nothing from your friend (no voice, no game audio).");
             });
             ui.horizontal(|ui| {
-                ui.label("Friend's voice volume");
-                percent_slider(ui, &mut a.voice_volume)
+                let label = ui.label("Friend's voice volume");
+                percent_slider(ui, &mut a.voice_volume, label.id)
                     .on_hover_text("How loud your friend's voice is for you (100% = unchanged).");
             });
             ui.horizontal(|ui| {
-                ui.label("Your mic");
+                let label = ui.label("Your mic");
                 ui.add(
                     ProgressBar::new(snap.audio.mic_level.clamp(0.0, 1.0))
                         .desired_width(150.0)
                         .desired_height(10.0),
                 )
+                .labelled_by(label.id)
                 .on_hover_text("Moves when your microphone hears you.");
                 if a.mic_muted {
                     ui.label(RichText::new("Muted").color(ORANGE));
@@ -1027,7 +1049,10 @@ fn banner(ui: &mut Ui, text: &str, close_tip: Option<&str>) -> bool {
                         let close =
                             egui::Button::new(RichText::new("×").size(16.0).color(Color32::WHITE))
                                 .frame(false);
-                        if ui.add(close).on_hover_text(tip).clicked() {
+                        let r = ui.add(close);
+                        // Screen readers say the tip, not "×".
+                        set_accessible_name(&r, tip);
+                        if r.on_hover_text(tip).clicked() {
                             closed = true;
                         }
                     });
@@ -1044,6 +1069,7 @@ fn device_combo(
     id: &str,
     value: &mut Option<String>,
     devices: &[String],
+    label: egui::Id,
 ) -> egui::Response {
     let text = match value {
         None => "System default".to_string(),
@@ -1060,16 +1086,61 @@ fn device_combo(
             }
         })
         .response
+        .labelled_by(label)
 }
 
 /// 0.0..=2.0 shown as 0–200 %.
-fn percent_slider(ui: &mut Ui, value: &mut f32) -> egui::Response {
+fn percent_slider(ui: &mut Ui, value: &mut f32, label: egui::Id) -> egui::Response {
     let mut pct = (*value * 100.0).round();
-    let r = ui.add(Slider::new(&mut pct, 0.0..=200.0).suffix(" %"));
+    let r = labelled_slider(ui, &mut pct, 0.0..=200.0, " %", label);
     if r.changed() {
         *value = pct / 100.0;
     }
     r
+}
+
+/// A slider with its number box, both named after the `label` next to them
+/// for screen readers (egui's own number box would have no name).
+fn labelled_slider<N: egui::emath::Numeric>(
+    ui: &mut Ui,
+    value: &mut N,
+    range: std::ops::RangeInclusive<N>,
+    suffix: &str,
+    label: egui::Id,
+) -> egui::Response {
+    let slider = ui
+        .add(Slider::new(value, range.clone()).show_value(false))
+        .labelled_by(label);
+    let number = ui
+        .add(egui::DragValue::new(value).range(range).suffix(suffix))
+        .labelled_by(label);
+    slider | number
+}
+
+/// Names a control for screen readers when no visible text says what it is.
+fn set_accessible_name(r: &egui::Response, name: &str) {
+    r.ctx
+        .accesskit_node_builder(r.id, |node| node.set_label(name));
+}
+
+/// egui's text boxes ignore "set value" requests from accessibility tools
+/// (Windows UI Automation); this applies them.
+fn accept_set_value(r: &egui::Response, text: &mut String, max_chars: usize) {
+    use egui::accesskit::{Action, ActionData};
+    r.ctx
+        .accesskit_node_builder(r.id, |node| node.add_action(Action::SetValue));
+    let new = r.ctx.input(|i| {
+        i.accesskit_action_requests(r.id, Action::SetValue)
+            .filter_map(|req| match &req.data {
+                Some(ActionData::Value(v)) => Some(v.to_string()),
+                _ => None,
+            })
+            .last()
+    });
+    if let Some(v) = new {
+        *text = v.chars().take(max_chars).collect();
+        r.ctx.request_repaint();
+    }
 }
 
 fn shorten(s: &str, max: usize) -> String {
@@ -1079,5 +1150,107 @@ fn shorten(s: &str, max: usize) -> String {
         let mut t: String = s.chars().take(max.saturating_sub(1)).collect();
         t.push('…');
         t
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::accesskit::{Action, ActionData, ActionRequest, Node, NodeId, Role, TreeId};
+
+    /// One frame; returns the accessibility tree (what screen readers and
+    /// Windows UI Automation see).
+    fn frame(
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        mut f: impl FnMut(&mut Ui),
+    ) -> Vec<(NodeId, Node)> {
+        let input = egui::RawInput {
+            events,
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| f(ui));
+        let tree = out.platform_output.accesskit_update.take().unwrap();
+        // No renderer here.
+        out.drop_without_applying_deltas();
+        tree.nodes
+    }
+
+    /// The text of the labels that name `node` (as UI Automation reads them).
+    fn name(nodes: &[(NodeId, Node)], node: &Node) -> String {
+        if let Some(l) = node.label() {
+            return l.to_string();
+        }
+        let label_of = |id: &NodeId| {
+            let (_, n) = nodes.iter().find(|(i, _)| i == id).unwrap();
+            n.value().or(n.label()).unwrap_or_default().to_string()
+        };
+        node.labelled_by()
+            .iter()
+            .map(label_of)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn names_of(nodes: &[(NodeId, Node)], role: Role) -> Vec<String> {
+        nodes
+            .iter()
+            .filter(|(_, n)| n.role() == role)
+            .map(|(_, n)| name(nodes, n))
+            .collect()
+    }
+
+    #[test]
+    fn controls_have_accessible_names() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut volume = 1.0;
+        let mut device = None;
+        let nodes = frame(&ctx, vec![], |ui| {
+            let label = ui.label("Friend's voice volume");
+            percent_slider(ui, &mut volume, label.id);
+            let label = ui.label("Microphone");
+            device_combo(ui, "mic", &mut device, &["Yeti".into()], label.id);
+            banner(ui, "Something failed.", Some("Hide this message"));
+        });
+        assert_eq!(names_of(&nodes, Role::Slider), ["Friend's voice volume"]);
+        assert_eq!(
+            names_of(&nodes, Role::SpinButton),
+            ["Friend's voice volume"]
+        );
+        assert_eq!(names_of(&nodes, Role::ComboBox), ["Microphone"]);
+        assert_eq!(names_of(&nodes, Role::Button), ["Hide this message"]);
+    }
+
+    #[test]
+    fn text_boxes_take_values_from_ui_automation() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut text = "HYEON-SU".to_string();
+        let edit_id = std::cell::Cell::new(None);
+        let show = |ui: &mut Ui, text: &mut String| {
+            let label = ui.label("Your name:");
+            let r = ui
+                .add(TextEdit::singleline(text).char_limit(10))
+                .labelled_by(label.id);
+            accept_set_value(&r, text, 10);
+            edit_id.set(Some(r.id));
+        };
+        let nodes = frame(&ctx, vec![], |ui| show(ui, &mut text));
+        let (_, edit) = nodes
+            .iter()
+            .find(|(_, n)| n.role() == Role::TextInput)
+            .unwrap();
+        assert_eq!(name(&nodes, edit), "Your name:");
+        assert!(edit.supports_action(Action::SetValue));
+
+        let set = egui::Event::AccessKitActionRequest(ActionRequest {
+            action: Action::SetValue,
+            target_tree: TreeId::ROOT,
+            target_node: edit_id.get().unwrap().accesskit_id(),
+            data: Some(ActionData::Value("Friend B, a long name".into())),
+        });
+        frame(&ctx, vec![set], |ui| show(ui, &mut text));
+        assert_eq!(text, "Friend B, ", "set, and cut to the box's limit");
     }
 }

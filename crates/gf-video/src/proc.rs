@@ -12,7 +12,8 @@ const TAIL_LINES: usize = 30;
 /// Longer lines are cut (a misbehaving child can't make us buffer forever).
 const MAX_LINE: usize = 400;
 
-/// Collects the last lines a child prints on stderr, on its own thread.
+/// Collects the last lines a child prints on stderr (or stdout), on its own
+/// thread. Reads until the stream closes, so the child never blocks on it.
 pub(crate) struct StderrTail {
     lines: Arc<Mutex<VecDeque<String>>>,
     thread: Option<JoinHandle<()>>,

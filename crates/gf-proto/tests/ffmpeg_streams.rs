@@ -28,6 +28,10 @@ fn raw_format(codec: VideoCodec) -> &'static str {
 
 /// FLV bytes from FFmpeg, or `None` (with a printed note) if unavailable.
 fn encode_flv(encoder: &str) -> Option<Vec<u8>> {
+    encode_flv_with(encoder, &[])
+}
+
+fn encode_flv_with(encoder: &str, extra: &[&str]) -> Option<Vec<u8>> {
     let out = Command::new("ffmpeg")
         .args([
             "-hide_banner",
@@ -48,6 +52,7 @@ fn encode_flv(encoder: &str) -> Option<Vec<u8>> {
             "-bf",
             "0",
         ])
+        .args(extra)
         .args(["-f", "flv", "-flvflags", "no_duration_filesize", "pipe:1"])
         .stdin(Stdio::null())
         .stderr(Stdio::piped())
@@ -149,7 +154,10 @@ fn decode(format: &str, stream: Vec<u8>) -> (Vec<String>, String) {
 
 /// Checks everything about one codec's real stream; returns the frames.
 fn check_stream(encoder: &str, codec: VideoCodec) -> Option<Vec<DemuxedFrame>> {
-    let flv = encode_flv(encoder)?;
+    check_flv(encoder, codec, encode_flv(encoder)?)
+}
+
+fn check_flv(encoder: &str, codec: VideoCodec, flv: Vec<u8>) -> Option<Vec<DemuxedFrame>> {
     let frames = demux_chunked(&flv, None);
     for seed in 0..5 {
         assert_eq!(
@@ -292,6 +300,47 @@ fn check_latency(encoder: &str, codec: VideoCodec) {
 #[test]
 fn h264_stream() {
     check_stream("libx264", VideoCodec::H264);
+}
+
+/// x264 in CBR HRD mode pads every frame with filler NAL units, like
+/// NVENC's H.264 CBR does. The canonical frames must not carry them, and the
+/// stream must still decode to the same pictures.
+#[test]
+fn h264_cbr_filler_is_dropped() {
+    let extra = [
+        "-b:v",
+        "8M",
+        "-maxrate",
+        "8M",
+        "-bufsize",
+        "800k",
+        "-x264-params",
+        "nal-hrd=cbr:force-cfr=1",
+    ];
+    let Some(flv) = encode_flv_with("libx264", &extra) else {
+        return;
+    };
+    // A filler NAL unit: header 0x0c, then 0xff bytes.
+    if !flv.windows(4).any(|w| w == [0x0c, 0xff, 0xff, 0xff]) {
+        println!("note: skipping, this libx264 wrote no filler data");
+        return;
+    }
+    let flv_len = flv.len();
+    let Some(frames) = check_flv("libx264 (CBR filler)", VideoCodec::H264, flv) else {
+        return;
+    };
+    for (i, f) in frames.iter().enumerate() {
+        let filler = f
+            .data
+            .windows(4)
+            .any(|w| w[..3] == [0, 0, 1] && w[3] & 0x1f == 12);
+        assert!(!filler, "frame {i} still contains filler data");
+    }
+    let payload: usize = frames.iter().map(|f| f.data.len()).sum();
+    assert!(
+        payload < flv_len / 2,
+        "filler not dropped: {payload} of {flv_len} bytes kept"
+    );
 }
 
 #[test]

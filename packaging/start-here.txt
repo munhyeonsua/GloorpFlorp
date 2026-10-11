@@ -30,6 +30,7 @@ Full guide: open "GloorpFlorp Guide.html" in this folder.
 
 Something wrong? See "Troubleshooting" in the guide. When asking for help,
 send your log file: press Windows+R, paste %APPDATA%\GloorpFlorp and press
-Enter, then send log.txt from that folder.
+Enter, then send log.txt from that folder (and log.old.txt, the log from
+before GloorpFlorp was last restarted).
 
 You and your friend need the same version of GloorpFlorp (see VERSIONS.txt).

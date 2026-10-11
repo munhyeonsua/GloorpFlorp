@@ -2,7 +2,9 @@
 //! Voice activation is an energy gate on the processed signal (sonora 0.2
 //! doesn't expose a voice-activity result); noise suppression keeps
 //! background noise well below its threshold, and with auto gain on the
-//! threshold stays above the noise level the gain may lift.
+//! threshold stays above the noise level the gain may lift. Right after a
+//! microphone opens, voice activation ignores it for a moment: some (e.g. a
+//! Yeti) start with a burst of settling noise that the gain lifts over it.
 
 use crate::VoiceMode;
 
@@ -14,6 +16,10 @@ pub(crate) type KeyFn = Box<dyn Fn(u32) -> bool + Send>;
 pub(crate) const PTT_TAIL_FRAMES: u32 = 15;
 /// Voice activation stays open this long after the level drops.
 pub(crate) const VAD_HANGOVER_FRAMES: u32 = 40;
+/// Voice activation ignores a newly opened microphone for this long. A Yeti
+/// settles for ~0.3 s, but the gain keeps its noise near the most sensitive
+/// threshold until ~0.7 s.
+pub(crate) const MIC_SETTLE_FRAMES: u32 = 100;
 
 /// Auto gain (sonora's AGC2 adaptive digital, default settings) may lift
 /// background noise up to this level (its `max_output_noise_level_dbfs`).
@@ -41,6 +47,8 @@ pub(crate) struct VoiceGate {
     key_down: KeyFn,
     /// Frames left before the gate closes on its own.
     hold: u32,
+    /// Frames left in which voice activation ignores the level.
+    settle: u32,
     mode: Option<VoiceMode>,
 }
 
@@ -49,8 +57,17 @@ impl VoiceGate {
         VoiceGate {
             key_down,
             hold: 0,
+            settle: 0,
             mode: None,
         }
+    }
+
+    /// A microphone (re)opened: the old one's hangover ends, and with
+    /// `settle` voice activation waits `MIC_SETTLE_FRAMES` before it listens.
+    /// Push-to-talk and always-on are up to the user and send at once.
+    pub fn restart(&mut self, settle: bool) {
+        self.hold = 0;
+        self.settle = if settle { MIC_SETTLE_FRAMES } else { 0 };
     }
 
     /// Called once per 10 ms frame with that frame's processed level
@@ -69,11 +86,13 @@ impl VoiceGate {
             self.mode = Some(mode);
             self.hold = 0;
         }
+        let settling = self.settle > 0;
+        self.settle = self.settle.saturating_sub(1);
         let (triggered, tail) = match mode {
             VoiceMode::AlwaysOn => (true, 0),
             VoiceMode::PushToTalk => ((self.key_down)(ptt_key), PTT_TAIL_FRAMES),
             VoiceMode::VoiceActivity => (
-                level_dbfs >= vad_threshold_dbfs(sensitivity, auto_gain),
+                !settling && level_dbfs >= vad_threshold_dbfs(sensitivity, auto_gain),
                 VAD_HANGOVER_FRAMES,
             ),
         };
@@ -201,6 +220,40 @@ mod tests {
         // Without auto gain nothing lifts the noise, so the full range applies.
         let (mut g, _) = gate_with_key();
         assert!(g.update(VoiceMode::VoiceActivity, 0, 1.0, false, false, -50.0));
+    }
+
+    #[test]
+    fn new_microphone_settles_before_voice_activation_listens() {
+        let (mut g, held) = gate_with_key();
+        let vad = |g: &mut VoiceGate, level: f32| {
+            g.update(VoiceMode::VoiceActivity, 0x56, 1.0, true, false, level)
+        };
+        // Speaking when the mic changes: the old hangover doesn't carry the
+        // new mic's start-up burst.
+        assert!(vad(&mut g, LOUD));
+        g.restart(true);
+        for i in 0..MIC_SETTLE_FRAMES {
+            assert!(!vad(&mut g, LOUD), "settling frame {i}");
+        }
+        assert!(vad(&mut g, LOUD));
+        for _ in 0..VAD_HANGOVER_FRAMES {
+            assert!(vad(&mut g, QUIET));
+        }
+        assert!(!vad(&mut g, QUIET));
+
+        // Push-to-talk and always-on don't wait.
+        g.restart(true);
+        held.store(true, Ordering::Relaxed);
+        assert!(g.update(VoiceMode::PushToTalk, 0x56, 1.0, true, false, QUIET));
+        g.restart(true);
+        assert!(g.update(VoiceMode::AlwaysOn, 0x56, 1.0, true, false, QUIET));
+
+        // Without settling only the hangover is dropped.
+        let (mut g, _) = gate_with_key();
+        assert!(vad(&mut g, LOUD));
+        g.restart(false);
+        assert!(!vad(&mut g, QUIET));
+        assert!(vad(&mut g, LOUD));
     }
 
     #[test]

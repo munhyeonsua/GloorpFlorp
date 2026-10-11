@@ -12,25 +12,23 @@ agents that built the crates: `.claude/handoff/phase1-agent-reports.json` (proto
 
 ## Status
 
-| Part | State | Tests (Linux) |
+| Part | State | Tests (owner's PC, FFmpeg + mpv on PATH) |
 |---|---|---|
-| `gf-proto`: room codes, wire format, FLV demuxer + viewer writer, jitter buffer | ✅ done | 52 unit + 6 FFmpeg stream tests pass |
-| `gf-sys`: monitors, game-audio capture (process loopback), push-to-talk keys, Tailscale IP, child-process job object | ✅ done | 19 pass (Windows parts compile-checked only) |
-| `gf-net`: TCP+UDP session, handshake, reconnect, video queue, stats | ✅ done | 29 pass |
-| `gf-video`: FFmpeg encoder (ddagrab → NVENC → FLV), mpv viewer | ✅ done | 22 unit + 4 integration pass (software encoders) |
+| `gf-proto`: room codes, wire format, FLV demuxer + viewer writer, jitter buffer | ✅ done | 58 unit + 7 FFmpeg stream tests pass |
+| `gf-sys`: monitors, game-audio capture (process loopback), push-to-talk keys, Tailscale IP, child-process job object | ✅ done | 23 pass |
+| `gf-net`: TCP+UDP session, handshake, reconnect, video queue, stats | ✅ done | 35 pass |
+| `gf-video`: FFmpeg encoder (ddagrab → NVENC → FLV), mpv viewer | ✅ done | 27 unit + 3 integration pass |
 | `.github/workflows/build.yml`, `packaging/`, `README.md` | ✅ done | actionlint clean; packaging script run end to end with the real FFmpeg zip |
-| `gf-audio`: mic, echo cancellation, Opus, jitter, mixing, playback, game audio | ✅ done | 41 pass (Linux + native Windows) |
-| `app`: engine, settings, logging, egui UI, end-to-end test | ✅ done | 5 unit + 3 end-to-end pass (Linux + native Windows) |
-| Integration (everything together, release build) | ✅ done on the owner's PC (Windows 11, MSVC): `cargo build --workspace`, `cargo test --workspace`, `cargo clippy --workspace --all-targets -D warnings`, `cargo build --release -p gloorpflorp` → `target\release\GloorpFlorp.exe` | all pass |
+| `gf-audio`: mic, echo cancellation, Opus, jitter, mixing, playback, game audio | ✅ done | 48 pass |
+| `app`: engine, settings, logging, egui UI, end-to-end test | ✅ done | 7 + 2 (UI) unit + 4 end-to-end pass |
+| Integration (everything together, release build) | ✅ done on the owner's PC (Windows 11, MSVC): `cargo build --workspace`, `cargo test --workspace` (with and without FFmpeg/mpv), `cargo clippy --workspace --all-targets -D warnings`, `cargo fmt --all -- --check`, `cargo build --release -p gloorpflorp` → `target\release\GloorpFlorp.exe` | all pass |
 
-What has run on the real PC (no FFmpeg/mpv installed there yet): the
-release exe opens its window, finds Tailscale, both monitors, the real
-microphone and headphones, lists programs, and closes cleanly in < 1 s;
-`cargo run -p gf-sys --example sys_probe` captured real process-loopback
-audio ("everything except" and a single program); every test binary runs on
-Windows. **Screen sharing (FFmpeg/NVENC) and the mpv viewer have not run on
-Windows yet**, and the end-to-end test skipped its video part there (no
-FFmpeg).
+Most of the app has now run on the owner's PC: see "Hardware test results"
+below. Not yet: a real screen share in the app (the screen saver blocked
+screen capture), the portrait-monitor and scaling fixes with a live
+capture, push-to-talk in a game, the Firewall prompt, and a session between
+the two PCs. `dist\GloorpFlorp` holds a packaged copy (BtbN FFmpeg
+N-127271, shinchiro mpv 0.41) with the latest `GloorpFlorp.exe`.
 
 ## Next steps
 
@@ -38,23 +36,24 @@ FFmpeg).
 2. **Review.** Run an adversarial review across the workspace: Windows API
    correctness, real-time audio safety, protocol edge cases, UI wording.
    Verify each finding before fixing it.
-3. **Test on real hardware** (this PC). Get `ffmpeg.exe` (BtbN
-   `ffmpeg-master-latest-win64-gpl.zip`) and `mpv` (shinchiro
-   `mpv-x86_64-*.7z`) next to the exe, or use `packaging/package-windows.ps1`.
-   With FFmpeg on PATH, also re-run `cargo test --workspace` so the video
-   part of the end-to-end test and the gf-video/gf-proto FFmpeg tests run on
-   Windows. Then check:
-   - [ ] `probe_encoders` finds AV1, HEVC and H.264 NVENC on the 5080
-   - [ ] A short real share: ddagrab → av1_nvenc → viewer window shows it, delay feels low
-   - [ ] Scaling path: this PC's main monitor is 3840×2160 and the default cap is 1440p, so the ladder's GPU scaling is used (check which step wins in the log)
-   - [ ] The portrait monitor (2160×3840, index 1) shares correctly
-   - [x] Monitor list matches the real monitors (2 found: 3840×2160 primary, 2160×3840); ddagrab indices still to confirm
-   - [x] Game-audio capture works ("everything except" and one program, via `sys_probe`), and through the engine with real devices (a throwaway example: capture starts, level moves, stops; closing the picked program stops game audio within ~1.5 s with the plain message). Still to try from the window itself
-   - [ ] Mic → echo cancellation → voice; push-to-talk key works while a game window has focus
-   - [ ] Two copies on one PC: start both with `GLOORP_DEV_IP=127.0.0.1` (use `GLOORP_FAKE_AUDIO=1` on one of them, or headphones, to avoid feedback)
-   - [ ] Windows Firewall prompt appears on first Host
+3. **Test on real hardware** (this PC). Done on 2026-10-11 except where
+   unticked (results and fixes below). The screen saver blocked screen
+   capture and synthesized key presses for most of that night, so the
+   unticked items need someone at the PC:
+   - [x] `probe_encoders` finds AV1, HEVC and H.264 NVENC on the 5080 (0.82–0.84 s)
+   - [ ] A short real share in the app: ddagrab → NVENC and the mpv viewer each work on their own (below); together in the app only with the test pattern so far
+   - [x] Scaling path: both GPU steps failed every time and the CPU step won (~2.3 s to start, ~1.9 cores). Since then the impossible CUDA step is gone and a failed GPU step is remembered, but GPU scaling still doesn't work and the shorter ladder hasn't run with a live capture yet
+   - [ ] The portrait monitor (2160×3840, index 1) shares correctly: it came out sideways; fixed in code, not yet checked with a live capture
+   - [x] Monitor list matches the real monitors, and `Monitor::index` = ddagrab `output_idx`
+   - [x] Game-audio capture, both modes, from the window too
+   - [x] Mic → echo cancellation → voice on the real Yeti / ECHO-A (runs cleanly; how well echo is cancelled needs a real call, as no sound was played)
+   - [ ] Push-to-talk key works while a game window has focus
+   - [x] Two copies on one PC (`GLOORP_DEV_IP=127.0.0.1`, `GLOORP_FAKE_AUDIO=1`)
+   - [ ] Windows Firewall prompt appears on first Host (tests only used 127.0.0.1)
+   - [ ] Does the viewer window take focus from a game when it opens? (mpv took the foreground in every test, even with `--focus-on=never`)
+   - [ ] Next-session checks prepared by the fixers: share monitor 1 at 1440p and native and compare with a `gdigrab` capture (direction, mouse pointer); set `args::CUDA_TRANSFORM = true` and run `scratchpad/hwfix/fix-video/vs-harness` (`enc av1 0 60 1440`, `enc h264 1 60 1440`) to compare CPU use; run `scratchpad/hwfix/fix-video/pacing/pacing.sh`. Ready-made scripts with a screen-saver check: `scratchpad/hwfix/retest/capture-checks.ps1` (portrait, scaling, pacing, bitrate) and `app-share.ps1 -Monitor 0` / `-Monitor 1` (two packaged copies on 127.0.0.1). (Scratchpads are under `%TEMP%\claude\…`; they may be gone.)
 4. **Push without `[skip ci]`** so GitHub builds the zip. Check both jobs go green.
-5. **First session with the friend.** The friend's 3070 Ti PC needs an up-to-date NVIDIA driver (FFmpeg master needs a recent NVENC API).
+5. **First session with the friend.** The friend's 3070 Ti PC needs an up-to-date NVIDIA driver (FFmpeg master needs a recent NVENC API). Judge delay and echo by ear (nothing audible was played in the tests), and keep both PCs' log files.
 
 ## Decisions made after ARCHITECTURE.md was written
 
@@ -107,7 +106,12 @@ FFmpeg).
 - **Devices:** a stream that stops working is reopened at once, and default
   streams follow Windows' default device.
 - **Voice activation:** with auto gain on, the gate threshold stays 6 dB
-  above the noise level the gain may lift, so a fan can't hold it open.
+  above the noise level the gain may lift, so a fan can't hold it open. It
+  also ignores a newly opened microphone for 1 s (`gate::MIC_SETTLE_FRAMES`):
+  the Yeti makes ~0.3 s of settling noise that auto gain lifted over the
+  threshold and sent as ~0.45 s of noise. This applies on start, on a device
+  switch, on a Windows default-device change and on recovery; push-to-talk
+  and Always on are not delayed.
 - **Game-audio capture:** 100 ms buffer, encoder flush after 120 ms (no
   padding when the capture thread was held up). The capture's problem is
   `AudioStatus::game_error`, shown under "Game audio" and as the banner when
@@ -142,6 +146,81 @@ FFmpeg).
 - **UI:** no-encoder state shown up front; release builds show a message
   box if the window can't open; minimum width 440.
 
+## Hardware test results (RTX 5080 PC, 2026-10-11)
+
+Windows 11, Ryzen 7 9800X3D, RTX 5080 (driver 617.42), monitors 3840×2160
+(primary) and 2160×3840 (portrait), Yeti mic, ECHO-A headphones. Five test
+runs, every defect double-checked before fixing. Key numbers:
+
+- **Tests:** with FFmpeg and mpv on PATH every test now really runs; the
+  only failure (an mpv test) was a real viewer delay, fixed below.
+- **Encoders:** AV1, HEVC and H.264 NVENC found in 0.82–0.84 s. Native 4K60
+  AV1 straight from the GPU: started in 0.77 s, 60.05 fps, almost no CPU.
+  Every keyframe decodes on its own, one every 2 s. Stop takes 50–60 ms and
+  leaves no FFmpeg behind.
+- **Scaling (4K → 1440p):** both GPU steps failed every time, so the CPU step
+  ran: ~2.3–2.4 s to start, ~1.9 CPU cores. (Fixed; see below.)
+- **Capture pacing:** at 60 fps about every 10th frame gap is ~31 ms instead
+  of ~16 ms; 120 and 144 fps only reach 74–89 fps. The limit is the capture
+  (`ddagrab`), not NVENC (8–39% busy). Not fixed yet.
+- **Portrait monitor:** index mapping right, but the picture came out
+  sideways. (Fixed in code; not yet seen with a live capture.)
+- **Viewer (mpv 0.41):** hardware decoding of all three codecs, `push`
+  never blocks (max 0.26 ms), closing the window is noticed in ~0.18 s. Before
+  the fixes: H.264/HEVC shown ~47 ms late, a new window could stay black ~2 s,
+  and starting mpv froze the engine for ~0.37 s.
+- **Audio:** device lists match Windows; Always on sends exactly 100 voice
+  packets/s (48.8 kbps), no lost mic samples, 0 output underruns over ~4.5
+  minutes and under a 16-thread CPU load; all audio threads at MMCSS priority
+  24. Game audio starts in 0.4–20 ms, stops in ~6 ms, and GloorpFlorp's own
+  sound is really left out of "Everything except GloorpFlorp".
+- **The app window (two copies on 127.0.0.1):** Host, Join, voice, Mute,
+  Deafen, game audio, leave/rejoin, error messages and closing all worked
+  with plain messages; closing takes 150–260 ms and leaves no FFmpeg/mpv.
+
+## Hardware test fixes
+
+Crates (first round):
+- **Viewer:** mpv gets `--demuxer=lavf` and `--hwdec-threads=1` (H.264/HEVC
+  delay ~47 ms → 0.4 ms; a new window shows the first picture after ~0.63 s,
+  mpv's start-up, instead of up to ~2 s). While mpv starts, frames from the
+  latest keyframe on wait for it (up to 300 frames / 16 MB). mpv's messages
+  reach the log; `$` in the friend's name no longer gets expanded.
+- **Portrait monitor:** `gf_sys::Monitor::rotation`; the picture is turned
+  upright on the CPU path, also at native size. Checked with test frames
+  through the real NVENC, not yet with a live capture.
+- **Scaling:** the impossible CUDA mapping step is gone, `scale_d3d11` is
+  skipped for turned monitors, and once a GPU step failed and the CPU step
+  then worked, later shares in the same app run go straight to the CPU. A
+  CUDA scaling path is ready but off (`args::CUDA_TRANSFORM`) until a
+  live-desktop check. Scaled shares still use ~1.6–1.9 CPU cores.
+- **H.264 filler:** NVENC padded 72–78% of the bytes; it is dropped before
+  sending (a quiet 3 s 4K NVENC stream from test frames: 13.1 MB → 1.07 MB;
+  not yet measured on a live capture).
+- **Colours:** the CPU path tags its colour matrix like NVENC does.
+- **Game audio:** a program Windows won't let us watch (e.g. access denied)
+  is captured anyway instead of "has closed"; new plain message if capture
+  itself is refused; the "has closed" message names Start sending game audio.
+- **Voice activation:** a newly opened mic is ignored for 1 s (Yeti start-up
+  noise was sent in 3 of 7 opens; now 0 of 16).
+
+App and docs (second round):
+- **Viewer start off the engine thread:** mpv is started on a helper thread
+  (stale starts discarded); video that arrives meanwhile is kept from the
+  latest keyframe on and handed over. Measured: engine stalls at viewer open
+  372–385 ms → 3–5 ms (same as normal), voice packets dropped per open 32–34
+  → 0; on a codec change the new viewer still gets the opening keyframe.
+- **Settings saved with a byte-order mark** (Notepad, PowerShell 5.1) load
+  instead of being reset to defaults.
+- **Screen readers / UI Automation:** every text box, dropdown, slider and
+  number box is named after its label; the banner's × is "Hide this message";
+  text boxes accept UI Automation "set value".
+- **120 and 144 fps** are labelled "(experimental)", with the measured rates
+  in the tooltip and README.
+- **README:** log.old.txt in the privacy list, "Wrong room code", Codec under
+  "Your screen", "a few seconds" of black, mpv 0.41 needed.
+- **Packaging** fails if the downloaded mpv is older than 0.41.
+
 ## What the finished crates need from `gf-audio` and `app`
 
 From the agents' reports (also check the code's doc comments):
@@ -166,13 +245,16 @@ From the agents' reports (also check the code's doc comments):
   `Stopped{error:Some(msg)}` show only the first paragraph in the UI; the
   rest ("Details from FFmpeg: …") is for the log.
 - Open a new `Viewer` when the codec changes. When `Viewer::push` returns
-  false (window closed), send `Watching{on:false}`.
+  false (window closed), send `Watching{on:false}`. `Viewer::start` can
+  block ~0.4 s (starting mpv.exe), so the engine runs it on a helper thread.
 - `gf_sys::LoopbackCapture::start` can block up to 10 s and dropping it up to
   2 s, so do both off the UI thread. Poll `LoopbackCapture::error()` to show
   "the program you picked closed".
 - Test env vars: `GLOORP_FAKE_AUDIO=1` (fake mic/output/game tone),
-  `GLOORP_FAKE_VIDEO=1` (test pattern + software encoders, FFmpeg null-sink
-  viewer, also on Windows). The end-to-end test on the windows-latest
+  `GLOORP_FAKE_VIDEO=1` (test pattern + software encoders; the viewer is
+  mpv when it is found, else an FFmpeg null sink, also on Windows). With
+  mpv on PATH, `cargo test -p gloorpflorp` opens a real, focus-taking mpv
+  window for a few seconds. The end-to-end test on the windows-latest
   runner needs `GLOORP_FAKE_VIDEO=1` and ffmpeg on PATH, or must skip video.
 - UI labels the README uses (keep them, or update README.md and
   `packaging/start-here.txt`): **Host**, **Join**, **Start sharing**,
@@ -208,14 +290,38 @@ From the agents' reports (also check the code's doc comments):
 
 - Windows-only code that has run on the real PC: DXGI monitor enumeration,
   WASAPI process loopback, cpal/WASAPI device open, job object,
-  CREATE_NO_WINDOW, MMCSS, the egui window. Not yet exercised for real:
-  GetAsyncKeyState push-to-talk in a game, ddagrab/NVENC, mpv.
+  CREATE_NO_WINDOW, MMCSS, the egui window, ddagrab/NVENC, mpv. Not yet
+  exercised for real: GetAsyncKeyState push-to-talk in a game, a live share
+  in the app, the portrait-monitor fix, the Windows Firewall prompt.
+- **The screen saver blocks capture.** While it runs (or the PC is locked),
+  Windows refuses Desktop Duplication ("Desktop duplication access denied";
+  the app shows its plain "Windows refused to let GloorpFlorp capture the
+  screen…" message) and synthesized key presses. Test sharing with someone
+  at the PC.
+- **Capture pacing:** ddagrab delivers frames in ~15.6 ms steps (the
+  Windows timer), so 60 fps has a ~31 ms gap about every 10th frame and
+  120/144 fps reach only ~74–89 fps. A prepared experiment
+  (`framerate=1001` + a pacing filter) needs a live desktop.
+- **GPU scaling:** `scale_d3d11` fails on NVIDIA with FFmpeg 8 (error
+  80070057, reproducible without capture), so scaled shares use the CPU
+  (~1.6–1.9 cores at 4K → 1440p) until the CUDA path is checked and turned
+  on (`args::CUDA_TRANSFORM`).
+- **Viewer focus:** mpv took the foreground every time it opened in the
+  tests. Whether it steals focus from a game (e.g. Tarkov) needs a check in
+  game.
+- Starting mpv.exe is slow when no mpv is running (~0.37 s, probably
+  antivirus scanning the 120 MB unsigned file); the engine no longer waits
+  for it.
+- A turned (portrait) monitor is always turned on the CPU while
+  `CUDA_TRANSFORM` is off, also at native size (2160×3840); its CPU use
+  hasn't been measured.
+- mpv's messages now reach the log: each viewer open adds ~10 harmless
+  warnings ("no timestamps", "No video PTS", decoder errors at the end of a
+  stream). Don't read them as the cause of a problem.
 - `wasapi`'s `new_application_loopback_client` waits with no timeout. If
   Windows never activates capture, `start()` gives up after 10 s and leaves
   a stuck thread (logged).
 - `list_monitors` only lists adapter 0's outputs (what ddagrab uses).
-- `scale_d3d11` options in FFmpeg 8 are unconfirmed. The ladder falls back to
-  CUDA, then CPU scaling.
 - CI on a private repo: Windows minutes count double, and each zip is
   ~110–130 MB against a 500 MB free artifact quota. The workflow cancels
   older runs on the same branch and keeps artifacts 14 days. Consider

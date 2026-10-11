@@ -32,6 +32,10 @@ const REBIND_WINDOW: Duration = Duration::from_secs(5);
 const VIEWER_EARLY_CLOSE: Duration = Duration::from_secs(2);
 /// Game audio is considered dead after the capture reports a problem this long.
 const GAME_DEAD_AFTER: Duration = Duration::from_secs(1);
+/// Frames kept for a viewer that is still starting (as many as the viewer
+/// itself keeps while mpv starts).
+const PENDING_FRAMES: usize = 300;
+const PENDING_BYTES: usize = 16 << 20;
 /// How often to check whether an elevated program has focus (a few cheap
 /// system calls; only with push-to-talk).
 const ELEVATED_CHECK: Duration = Duration::from_millis(500);
@@ -68,6 +72,10 @@ enum Internal {
     EncoderReady {
         gen: u64,
         result: EncoderStart,
+    },
+    ViewerReady {
+        gen: u64,
+        result: Result<Viewer, String>,
     },
     /// The audio engine started (or couldn't).
     AudioReady(Result<Arc<AudioEngine>, String>),
@@ -179,6 +187,41 @@ fn dispose<T: Send + 'static>(what: &str, value: T) {
     }
 }
 
+/// Video that arrives while the viewer starts, from the latest keyframe on.
+/// The new viewer gets it once it runs, so it can start at the opening
+/// keyframe instead of waiting for the next one.
+#[derive(Default)]
+struct PendingFrames {
+    frames: Vec<VideoFrame>,
+    bytes: usize,
+}
+
+impl PendingFrames {
+    fn push(&mut self, codec: VideoCodec, frame: VideoFrame) {
+        if frame.codec != codec {
+            return;
+        }
+        if frame.keyframe {
+            self.clear();
+        } else if self.frames.is_empty() {
+            // Nothing to decode it from.
+            return;
+        }
+        if self.frames.len() >= PENDING_FRAMES || self.bytes + frame.data.len() > PENDING_BYTES {
+            // Too much: wait for the next keyframe.
+            self.clear();
+            return;
+        }
+        self.bytes += frame.data.len();
+        self.frames.push(frame);
+    }
+
+    fn clear(&mut self) {
+        self.frames.clear();
+        self.bytes = 0;
+    }
+}
+
 fn spawn_helper(name: &str, f: impl FnOnce() + Send + 'static) {
     if let Err(e) = std::thread::Builder::new().name(name.into()).spawn(f) {
         log::warn!("couldn't start the {name} thread: {e}");
@@ -230,6 +273,12 @@ struct Core {
     viewer: Option<Viewer>,
     /// What the open viewer shows, and when it opened.
     viewer_for: Option<(ShareInfo, Instant)>,
+    /// A viewer is starting on a helper thread (launching mpv can take
+    /// ~0.4 s) for this share; its video waits in `viewer_pending`.
+    viewer_starting: Option<ShareInfo>,
+    viewer_pending: PendingFrames,
+    /// Bumped whenever the viewer closes, so a late start is discarded.
+    viewer_gen: u64,
     /// The user closed the viewer for the friend's current share: don't
     /// reopen it by itself until the friend shares again.
     viewer_declined: bool,
@@ -285,6 +334,9 @@ pub(super) fn run(
         share_announced: false,
         viewer: None,
         viewer_for: None,
+        viewer_starting: None,
+        viewer_pending: PendingFrames::default(),
+        viewer_gen: 0,
         viewer_declined: false,
         game_dead_since: None,
         elevated_check_at: Instant::now(),
@@ -832,9 +884,11 @@ impl Core {
 
     // ------------------------------------------------------------ viewer
 
+    /// Starts the viewer on a helper thread: launching mpv can take several
+    /// hundred ms, and the engine thread must keep passing on audio.
     fn open_viewer(&mut self, info: ShareInfo) {
         self.close_viewer();
-        let Some(tools) = &self.tools else {
+        let Some(tools) = self.tools.clone() else {
             let msg = self
                 .tools_error
                 .clone()
@@ -843,20 +897,60 @@ impl Core {
             return;
         };
         let title = format!("{}'s screen - GloorpFlorp", self.peer_label());
-        match Viewer::start(tools, info.codec, &title) {
-            Ok(v) => {
-                self.viewer = Some(v);
-                self.viewer_for = Some((info, Instant::now()));
-                self.viewer_declined = false;
-                self.snap.viewer_open = true;
-                self.urgent = true;
-                self.send(TcpMsg::Watching { on: true });
+        let gen = self.viewer_gen;
+        self.viewer_starting = Some(info);
+        self.viewer_declined = false;
+        self.snap.viewer_open = true;
+        self.urgent = true;
+        // Ask for video now; it waits in `viewer_pending` until mpv runs.
+        self.send(TcpMsg::Watching { on: true });
+        let tx = self.internal_tx.clone();
+        spawn_helper("viewer-start", move || {
+            let started = Instant::now();
+            let result = Viewer::start(&tools, info.codec, &title).map_err(|e| e.to_string());
+            log::debug!("viewer start took {} ms", started.elapsed().as_millis());
+            // If the engine is gone, this drops (closes) the viewer.
+            let _ = tx.send(Internal::ViewerReady { gen, result });
+        });
+    }
+
+    fn viewer_ready(&mut self, gen: u64, result: Result<Viewer, String>) {
+        let info = match self.viewer_starting {
+            Some(info) if gen == self.viewer_gen => info,
+            _ => {
+                if let Ok(v) = result {
+                    dispose("viewer", v);
+                }
+                return;
             }
-            Err(e) => self.error(e.to_string()),
+        };
+        self.viewer_starting = None;
+        let pending = std::mem::take(&mut self.viewer_pending);
+        match result {
+            Ok(v) => {
+                log::debug!(
+                    "viewer started; passing on {} frame(s) that arrived meanwhile",
+                    pending.frames.len()
+                );
+                self.viewer_for = Some((info, Instant::now()));
+                let open = pending.frames.iter().all(|f| v.push(f));
+                self.viewer = Some(v);
+                if !open {
+                    self.viewer_closed();
+                }
+            }
+            Err(e) => {
+                self.snap.viewer_open = false;
+                self.send(TcpMsg::Watching { on: false });
+                self.error(e);
+            }
         }
     }
 
     fn close_viewer(&mut self) {
+        self.viewer_gen += 1;
+        self.viewer_starting = None;
+        self.viewer_pending.clear();
         if let Some(v) = self.viewer.take() {
             dispose("viewer", v);
         }
@@ -882,7 +976,9 @@ impl Core {
     fn open_viewer_cmd(&mut self) {
         match self.snap.peer_share {
             Some(info) => {
-                if self.viewer.as_ref().is_some_and(|v| v.is_open()) {
+                if self.viewer_starting.is_some()
+                    || self.viewer.as_ref().is_some_and(|v| v.is_open())
+                {
                     return;
                 }
                 self.open_viewer(info);
@@ -910,17 +1006,18 @@ impl Core {
         }
         self.snap.peer_share = Some(info);
         self.snap.frames_received = 0;
-        let open = self.viewer.is_some();
         let same_picture =
             |s: ShareInfo| (s.codec, s.width, s.height) == (info.codec, info.width, info.height);
-        match self.viewer_for {
-            Some((shown, _)) if open && same_picture(shown) => {
+        // What the open (or still starting) viewer shows.
+        let shown = self.viewer_for.map(|(s, _)| s).or(self.viewer_starting);
+        match shown {
+            Some(shown) if same_picture(shown) => {
                 // Same picture format (the friend restarted their encoder,
                 // e.g. a new frame rate): keep the window.
                 self.send(TcpMsg::Watching { on: true });
             }
-            Some(_) if open => self.open_viewer(info),
-            _ => {
+            Some(_) => self.open_viewer(info),
+            None => {
                 if self.settings.auto_open_viewer && !self.viewer_declined {
                     self.open_viewer(info);
                 }
@@ -1150,6 +1247,7 @@ impl Core {
                     }
                 }
             }
+            Internal::ViewerReady { gen, result } => self.viewer_ready(gen, result),
             Internal::AudioReady(Ok(audio)) => {
                 // The settings may have changed while it started.
                 audio.set_settings(AudioSettings::from(&self.settings.audio));
@@ -1182,8 +1280,9 @@ impl Core {
         match ev {
             NetEvent::Video(frame) => {
                 self.snap.frames_received += 1;
-                let closed = self.viewer.as_ref().is_some_and(|v| !v.push(&frame));
-                if closed {
+                if let Some(info) = self.viewer_starting {
+                    self.viewer_pending.push(info.codec, frame);
+                } else if self.viewer.as_ref().is_some_and(|v| !v.push(&frame)) {
                     self.viewer_closed();
                 }
             }
@@ -1462,5 +1561,53 @@ fn command_name(cmd: &Command) -> &'static str {
         Command::RefreshLists => "RefreshLists",
         Command::DismissError => "DismissError",
         Command::Shutdown => "Shutdown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(codec: VideoCodec, keyframe: bool, len: usize) -> VideoFrame {
+        VideoFrame {
+            codec,
+            keyframe,
+            sent_us: 0,
+            data: vec![0; len],
+        }
+    }
+
+    /// While the viewer starts, its video is kept from the latest keyframe
+    /// on, so the new window can start at the opening keyframe.
+    #[test]
+    fn video_waits_for_a_starting_viewer() {
+        let h264 = VideoCodec::H264;
+        let mut p = PendingFrames::default();
+        p.push(h264, frame(h264, false, 10));
+        assert!(p.frames.is_empty(), "nothing before the first keyframe");
+        p.push(h264, frame(h264, true, 100));
+        p.push(h264, frame(h264, false, 10));
+        p.push(h264, frame(VideoCodec::Av1, true, 10));
+        assert_eq!(p.frames.len(), 2, "other codecs are skipped");
+        assert!(p.frames[0].keyframe);
+        assert_eq!(p.bytes, 110);
+
+        // A newer keyframe replaces what came before it.
+        p.push(h264, frame(h264, true, 50));
+        assert_eq!((p.frames.len(), p.bytes), (1, 50));
+
+        // Too much (the viewer never started): wait for the next keyframe.
+        for _ in 1..PENDING_FRAMES {
+            p.push(h264, frame(h264, false, 1));
+        }
+        assert_eq!(p.frames.len(), PENDING_FRAMES);
+        p.push(h264, frame(h264, false, 1));
+        assert!(p.frames.is_empty());
+        p.push(h264, frame(h264, false, 1));
+        assert!(p.frames.is_empty());
+        p.push(h264, frame(h264, true, PENDING_BYTES + 1));
+        assert!(p.frames.is_empty(), "the byte limit counts too");
+        p.push(h264, frame(h264, true, 1));
+        assert_eq!((p.frames.len(), p.bytes), (1, 1));
     }
 }

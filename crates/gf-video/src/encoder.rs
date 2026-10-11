@@ -3,6 +3,7 @@
 
 use std::io::Read;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -11,7 +12,7 @@ use crossbeam_channel::{Receiver, Sender, TrySendError};
 use gf_proto::bitstream::{DemuxedFrame, FlvDemuxer};
 use gf_proto::{VideoCodec, VideoFrame};
 
-use crate::args::{self, Step};
+use crate::args::{self, Screen, Step};
 use crate::proc::{self, StderrTail};
 use crate::{tools, EncoderEvent, EncoderSettings, Tools};
 
@@ -25,18 +26,35 @@ const EVENT_QUEUE: usize = 120;
 /// Bytes kept from the start of the stream to read the FLV metadata.
 const META_BYTES: usize = 4096;
 
-/// Size of the monitor `index`, or 1920×1080 if it can't be found.
-pub(crate) fn monitor_size(index: u32) -> (u32, u32) {
+/// Set once scaling/turning on the GPU has failed where the CPU way then
+/// worked: later shares in this run of the app go straight to the CPU.
+static GPU_TRANSFORM_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// The monitor `index`, or an upright 1920×1080 if it can't be found.
+pub(crate) fn screen(index: u32) -> Screen {
     match gf_sys::list_monitors()
         .into_iter()
         .find(|m| m.index == index)
     {
-        Some(m) if m.width > 0 && m.height > 0 => (m.width, m.height),
+        Some(m) if m.width > 0 && m.height > 0 => Screen {
+            width: m.width,
+            height: m.height,
+            rotation: m.rotation,
+        },
         _ => {
             log::warn!("monitor {index} not found; assuming 1920x1080");
-            (1920, 1080)
+            Screen {
+                width: 1920,
+                height: 1080,
+                rotation: 0,
+            }
         }
     }
+}
+
+/// Size of the monitor `index` as shown on the desktop (upright).
+pub(crate) fn monitor_size(index: u32) -> (u32, u32) {
+    screen(index).size()
 }
 
 /// Messages from a reader thread to the supervisor.
@@ -67,10 +85,10 @@ fn spawn_attempt(
     tools: &Tools,
     step: Step,
     settings: &EncoderSettings,
-    monitor: (u32, u32),
+    screen: Screen,
     internal: &Sender<Internal>,
 ) -> anyhow::Result<Attempt> {
-    let a = args::encoder_args(step, settings, monitor);
+    let a = args::encoder_args(step, settings, screen);
     log::info!("starting FFmpeg ({}): {}", step.label(), a.join(" "));
     let mut cmd = Command::new(&tools.ffmpeg);
     cmd.args(&a)
@@ -198,21 +216,30 @@ impl EncoderInner {
         tools: &Tools,
         settings: &EncoderSettings,
     ) -> anyhow::Result<(EncoderInner, Receiver<EncoderEvent>)> {
-        let monitor = monitor_size(settings.monitor);
-        let size = args::output_size(monitor.0, monitor.1, settings.max_height);
+        let screen = screen(settings.monitor);
+        let size = args::output_size(screen.width, screen.height, settings.max_height);
         let test_source = tools::use_test_source();
-        let steps = args::ladder(test_source, size != monitor);
+        let transform = screen.needs_transform(settings.max_height);
+        let gpu_transform = if GPU_TRANSFORM_FAILED.load(Ordering::Relaxed) {
+            if transform && !test_source {
+                log::info!("scaling on the CPU (the GPU way failed earlier in this session)");
+            }
+            None
+        } else {
+            args::gpu_transform_step(screen.turned(), args::CUDA_TRANSFORM)
+        };
+        let steps = args::ladder(test_source, transform, gpu_transform);
         let (internal_tx, internal_rx) = crossbeam_channel::unbounded();
         let (tx, rx) = crossbeam_channel::bounded(EVENT_QUEUE);
 
         // Spawn the first step here so a missing/broken FFmpeg is reported at once.
-        let first = spawn_attempt(tools, steps[0], settings, monitor, &internal_tx)?;
+        let first = spawn_attempt(tools, steps[0], settings, screen, &internal_tx)?;
         let current: SharedChild = Arc::new(Mutex::new(Some(first)));
 
         let sup = Supervisor {
             tools: tools.clone(),
             settings: settings.clone(),
-            monitor,
+            screen,
             size,
             steps,
             timeout: if test_source {
@@ -227,6 +254,8 @@ impl EncoderInner {
                 tx,
                 skipping: false,
             },
+            transform,
+            gpu_transform_failed: false,
         };
         let supervisor = std::thread::Builder::new()
             .name("encoder".into())
@@ -274,7 +303,7 @@ impl Drop for EncoderInner {
 struct Supervisor {
     tools: Tools,
     settings: EncoderSettings,
-    monitor: (u32, u32),
+    screen: Screen,
     size: (u32, u32),
     steps: Vec<Step>,
     timeout: Duration,
@@ -282,6 +311,10 @@ struct Supervisor {
     internal_tx: Sender<Internal>,
     internal_rx: Receiver<Internal>,
     out: Out,
+    /// The picture is scaled or turned (the first step does it on the GPU).
+    transform: bool,
+    /// The GPU scaling/turning step failed to start in this ladder.
+    gpu_transform_failed: bool,
 }
 
 enum StepResult {
@@ -303,7 +336,7 @@ impl Supervisor {
                     &self.tools,
                     step,
                     &self.settings,
-                    self.monitor,
+                    self.screen,
                     &self.internal_tx,
                 ) {
                     Ok(a) => {
@@ -330,6 +363,7 @@ impl Supervisor {
                         step.label(),
                         lines.last().map(String::as_str).unwrap_or("(no output)")
                     );
+                    self.gpu_transform_failed |= self.transform && step != Step::Cpu;
                     failures.push((step, lines));
                 }
                 StepResult::Died(lines) => {
@@ -383,6 +417,9 @@ impl Supervisor {
                 Some(Internal::Frame(f, sent_us)) => {
                     if !started {
                         started = true;
+                        if self.gpu_transform_failed && step == Step::Cpu {
+                            GPU_TRANSFORM_FAILED.store(true, Ordering::Relaxed);
+                        }
                         log::info!(
                             "screen sharing started: {} {}x{} @ {} fps via {}",
                             f.codec.label(),

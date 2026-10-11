@@ -190,6 +190,9 @@ try {
         if (-not $mpvVersion) {
             Write-Host "::warning::Could not read the mpv version ('mpv --version' failed). The package is still built; test the viewer on a real PC."
             $mpvVersion = '(unknown: mpv --version failed on the build machine)'
+        } elseif ($mpvVersion -match '^mpv v?(\d+)\.(\d+)' -and [int]$Matches[1] -eq 0 -and [int]$Matches[2] -lt 41) {
+            # The viewer passes --hwdec-threads, which older mpv refuses (it wouldn't start).
+            Fail "The downloaded mpv is too old ($mpvVersion). GloorpFlorp's viewer needs mpv 0.41 or newer; check the 'Download mpv' step."
         }
     }
 

@@ -4,10 +4,10 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use gf_proto::bitstream::{is_decodable_start, viewer_prologue, write_viewer_frame};
@@ -19,6 +19,22 @@ use crate::{tools, Tools};
 
 /// Frames waiting for the viewer. Small on purpose: more would only add delay.
 const QUEUE: usize = 6;
+/// Until the viewer reads its input and has caught up, every frame from the
+/// latest keyframe on is kept (mpv takes ~0.6 s to start on Windows), up to
+/// this many frames or bytes. mpv then plays the backlog at once
+/// (`--untimed`).
+const STARTUP_QUEUE: usize = 300;
+const STARTUP_BYTES: usize = 16 << 20;
+/// A pipe takes ~64 KB without anyone reading it, so the viewer only
+/// surely reads once more than this went through; or once writes have kept
+/// going for `READING_AFTER` (a quiet screen makes tiny frames).
+const PIPE_SLACK: u64 = 256 << 10;
+const READING_AFTER: Duration = Duration::from_secs(3);
+
+/// Whether the viewer reads its input, judged by the writer.
+fn is_reading(bytes_written: u64, since_first_write: Duration) -> bool {
+    bytes_written > PIPE_SLACK || since_first_write >= READING_AFTER
+}
 
 pub(crate) struct ViewerInner {
     codec: VideoCodec,
@@ -27,6 +43,13 @@ pub(crate) struct ViewerInner {
     stopping: Arc<AtomicBool>,
     /// Skip frames until the next decodable keyframe.
     need_key: AtomicBool,
+    /// Set by the writer once the viewer reads its input (see `is_reading`).
+    reading: Arc<AtomicBool>,
+    /// The start-up backlog is gone: from now on `QUEUE` waiting frames
+    /// mean the viewer is behind.
+    caught_up: AtomicBool,
+    /// Bytes waiting in the queue.
+    queued_bytes: Arc<AtomicUsize>,
     tx: Option<Sender<Vec<u8>>>,
     /// Lets `push` clear the queue when the viewer falls behind.
     rx: Receiver<Vec<u8>>,
@@ -80,39 +103,32 @@ impl ViewerInner {
             codec.label(),
             a.join(" ")
         );
-        let mut cmd = Command::new(program);
-        cmd.args(a)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
-        // Harmless for GUI programs; stops a console window flashing up otherwise.
-        gf_sys::hide_console_window(&mut cmd);
-        let mut child = cmd.spawn().map_err(|e| {
-            anyhow::anyhow!(
-                "Couldn't open the viewer window ({e}). Extract the whole GloorpFlorp zip \
-                 again, then restart GloorpFlorp."
-            )
-        })?;
-        gf_sys::bind_child_to_app_lifetime(&child);
-        let stderr = StderrTail::spawn(name, child.stderr.take());
+        let (mut child, output) = spawn_child(program, a, name)?;
         let stdin = child.stdin.take();
         let child = Arc::new(Mutex::new(child));
         let open = Arc::new(AtomicBool::new(true));
         let stopping = Arc::new(AtomicBool::new(false));
-        let (tx, rx) = crossbeam_channel::bounded::<Vec<u8>>(QUEUE);
+        let reading = Arc::new(AtomicBool::new(false));
+        let queued_bytes = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = crossbeam_channel::bounded::<Vec<u8>>(STARTUP_QUEUE);
 
         let spawned = (|| -> std::io::Result<(JoinHandle<()>, JoinHandle<()>)> {
             let writer = {
-                let (rx, open) = (rx.clone(), open.clone());
+                let feed = Feed {
+                    rx: rx.clone(),
+                    open: open.clone(),
+                    reading: reading.clone(),
+                    queued_bytes: queued_bytes.clone(),
+                };
                 std::thread::Builder::new()
                     .name("viewer-writer".into())
-                    .spawn(move || write_frames(stdin, codec, &rx, &open))?
+                    .spawn(move || write_frames(stdin, codec, &feed))?
             };
             let watcher = {
                 let (child, open, stopping) = (child.clone(), open.clone(), stopping.clone());
                 std::thread::Builder::new()
                     .name("viewer-watch".into())
-                    .spawn(move || watch(&child, &open, &stopping, stderr, name))?
+                    .spawn(move || watch(&child, &open, &stopping, output, name))?
             };
             Ok((writer, watcher))
         })();
@@ -130,6 +146,9 @@ impl ViewerInner {
             open,
             stopping,
             need_key: AtomicBool::new(true),
+            reading,
+            caught_up: AtomicBool::new(false),
+            queued_bytes,
             tx: Some(tx),
             rx,
             child,
@@ -151,27 +170,63 @@ impl ViewerInner {
             );
             return true;
         }
-        let startable = || frame.keyframe && is_decodable_start(self.codec, &frame.data);
+        let startable = frame.keyframe && is_decodable_start(self.codec, &frame.data);
         if self.need_key.load(Ordering::Relaxed) {
-            if !startable() {
+            if !startable {
                 return true;
             }
             self.need_key.store(false, Ordering::Relaxed);
         }
-        match tx.try_send(frame.data.clone()) {
-            Ok(()) => {}
-            Err(TrySendError::Full(data)) => {
-                log::debug!("viewer is behind; skipping to the next keyframe");
-                while self.rx.try_recv().is_ok() {}
-                if startable() {
-                    let _ = tx.try_send(data);
-                } else {
-                    self.need_key.store(true, Ordering::Relaxed);
-                }
+        if !self.caught_up.load(Ordering::Relaxed)
+            && self.reading.load(Ordering::Relaxed)
+            && tx.is_empty()
+        {
+            self.caught_up.store(true, Ordering::Relaxed);
+        }
+        let starting = !self.caught_up.load(Ordering::Relaxed);
+        if starting && startable {
+            // Still starting: frames before a newer keyframe aren't needed.
+            self.clear();
+        }
+        let behind = if starting {
+            tx.len() >= STARTUP_QUEUE
+                || self.queued_bytes.load(Ordering::Relaxed) + frame.data.len() > STARTUP_BYTES
+        } else {
+            tx.len() >= QUEUE
+        };
+        if behind {
+            self.skip_to_keyframe(startable);
+            if !startable {
+                return self.is_open();
             }
-            Err(TrySendError::Disconnected(_)) => self.open.store(false, Ordering::Relaxed),
+        }
+        let len = frame.data.len();
+        self.queued_bytes.fetch_add(len, Ordering::Relaxed);
+        if let Err(e) = tx.try_send(frame.data.clone()) {
+            self.queued_bytes.fetch_sub(len, Ordering::Relaxed);
+            match e {
+                // Only if `push` runs on two threads at once.
+                TrySendError::Full(_) => self.skip_to_keyframe(false),
+                TrySendError::Disconnected(_) => self.open.store(false, Ordering::Relaxed),
+            }
         }
         self.is_open()
+    }
+
+    /// The viewer is behind: drop what waits, then go on from `frame` if it
+    /// is a keyframe it can start from, else from the next one.
+    fn skip_to_keyframe(&self, startable: bool) {
+        log::debug!("viewer is behind; skipping to the next keyframe");
+        self.clear();
+        if !startable {
+            self.need_key.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn clear(&self) {
+        while let Ok(f) = self.rx.try_recv() {
+            self.queued_bytes.fetch_sub(f.len(), Ordering::Relaxed);
+        }
     }
 
     pub(crate) fn is_open(&self) -> bool {
@@ -201,26 +256,66 @@ impl Drop for ViewerInner {
     }
 }
 
-fn write_frames(
-    stdin: Option<ChildStdin>,
-    codec: VideoCodec,
-    rx: &Receiver<Vec<u8>>,
-    open: &AtomicBool,
-) {
+/// Starts the viewer program with all three pipes. mpv prints its messages
+/// on stdout (on Windows), FFmpeg on stderr: the last lines of both are kept
+/// for the log.
+fn spawn_child(
+    program: &Path,
+    a: &[String],
+    name: &str,
+) -> anyhow::Result<(Child, [StderrTail; 2])> {
+    let mut cmd = Command::new(program);
+    cmd.args(a)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Harmless for GUI programs; stops a console window flashing up otherwise.
+    gf_sys::hide_console_window(&mut cmd);
+    let mut child = cmd.spawn().map_err(|e| {
+        anyhow::anyhow!(
+            "Couldn't open the viewer window ({e}). Extract the whole GloorpFlorp zip \
+             again, then restart GloorpFlorp."
+        )
+    })?;
+    gf_sys::bind_child_to_app_lifetime(&child);
+    let output = [
+        StderrTail::spawn(name, child.stdout.take()),
+        StderrTail::spawn(name, child.stderr.take()),
+    ];
+    Ok((child, output))
+}
+
+/// What the writer thread shares with `ViewerInner`.
+struct Feed {
+    rx: Receiver<Vec<u8>>,
+    open: Arc<AtomicBool>,
+    reading: Arc<AtomicBool>,
+    queued_bytes: Arc<AtomicUsize>,
+}
+
+fn write_frames(stdin: Option<ChildStdin>, codec: VideoCodec, feed: &Feed) {
     let Some(mut stdin) = stdin else {
-        open.store(false, Ordering::Relaxed);
+        feed.open.store(false, Ordering::Relaxed);
         return;
     };
     // The prologue goes out together with the first frame.
     let mut buf = viewer_prologue(codec);
     let mut written = 0u64;
-    while let Ok(frame) = rx.recv() {
+    let mut bytes = 0u64;
+    let mut first_write = None;
+    while let Ok(frame) = feed.rx.recv() {
+        feed.queued_bytes.fetch_sub(frame.len(), Ordering::Relaxed);
         write_viewer_frame(codec, &frame, &mut buf);
         if let Err(e) = stdin.write_all(&buf).and_then(|()| stdin.flush()) {
-            if open.swap(false, Ordering::Relaxed) {
+            if feed.open.swap(false, Ordering::Relaxed) {
                 log::info!("viewer closed its input ({e})");
             }
             break;
+        }
+        bytes += buf.len() as u64;
+        let since = first_write.get_or_insert_with(Instant::now).elapsed();
+        if is_reading(bytes, since) {
+            feed.reading.store(true, Ordering::Relaxed);
         }
         buf.clear();
         written += 1;
@@ -232,7 +327,7 @@ fn watch(
     child: &Mutex<Child>,
     open: &AtomicBool,
     stopping: &AtomicBool,
-    stderr: StderrTail,
+    output: [StderrTail; 2],
     name: &str,
 ) {
     let status = loop {
@@ -244,7 +339,10 @@ fn watch(
         std::thread::sleep(Duration::from_millis(50));
     };
     open.store(false, Ordering::Relaxed);
-    let lines = stderr.finish(Duration::from_secs(1));
+    let lines: Vec<String> = output
+        .into_iter()
+        .flat_map(|t| t.finish(Duration::from_secs(1)))
+        .collect();
     if stopping.load(Ordering::Relaxed) {
         log::debug!("{name} stopped");
     } else {
@@ -258,7 +356,6 @@ fn watch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Instant;
 
     fn frame(keyframe: bool, data: Vec<u8>) -> VideoFrame {
         VideoFrame {
@@ -451,7 +548,15 @@ mod tests {
             println!("note: skipping, mpv is not available");
             return;
         };
+        match mpv_version(&mpv) {
+            Some(v) if v >= (0, 41) => {}
+            v => {
+                println!("note: skipping, mpv {v:?} is older than 0.41 (no --hwdec-threads)");
+                return;
+            }
+        }
         let dir = std::env::temp_dir().join(format!("gf-video-mpv-{}", std::process::id()));
+        let _cleanup = RemoveOnDrop(dir.clone());
         for codec in VideoCodec::ALL {
             let encoder = args::software_encoder(codec);
             if ffmpeg_with(encoder).is_none() {
@@ -467,6 +572,10 @@ mod tests {
             a.pop();
             a.extend([
                 "--vo=image".to_string(),
+                // The image output can't take frames straight from a GPU
+                // decoder; copying them back holds frames, which the real
+                // window (zero-copy) never does. Decode on the CPU here.
+                "--hwdec=no".into(),
                 "--vo-image-format=png".into(),
                 format!("--vo-image-outdir={}", shots.display()),
                 "-".into(),
@@ -508,7 +617,50 @@ mod tests {
             assert_eq!(count(), pushed, "{codec:?}: frames shown");
             println!("{codec:?}: {pushed} frames shown");
         }
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Removes a test's scratch folder, also when an assertion fails.
+    struct RemoveOnDrop(PathBuf);
+
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// (major, minor) from `mpv --version` ("mpv v0.41.0-..." or "mpv 0.37.0").
+    fn mpv_version(mpv: &Path) -> Option<(u32, u32)> {
+        let (_, out, _) =
+            crate::tools::run_short(mpv, &["--version".into()], Duration::from_secs(20))?;
+        let v = out.split_whitespace().nth(1)?.trim_start_matches('v');
+        let mut parts = v.split(['.', '-']).map(|p| p.parse::<u32>().ok());
+        Some((parts.next()??, parts.next()??))
+    }
+
+    /// mpv reports its errors on stdout (on Windows); they reach the log.
+    #[test]
+    fn viewer_output_is_kept() {
+        let (program, a) = if cfg!(windows) {
+            (
+                PathBuf::from("cmd"),
+                vec![
+                    "/C".to_string(),
+                    "echo out-line & echo err-line 1>&2".into(),
+                ],
+            )
+        } else {
+            (
+                PathBuf::from("/bin/sh"),
+                vec!["-c".to_string(), "echo out-line; echo err-line >&2".into()],
+            )
+        };
+        let (mut child, output) = spawn_child(&program, &a, "echo").unwrap();
+        assert!(child.wait().unwrap().success());
+        let lines: Vec<String> = output
+            .into_iter()
+            .flat_map(|t| t.finish(Duration::from_secs(5)))
+            .collect();
+        assert_eq!(lines, ["out-line", "err-line"]);
     }
 
     /// A program that runs for 30 s and never reads stdin.
@@ -537,7 +689,9 @@ mod tests {
         while !v.rx.is_empty() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(5));
         }
-        // The writer is now stuck on the 1 MB frame.
+        // The writer is now stuck on the 1 MB frame. Behave as if the
+        // viewer had been reading before (see the start-up test).
+        v.reading.store(true, Ordering::Relaxed);
         for _ in 0..QUEUE {
             assert!(v.push(&synthetic(false, 100)));
         }
@@ -553,6 +707,62 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(!v.is_open());
         assert!(!v.push(&synthetic(true, 100)));
+    }
+
+    fn wait_until(done: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(done(), "timed out");
+    }
+
+    #[test]
+    fn reading_needs_more_than_a_pipe_full() {
+        // A 60 KB keyframe fits in the pipe of an mpv that isn't reading yet.
+        assert!(!is_reading(60_000, Duration::from_millis(5)));
+        assert!(!is_reading(PIPE_SLACK, Duration::from_secs(2)));
+        assert!(is_reading(PIPE_SLACK + 1, Duration::ZERO));
+        // A quiet screen: tiny frames, but writes kept going.
+        assert!(is_reading(5_000, READING_AFTER));
+    }
+
+    /// While the viewer starts (mpv: ~0.6 s), frames from the opening
+    /// keyframe on wait for it instead of being dropped after 6.
+    #[test]
+    fn starting_viewer_keeps_frames_from_the_keyframe() {
+        let (program, a) = idle_program();
+        let mut v = ViewerInner::spawn(&program, &a, VideoCodec::H264, "idle").unwrap();
+        // Never read: the writer is stuck on the first (big) keyframe.
+        assert!(v.push(&synthetic(true, 1 << 20)));
+        wait_until(|| v.rx.is_empty());
+        assert!(!v.reading.load(Ordering::Relaxed));
+        for _ in 0..60 {
+            assert!(v.push(&synthetic(false, 1000)));
+        }
+        assert_eq!(v.rx.len(), 60, "a second of frames is kept");
+        assert_eq!(v.queued_bytes.load(Ordering::Relaxed), 60 * 1000);
+
+        // A newer keyframe makes the older frames unnecessary.
+        assert!(v.push(&synthetic(true, 1000)));
+        assert!(v.push(&synthetic(false, 1000)));
+        assert_eq!(v.rx.len(), 2);
+        assert!(is_decodable_start(
+            VideoCodec::H264,
+            &v.rx.try_recv().unwrap()
+        ));
+        v.queued_bytes.fetch_sub(1000, Ordering::Relaxed);
+
+        // The start-up queue has a limit in bytes too.
+        assert!(v.push(&synthetic(false, STARTUP_BYTES - 1500)));
+        assert!(v.push(&synthetic(false, 1000)));
+        assert!(v.rx.is_empty(), "over the limit: skip to the next keyframe");
+        assert_eq!(v.queued_bytes.load(Ordering::Relaxed), 0);
+        assert!(v.push(&synthetic(false, 1000)));
+        assert!(v.rx.is_empty());
+        assert!(v.push(&synthetic(true, 1000)));
+        assert_eq!(v.rx.len(), 1);
+        v.stop();
     }
 
     #[test]

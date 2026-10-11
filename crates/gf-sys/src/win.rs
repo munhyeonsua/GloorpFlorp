@@ -7,8 +7,12 @@ use std::time::{Duration, Instant};
 
 use windows::core::{BOOL, PWSTR};
 use windows::Wdk::System::SystemServices::RtlGetVersion;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{CloseHandle, E_INVALIDARG, HANDLE, HWND, LPARAM, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_MODE_ROTATION, DXGI_MODE_ROTATION_ROTATE180, DXGI_MODE_ROTATION_ROTATE270,
+    DXGI_MODE_ROTATION_ROTATE90,
+};
 use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1, DXGI_ERROR_NOT_FOUND};
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITORINFO};
 use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
@@ -63,10 +67,26 @@ pub(crate) fn list_monitors() -> windows::core::Result<Vec<Monitor>> {
             };
             let primary = GetMonitorInfoW(desc.Monitor, &mut info).as_bool()
                 && info.dwFlags & MONITORINFOF_PRIMARY != 0;
-            monitors.push(Monitor::new(i, width, height, primary));
+            monitors.push(Monitor::new(
+                i,
+                width,
+                height,
+                primary,
+                rotation_degrees(desc.Rotation),
+            ));
         }
         log::debug!("monitors: {monitors:?}");
         Ok(monitors)
+    }
+}
+
+/// Clockwise degrees for a DXGI rotation (unspecified counts as none).
+fn rotation_degrees(r: DXGI_MODE_ROTATION) -> u32 {
+    match r {
+        DXGI_MODE_ROTATION_ROTATE90 => 90,
+        DXGI_MODE_ROTATION_ROTATE180 => 180,
+        DXGI_MODE_ROTATION_ROTATE270 => 270,
+        _ => 0,
     }
 }
 
@@ -282,7 +302,11 @@ fn windows_build() -> Option<u32> {
 const MIN_BUILD: u32 = 19041;
 const TOO_OLD: &str = "Game-audio capture needs Windows 10 version 2004 or newer.";
 const PROGRAM_CLOSED: &str =
-    "The program you picked for game audio has closed. Start it again, then pick it again in the game-audio list.";
+    "The program you picked for game audio has closed. Start it again, then click Start sending game audio.";
+const NO_ACCESS: &str =
+    "Windows won't let GloorpFlorp listen to the program you picked for game audio. \
+     Pick another program under \"Only one program\", or choose \"Everything except GloorpFlorp\", \
+     then click Start sending game audio.";
 
 /// Body of the capture thread (see `capture::launch`).
 pub(crate) fn loopback_capture(
@@ -307,6 +331,25 @@ pub(crate) fn loopback_capture(
     let result = capture_loop(source, on_samples, stop, ready);
     wasapi::deinitialize();
     result
+}
+
+/// Opens the picked program for exit watching. `Err` if it no longer runs;
+/// `Ok(None)` if Windows won't let us watch it (e.g. a protected or
+/// system process): capture is still tried, just without noticing its exit.
+fn watch_process(pid: u32) -> Result<Option<OwnedHandle>, String> {
+    // SAFETY: plain handle open; owned by OwnedHandle.
+    match unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) } {
+        Ok(h) => Ok(Some(OwnedHandle(h))),
+        // What OpenProcess says for a process id that isn't running.
+        Err(e) if e.code() == E_INVALIDARG => {
+            log::warn!("can't open process {pid}: {e}");
+            Err(PROGRAM_CLOSED.to_string())
+        }
+        Err(e) => {
+            log::warn!("can't watch process {pid} for exit ({e}); capturing without that");
+            Ok(None)
+        }
+    }
 }
 
 fn wasapi_error(what: &str, e: wasapi::WasapiError) -> String {
@@ -335,16 +378,7 @@ fn capture_loop(
     // Watch the chosen program so we can say when it has closed.
     let watched = match source {
         GameAudioSource::AllExceptThisApp => None,
-        GameAudioSource::Process { pid } => {
-            // SAFETY: plain handle open; owned by OwnedHandle.
-            match unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) } {
-                Ok(h) => Some(OwnedHandle(h)),
-                Err(e) => {
-                    log::warn!("can't open process {pid}: {e}");
-                    return Err(PROGRAM_CLOSED.to_string());
-                }
-            }
-        }
+        GameAudioSource::Process { pid } => watch_process(pid)?,
     };
     let has_exited = || {
         watched.as_ref().is_some_and(|h| {
@@ -357,6 +391,11 @@ fn capture_loop(
         AudioClient::new_application_loopback_client(pid, include_tree).map_err(|e| {
             match windows_build() {
                 Some(b) if b < MIN_BUILD => TOO_OLD.to_string(),
+                // A program we may not even watch: most likely Windows refuses it too.
+                _ if watched.is_none() && include_tree => {
+                    log::warn!("process loopback for {pid} failed: {e}");
+                    NO_ACCESS.to_string()
+                }
                 _ => wasapi_error("connecting to Windows audio", e),
             }
         })?;
@@ -502,5 +541,43 @@ pub(crate) fn bind_child_to_app_lifetime(child: &std::process::Child) {
             "couldn't tie child process {} to the app's lifetime: {e}",
             child.id()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rotations() {
+        assert_eq!(rotation_degrees(DXGI_MODE_ROTATION(0)), 0); // unspecified
+        assert_eq!(rotation_degrees(DXGI_MODE_ROTATION(1)), 0); // identity
+        assert_eq!(rotation_degrees(DXGI_MODE_ROTATION_ROTATE90), 90);
+        assert_eq!(rotation_degrees(DXGI_MODE_ROTATION_ROTATE180), 180);
+        assert_eq!(rotation_degrees(DXGI_MODE_ROTATION_ROTATE270), 270);
+    }
+
+    #[test]
+    fn program_closed_vs_not_allowed() {
+        // No process can have this id (ids are multiples of 4 below 2^32 - 4).
+        assert_eq!(
+            watch_process(0xFFFF_FFFC).err().as_deref(),
+            Some(PROGRAM_CLOSED)
+        );
+        // "System" (pid 4) always runs; a normal user may not open it, an
+        // administrator may. Either way it is not reported as closed.
+        assert!(watch_process(4).is_ok());
+        assert!(watch_process(std::process::id()).unwrap().is_some());
+    }
+
+    #[test]
+    fn messages_name_the_real_buttons() {
+        for m in [PROGRAM_CLOSED, NO_ACCESS] {
+            assert!(m.ends_with("click Start sending game audio."), "{m}");
+            assert!(!m.contains("game-audio list"));
+        }
+        assert!(NO_ACCESS.contains("\"Only one program\""));
+        assert!(NO_ACCESS.contains("\"Everything except GloorpFlorp\""));
+        assert!(!NO_ACCESS.contains("  "), "{NO_ACCESS}");
     }
 }

@@ -9,11 +9,16 @@ use crate::EncoderSettings;
 /// hardware steps in order; dev/test mode uses the test pattern.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Step {
-    /// ddagrab's D3D11 frames straight into NVENC; `scale_d3d11` if scaling.
+    /// ddagrab's D3D11 frames straight into NVENC; `scale_d3d11` if scaling
+    /// (it can't turn). With FFmpeg 8 on NVIDIA cards `scale_d3d11` fails to
+    /// create its output frames (error 80070057).
     GpuDirect,
-    /// Scale with CUDA (`hwmap` + `scale_cuda`). Only when scaling.
+    /// `hwdownload`, then back to the GPU with `hwupload_cuda`; `scale_cuda`
+    /// and `transpose_cuda` there, NVENC converts to YUV. Costs a copy each
+    /// way, but not the CPU scaling and colour conversion. (D3D11 frames
+    /// can't be mapped to CUDA directly: `hwmap` fails with error -40.)
     GpuCuda,
-    /// `hwdownload` to system memory, CPU scale/convert, NVENC.
+    /// `hwdownload` to system memory, CPU scale/turn/convert, NVENC.
     Cpu,
     /// `testsrc2` + software encoder (non-Windows, or `GLOORP_FAKE_VIDEO=1`).
     TestSource,
@@ -30,15 +35,115 @@ impl Step {
     }
 }
 
-/// The start-up ladder for one session.
-pub(crate) fn ladder(test_source: bool, needs_scale: bool) -> Vec<Step> {
+/// Whether to scale/turn with `GpuCuda`. It works on the RTX 5080 test PC
+/// with D3D11 test frames (same picture as the CPU way, ~1/15 of its CPU
+/// time), but hasn't run on a live desktop yet, so it stays off until then.
+pub(crate) const CUDA_TRANSFORM: bool = false;
+
+/// The GPU step that can scale/turn the picture, if any. `turn`: the
+/// monitor is turned (only CUDA can do that on the GPU).
+pub(crate) fn gpu_transform_step(turn: bool, cuda: bool) -> Option<Step> {
+    if cuda {
+        Some(Step::GpuCuda)
+    } else if turn {
+        None
+    } else {
+        Some(Step::GpuDirect)
+    }
+}
+
+/// The start-up ladder for one session. `transform`: the picture needs
+/// scaling or turning, with `gpu_transform` as the GPU way to try first
+/// (`None`: none, or it already failed in this run of the app).
+pub(crate) fn ladder(test_source: bool, transform: bool, gpu_transform: Option<Step>) -> Vec<Step> {
     if test_source {
         vec![Step::TestSource]
-    } else if needs_scale {
-        vec![Step::GpuDirect, Step::GpuCuda, Step::Cpu]
-    } else {
+    } else if !transform {
         vec![Step::GpuDirect, Step::Cpu]
+    } else {
+        gpu_transform.into_iter().chain([Step::Cpu]).collect()
     }
+}
+
+/// The monitor as the encoder sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Screen {
+    /// Desktop (upright) size.
+    pub width: u32,
+    pub height: u32,
+    /// `gf_sys::Monitor::rotation`: degrees clockwise.
+    pub rotation: u32,
+}
+
+impl Screen {
+    pub(crate) fn size(self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    fn sideways(self) -> bool {
+        self.rotation % 180 == 90
+    }
+
+    pub(crate) fn turned(self) -> bool {
+        !self.rotation.is_multiple_of(360)
+    }
+
+    /// Whether the captured picture must be scaled or turned to `max_height`.
+    pub(crate) fn needs_transform(self, max_height: Option<u32>) -> bool {
+        self.turned() || output_size(self.width, self.height, max_height) != self.size()
+    }
+}
+
+/// Filters that turn ddagrab's (unturned) frames upright, on the CPU or
+/// with CUDA; `None` for an upright monitor.
+fn turn_filter(rotation: u32, cuda: bool) -> Option<&'static str> {
+    Some(match (rotation % 360, cuda) {
+        (90, false) => "transpose=clock",
+        (180, false) => "hflip,vflip",
+        (270, false) => "transpose=cclock",
+        (90, true) => "transpose_cuda=dir=clock",
+        (180, true) => "transpose_cuda=dir=reversal",
+        (270, true) => "transpose_cuda=dir=cclock",
+        _ => return None,
+    })
+}
+
+/// `-vf` for a hardware step: scale to the output size (in capture
+/// orientation, so the turn handles the smaller picture), then turn.
+/// CPU conversion uses swscale's default BT.601 matrix, which is tagged so
+/// players don't guess BT.709 (NVENC's own RGB conversion is tagged alike).
+fn capture_filters(step: Step, screen: Screen, out: (u32, u32)) -> Option<String> {
+    let (w, h) = if screen.sideways() {
+        (out.1, out.0)
+    } else {
+        out
+    };
+    let scale = out != screen.size();
+    let mut f: Vec<String> = Vec::new();
+    match step {
+        // scale_d3d11 (FFmpeg 8) only outputs nv12/p010 and needs it spelled out.
+        Step::GpuDirect if scale => {
+            f.push(format!("scale_d3d11=width={w}:height={h}:format=nv12"));
+        }
+        Step::GpuCuda => {
+            f.push("hwdownload,format=bgra,hwupload_cuda".into());
+            if scale {
+                f.push(format!("scale_cuda=w={w}:h={h}:interp_algo=bicubic"));
+            }
+            f.extend(turn_filter(screen.rotation, true).map(String::from));
+        }
+        Step::Cpu => {
+            f.push("hwdownload,format=bgra".into());
+            if scale {
+                f.push(format!("scale={w}:{h}:flags=bicubic"));
+            }
+            f.push("format=nv12".into());
+            f.extend(turn_filter(screen.rotation, false).map(String::from));
+            f.push("setparams=colorspace=bt470bg".into());
+        }
+        Step::GpuDirect | Step::TestSource => {}
+    }
+    (!f.is_empty()).then(|| f.join(","))
 }
 
 pub(crate) fn nvenc_encoder(codec: VideoCodec) -> &'static str {
@@ -98,15 +203,10 @@ fn s(v: &[&str]) -> Vec<String> {
 }
 
 /// Full FFmpeg argument list for one ladder step.
-pub(crate) fn encoder_args(
-    step: Step,
-    settings: &EncoderSettings,
-    monitor: (u32, u32),
-) -> Vec<String> {
+pub(crate) fn encoder_args(step: Step, settings: &EncoderSettings, screen: Screen) -> Vec<String> {
     let fps = settings.fps.max(1);
     let gop = settings.keyframe_interval.max(1);
-    let (w, h) = output_size(monitor.0, monitor.1, settings.max_height);
-    let needs_scale = (w, h) != monitor;
+    let (w, h) = output_size(screen.width, screen.height, settings.max_height);
     let rate = format!("{}k", settings.bitrate_kbps.max(1));
     let bufsize = format!("{}k", bufsize_kbps(settings.bitrate_kbps, fps));
 
@@ -162,21 +262,7 @@ pub(crate) fn encoder_args(
             "ddagrab=output_idx={}:framerate={fps}:draw_mouse=1",
             settings.monitor
         ));
-        let vf = match (step, needs_scale) {
-            (Step::GpuDirect, false) => None,
-            // scale_d3d11 (FFmpeg 8) only outputs nv12/p010 and needs it spelled out.
-            (Step::GpuDirect, true) => {
-                Some(format!("scale_d3d11=width={w}:height={h}:format=nv12"))
-            }
-            (Step::GpuCuda, _) => Some(format!(
-                "hwmap=derive_device=cuda,scale_cuda=w={w}:h={h}:format=nv12"
-            )),
-            (_, true) => Some(format!(
-                "hwdownload,format=bgra,scale={w}:{h}:flags=bicubic,format=nv12"
-            )),
-            (_, false) => Some("hwdownload,format=bgra,format=nv12".to_string()),
-        };
-        if let Some(vf) = vf {
+        if let Some(vf) = capture_filters(step, screen, (w, h)) {
             a.push("-vf".into());
             a.push(vf);
         }
@@ -250,11 +336,15 @@ pub(crate) fn parse_software_encoders(listing: &str) -> Vec<VideoCodec> {
 pub(crate) fn mpv_args(codec: VideoCodec, title: &str) -> Vec<String> {
     vec![
         "--no-config".into(),
-        format!("--title={title}"),
+        // mpv expands `${property}` in the title; `$$` is a plain `$`.
+        format!("--title={}", title.replace('$', "$$")),
         "--force-window=immediate".into(),
         "--profile=low-latency".into(),
         "--untimed".into(),
         "--no-cache".into(),
+        // Straight to lavf: mpv's own format probes would first wait for
+        // 8 KB of input, which a small first keyframe (a dark screen) isn't.
+        "--demuxer=lavf".into(),
         format!("--demuxer-lavf-format={}", raw_format(codec)),
         "--demuxer-lavf-probesize=32".into(),
         "--demuxer-lavf-analyzeduration=0".into(),
@@ -264,6 +354,10 @@ pub(crate) fn mpv_args(codec: VideoCodec, title: &str) -> Vec<String> {
         "--demuxer-lavf-probe-info=nostreams".into(),
         "--demuxer-lavf-o=fflags=+nobuffer".into(),
         "--hwdec=auto-safe".into(),
+        // The low-latency profile only makes software decoding single
+        // threaded; hardware H.264/HEVC decoding would otherwise hold back
+        // 3 frames (4 threads by default).
+        "--hwdec-threads=1".into(),
         "--audio=no".into(),
         "--keep-open=no".into(),
         "--idle=no".into(),
@@ -432,14 +526,60 @@ mod tests {
         assert_eq!(bufsize_kbps(0, 0), 2);
     }
 
+    fn upright(width: u32, height: u32) -> Screen {
+        Screen {
+            width,
+            height,
+            rotation: 0,
+        }
+    }
+
     #[test]
     fn ladders() {
-        assert_eq!(ladder(true, true), vec![Step::TestSource]);
-        assert_eq!(ladder(false, false), vec![Step::GpuDirect, Step::Cpu]);
+        assert_eq!(ladder(true, true, None), vec![Step::TestSource]);
+        let direct = Some(Step::GpuDirect);
+        assert_eq!(ladder(false, false, None), vec![Step::GpuDirect, Step::Cpu]);
         assert_eq!(
-            ladder(false, true),
-            vec![Step::GpuDirect, Step::GpuCuda, Step::Cpu]
+            ladder(false, true, direct),
+            vec![Step::GpuDirect, Step::Cpu]
         );
+        let cuda = Some(Step::GpuCuda);
+        assert_eq!(ladder(false, true, cuda), vec![Step::GpuCuda, Step::Cpu]);
+        // No GPU way (left), or it failed before: straight to the CPU.
+        assert_eq!(ladder(false, true, None), vec![Step::Cpu]);
+
+        // scale_d3d11 can scale but not turn; CUDA does both.
+        assert_eq!(gpu_transform_step(false, false), direct);
+        assert_eq!(gpu_transform_step(true, false), None);
+        assert_eq!(gpu_transform_step(false, true), cuda);
+        assert_eq!(gpu_transform_step(true, true), cuda);
+    }
+
+    #[test]
+    fn gpu_direct_scaled() {
+        let a = encoder_args(
+            Step::GpuDirect,
+            &settings(VideoCodec::Hevc, Some(1080)),
+            upright(2560, 1440),
+        );
+        let j = joined(&a);
+        assert!(j.contains("-vf scale_d3d11=width=1920:height=1080:format=nv12 -c:v hevc_nvenc"));
+        assert!(j.contains("-bf 0 -forced-idr 1 -an"));
+    }
+
+    #[test]
+    fn transform_needed() {
+        assert!(!upright(2560, 1440).needs_transform(None));
+        assert!(!upright(2560, 1440).needs_transform(Some(1440)));
+        assert!(upright(3840, 2160).needs_transform(Some(1440)));
+        for rotation in [90, 180, 270] {
+            let s = Screen {
+                width: 2160,
+                height: 3840,
+                rotation,
+            };
+            assert!(s.needs_transform(None), "{rotation}");
+        }
     }
 
     #[test]
@@ -447,7 +587,7 @@ mod tests {
         let a = encoder_args(
             Step::GpuDirect,
             &settings(VideoCodec::Av1, None),
-            (2560, 1440),
+            upright(2560, 1440),
         );
         let expected = "-hide_banner -nostdin -loglevel warning -nostats \
             -f lavfi -i ddagrab=output_idx=1:framerate=60:draw_mouse=1 \
@@ -458,40 +598,88 @@ mod tests {
     }
 
     #[test]
-    fn gpu_direct_scaled() {
-        let a = encoder_args(
-            Step::GpuDirect,
-            &settings(VideoCodec::Hevc, Some(1080)),
-            (2560, 1440),
-        );
-        let j = joined(&a);
-        assert!(j.contains("-vf scale_d3d11=width=1920:height=1080:format=nv12 -c:v hevc_nvenc"));
-        assert!(j.contains("-bf 0 -forced-idr 1 -an"));
-    }
-
-    #[test]
     fn cuda_and_cpu_steps() {
-        let st = settings(VideoCodec::H264, Some(1080));
-        let j = joined(&encoder_args(Step::GpuCuda, &st, (2560, 1440)));
-        assert!(j.contains("-vf hwmap=derive_device=cuda,scale_cuda=w=1920:h=1080:format=nv12"));
-        assert!(j.contains("-c:v h264_nvenc"));
-        let j = joined(&encoder_args(Step::Cpu, &st, (2560, 1440)));
+        let st = settings(VideoCodec::Hevc, Some(1080));
+        let j = joined(&encoder_args(Step::GpuCuda, &st, upright(2560, 1440)));
         assert!(j.contains(
-            "-vf hwdownload,format=bgra,scale=1920:1080:flags=bicubic,format=nv12 -c:v h264_nvenc"
+            "-vf hwdownload,format=bgra,hwupload_cuda,scale_cuda=w=1920:h=1080:interp_algo=bicubic \
+             -c:v hevc_nvenc"
+        ));
+        assert!(j.contains("-bf 0 -forced-idr 1 -an"));
+        let st = settings(VideoCodec::H264, Some(1080));
+        let j = joined(&encoder_args(Step::Cpu, &st, upright(2560, 1440)));
+        assert!(j.contains(
+            "-vf hwdownload,format=bgra,scale=1920:1080:flags=bicubic,format=nv12,\
+             setparams=colorspace=bt470bg -c:v h264_nvenc"
         ));
         let j = joined(&encoder_args(
             Step::Cpu,
             &settings(VideoCodec::H264, None),
-            (2560, 1440),
+            upright(2560, 1440),
         ));
-        assert!(j.contains("-vf hwdownload,format=bgra,format=nv12 -c:v"));
+        assert!(
+            j.contains("-vf hwdownload,format=bgra,format=nv12,setparams=colorspace=bt470bg -c:v")
+        );
+    }
+
+    /// The portrait monitor of the PC this was tested on: Windows turns it
+    /// 90° and ddagrab hands over 3840×2160 frames that must be turned
+    /// clockwise. The size is still worked out from the upright 2160×3840.
+    #[test]
+    fn turned_monitors() {
+        let portrait = |rotation| Screen {
+            width: 2160,
+            height: 3840,
+            rotation,
+        };
+        let st = settings(VideoCodec::H264, Some(1440));
+        assert_eq!(output_size(2160, 3840, Some(1440)), (810, 1440));
+        let j = joined(&encoder_args(Step::Cpu, &st, portrait(90)));
+        assert!(j.contains(
+            "-vf hwdownload,format=bgra,scale=1440:810:flags=bicubic,format=nv12,\
+             transpose=clock,setparams=colorspace=bt470bg -c:v"
+        ));
+        let j = joined(&encoder_args(Step::GpuCuda, &st, portrait(90)));
+        assert!(j.contains(
+            "-vf hwdownload,format=bgra,hwupload_cuda,\
+             scale_cuda=w=1440:h=810:interp_algo=bicubic,transpose_cuda=dir=clock -c:v"
+        ));
+        let j = joined(&encoder_args(Step::GpuCuda, &st, portrait(270)));
+        assert!(j.contains(
+            "scale_cuda=w=1440:h=810:interp_algo=bicubic,transpose_cuda=dir=cclock -c:v"
+        ));
+        let j = joined(&encoder_args(Step::Cpu, &st, portrait(270)));
+        assert!(j.contains("format=nv12,transpose=cclock,setparams"));
+
+        // Native size: only the turn.
+        let st = settings(VideoCodec::Av1, None);
+        let j = joined(&encoder_args(Step::Cpu, &st, portrait(90)));
+        assert!(j.contains("-vf hwdownload,format=bgra,format=nv12,transpose=clock,setparams"));
+        let j = joined(&encoder_args(Step::GpuCuda, &st, portrait(90)));
+        assert!(
+            j.contains("-vf hwdownload,format=bgra,hwupload_cuda,transpose_cuda=dir=clock -c:v")
+        );
+
+        // Upside down: same size, flipped both ways.
+        let upside_down = Screen {
+            width: 2560,
+            height: 1440,
+            rotation: 180,
+        };
+        let st = settings(VideoCodec::Av1, Some(1080));
+        let j = joined(&encoder_args(Step::Cpu, &st, upside_down));
+        assert!(j.contains("scale=1920:1080:flags=bicubic,format=nv12,hflip,vflip,setparams"));
+        let j = joined(&encoder_args(Step::GpuCuda, &st, upside_down));
+        assert!(j.contains(
+            "scale_cuda=w=1920:h=1080:interp_algo=bicubic,transpose_cuda=dir=reversal -c:v"
+        ));
     }
 
     #[test]
     fn every_step_ends_with_flv_on_stdout() {
         for codec in VideoCodec::ALL {
             for step in [Step::GpuDirect, Step::GpuCuda, Step::Cpu, Step::TestSource] {
-                let a = encoder_args(step, &settings(codec, Some(1080)), (2560, 1440));
+                let a = encoder_args(step, &settings(codec, Some(1080)), upright(2560, 1440));
                 assert!(joined(&a).ends_with(
                     "-an -f flv -flvflags no_duration_filesize -flush_packets 1 pipe:1"
                 ));
@@ -514,16 +702,16 @@ mod tests {
         let mut st = settings(VideoCodec::H264, Some(240));
         st.fps = 30;
         st.keyframe_interval = 15;
-        let j = joined(&encoder_args(Step::TestSource, &st, (1920, 1080)));
+        let j = joined(&encoder_args(Step::TestSource, &st, upright(1920, 1080)));
         assert!(j.contains("-re -f lavfi -i testsrc2=size=426x240:rate=30 -pix_fmt yuv420p"));
         assert!(j.contains("-c:v libx264 -preset ultrafast -tune zerolatency -bf 0"));
         assert!(j.contains("-g 15"));
         st.codec = VideoCodec::Hevc;
-        let j = joined(&encoder_args(Step::TestSource, &st, (1920, 1080)));
+        let j = joined(&encoder_args(Step::TestSource, &st, upright(1920, 1080)));
         assert!(j.contains("-c:v libx265"));
         assert!(j.contains("keyint=15:min-keyint=15:bframes=0"));
         st.codec = VideoCodec::Av1;
-        let j = joined(&encoder_args(Step::TestSource, &st, (1920, 1080)));
+        let j = joined(&encoder_args(Step::TestSource, &st, upright(1920, 1080)));
         assert!(j.contains("-c:v libsvtav1 -preset 12 -g 15"));
         assert!(j.contains("pred-struct=1"));
         assert!(!j.contains("ddagrab"));
@@ -536,6 +724,13 @@ mod tests {
         assert!(a.contains(&"--demuxer-lavf-format=obu".to_string()));
         assert_eq!(a.last().map(String::as_str), Some("-"));
         assert!(mpv_args(VideoCodec::Hevc, "x").contains(&"--demuxer-lavf-format=hevc".to_string()));
+        // Straight to the raw demuxer, and no frames held by decoder threads.
+        let lavf = a.iter().position(|x| x == "--demuxer=lavf").unwrap();
+        assert!(a[lavf + 1].starts_with("--demuxer-lavf-format="));
+        assert!(a.contains(&"--hwdec-threads=1".to_string()));
+        // `${...}` in a friend's name is not expanded by mpv.
+        let a = mpv_args(VideoCodec::Av1, "${path} costs $5");
+        assert!(a.contains(&"--title=$${path} costs $$5".to_string()));
         assert_eq!(
             joined(&null_sink_args(VideoCodec::H264)),
             "-hide_banner -v error -f h264 -i pipe:0 -f null -"

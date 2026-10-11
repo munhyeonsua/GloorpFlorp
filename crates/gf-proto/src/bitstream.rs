@@ -19,6 +19,10 @@
 //! - Never contains access unit delimiters (H.264 NAL 9, HEVC NAL 35) or AV1
 //!   temporal delimiters (OBU type 2): they are stripped. The viewer writer
 //!   adds its own (see [`viewer_prologue`]).
+//! - Never contains filler data (H.264 NAL 12, HEVC NAL 38) or AV1 padding
+//!   OBUs (type 15) from the encoder: decoders ignore them, and NVENC's H.264
+//!   CBR pads every frame up to the bitrate with filler. (The padding OBU
+//!   inside the viewer's own AV1 delimiter is added later, by the writer.)
 //! - Every keyframe starts with the parameter sets from the latest
 //!   SequenceStart / AVC sequence header (H.264 SPS+PPS, HEVC VPS+SPS+PPS,
 //!   AV1 sequence header OBU) unless the frame already contains them, so a
@@ -68,6 +72,11 @@ const AV1_DELIMITER: [u8; 10] = [0x12, 0x00, 0x7a, 0x06, 0, 0, 0, 0, 0, 0x80];
 
 const H264_NAL_AUD: u8 = 9;
 const HEVC_NAL_AUD: u8 = 35;
+/// Filler data. NVENC's H.264 CBR pads every frame to the bitrate with it
+/// (~75% of the bytes on a quiet desktop); decoders throw it away.
+const H264_NAL_FILLER: u8 = 12;
+const HEVC_NAL_FILLER: u8 = 38;
+const OBU_PADDING: u8 = 15;
 const OBU_SEQUENCE_HEADER: u8 = 1;
 const OBU_TEMPORAL_DELIMITER: u8 = 2;
 const OBU_FRAME_HEADER: u8 = 3;
@@ -362,16 +371,18 @@ impl FlvDemuxer {
         if codec == VideoCodec::Av1 {
             for_each_obu(data, |h, ext, payload| {
                 let t = obu_type(h);
-                if t != OBU_TEMPORAL_DELIMITER {
+                if t != OBU_TEMPORAL_DELIMITER && t != OBU_PADDING {
                     present |= 1 << t;
                     write_obu(&mut body, h, ext, payload);
                 }
             })?;
         } else {
-            let aud = if codec == VideoCodec::H264 {
-                H264_NAL_AUD
+            // Access unit delimiters and filler are dropped (the viewer
+            // writes its own delimiters).
+            let (aud, filler) = if codec == VideoCodec::H264 {
+                (H264_NAL_AUD, H264_NAL_FILLER)
             } else {
-                HEVC_NAL_AUD
+                (HEVC_NAL_AUD, HEVC_NAL_FILLER)
             };
             let mut rest = data;
             while !rest.is_empty() {
@@ -385,7 +396,7 @@ impl FlvDemuxer {
                 rest = tail;
                 let Some(&h) = nal.first() else { continue };
                 let t = nal_type(codec, h);
-                if t == aud {
+                if t == aud || t == filler {
                     continue;
                 }
                 present |= 1 << t;
@@ -802,6 +813,46 @@ mod tests {
         let frames = FlvDemuxer::new().push(&s).unwrap();
         assert_eq!(frames[0].codec, VideoCodec::Hevc);
         assert_eq!(frames[0].data, annexb(&[VPS_H, SPS_H, PPS_H, IDR_H]));
+    }
+
+    #[test]
+    fn filler_and_padding_are_dropped() {
+        // NVENC's H.264 CBR pads frames with filler NAL units (type 12).
+        const FILLER: &[u8] = &[0x0c, 0xff, 0xff, 0xff, 0x80];
+        const FILLER_H: &[u8] = &[0x4c, 0x01, 0xff, 0xff, 0x80];
+        let mut s = flv_header();
+        s.extend(tag(9, &legacy(1, 7, 0, &avcc(4))));
+        s.extend(tag(
+            9,
+            &legacy(1, 7, 1, &length_prefixed(&[AUD, IDR, FILLER], 4)),
+        ));
+        s.extend(tag(
+            9,
+            &legacy(2, 7, 1, &length_prefixed(&[P_SLICE, FILLER, FILLER], 4)),
+        ));
+        let frames = FlvDemuxer::new().push(&s).unwrap();
+        assert_eq!(frames[0].data, annexb(&[SPS, PPS, IDR]));
+        assert_eq!(frames[1].data, annexb(&[P_SLICE]));
+
+        let mut s = flv_header();
+        s.extend(tag(9, &legacy(1, 12, 0, &hvcc())));
+        s.extend(tag(
+            9,
+            &legacy(1, 12, 1, &length_prefixed(&[IDR_H, FILLER_H], 4)),
+        ));
+        let frames = FlvDemuxer::new().push(&s).unwrap();
+        assert_eq!(frames[0].data, annexb(&[VPS_H, SPS_H, PPS_H, IDR_H]));
+
+        // AV1 padding OBUs (type 15) go the same way.
+        let mut s = flv_header();
+        s.extend(tag(9, &enhanced(1, 0, b"av01", &av1c())));
+        let mut key = obu(OBU_FRAME, KEY_FRAME, true);
+        key.extend(obu(OBU_PADDING, &[0, 0, 0x80], true));
+        s.extend(tag(9, &enhanced(1, 1, b"av01", &key)));
+        let frames = FlvDemuxer::new().push(&s).unwrap();
+        let mut expected = obu(OBU_SEQUENCE_HEADER, SEQ_HDR, true);
+        expected.extend(obu(OBU_FRAME, KEY_FRAME, true));
+        assert_eq!(frames[0].data, expected);
     }
 
     #[test]

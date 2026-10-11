@@ -257,8 +257,11 @@ impl MicPipeline {
             .frame(frame, send, live.voice_bitrate_kbps(), &self.sink);
     }
 
+    /// No microphone yet, or a new one just opened.
     fn idle(&mut self) {
         self.skip_reference();
+        // (The fake test tone has no start-up noise to wait out.)
+        self.gate.restart(!self.bypass);
         self.meter.reset();
         self.shared.meters.mic_level.store(0.0);
         self.shared.meters.transmitting.store(false, Relaxed);
@@ -311,6 +314,7 @@ pub(crate) fn run(mut pipeline: MicPipeline, feeds: Receiver<Option<InputFeed>>)
 mod tests {
     use super::*;
     use crate::codec::tests::{rms, sine};
+    use crate::gate::MIC_SETTLE_FRAMES;
     use crate::{AudioSettings, VoiceMode};
     use std::sync::Mutex;
 
@@ -493,6 +497,52 @@ mod tests {
         p.process_frame(&mut frame);
         let last = *sent.lock().unwrap().last().unwrap();
         assert_eq!((last.1, last.2), (90, 120 * AUDIO_FRAME_SAMPLES as u32));
+    }
+
+    #[test]
+    fn new_microphone_settles_before_voice_activation() {
+        let settings = AudioSettings {
+            voice_mode: VoiceMode::VoiceActivity,
+            vad_sensitivity: 1.0,
+            echo_cancel: false,
+            noise_suppress: false,
+            auto_gain: false,
+            ..Default::default()
+        };
+        let (mut p, _reference, sent) = pipeline(settings.clone(), false);
+        let loud = |p: &mut MicPipeline, f: usize| {
+            let mut frame = sine(300.0, 0.3, f * AUDIO_FRAME_SAMPLES, AUDIO_FRAME_SAMPLES, 1);
+            p.process_frame(&mut frame);
+        };
+        // A microphone opens loud (its start-up burst, or speech already).
+        p.idle();
+        for f in 0..MIC_SETTLE_FRAMES as usize {
+            loud(&mut p, f);
+        }
+        assert!(sent.lock().unwrap().is_empty());
+        assert!(!p.shared.meters.transmitting.load(Relaxed));
+        assert!(
+            p.shared.meters.mic_level.load() > 0.5,
+            "the meter still moves"
+        );
+        loud(&mut p, MIC_SETTLE_FRAMES as usize);
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        assert!(p.shared.meters.transmitting.load(Relaxed));
+
+        // Switching microphones mid-sentence: the hangover doesn't carry over.
+        p.idle();
+        for f in 0..10 {
+            let mut frame = vec![0.0; AUDIO_FRAME_SAMPLES];
+            p.process_frame(&mut frame);
+            assert!(!p.shared.meters.transmitting.load(Relaxed), "frame {f}");
+        }
+        assert_eq!(sent.lock().unwrap().len(), 1);
+
+        // The fake test tone sends at once.
+        let (mut p, _reference, sent) = pipeline(settings, true);
+        p.idle();
+        loud(&mut p, 0);
+        assert_eq!(sent.lock().unwrap().len(), 1);
     }
 
     #[test]

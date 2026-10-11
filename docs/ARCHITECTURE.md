@@ -29,7 +29,7 @@ non-NVIDIA support, internet use without Tailscale.
 |---|---|
 | Rust app, std threads + channels, no async runtime | Small, predictable, easy to reason about. |
 | Video capture+encode by a **bundled FFmpeg** child process (`ddagrab` → `*_nvenc`) | FFmpeg's NVENC and Desktop Duplication code is used by millions; writing our own NVENC/D3D11 FFI blind is the riskiest possible thing. Frames stay on the GPU. |
-| Viewer window is a **bundled mpv** child process fed through stdin | GPU decoding, scaling, fullscreen, window handling for free, battle tested low-latency mode. |
+| Viewer window is a **bundled mpv** (0.41 or newer) child process fed through stdin | GPU decoding, scaling, fullscreen, window handling for free, battle tested low-latency mode. |
 | Video over **TCP**, audio over **UDP** | Tailscale paths are direct and low loss; TCP gives a never-corrupted picture with very little code. A frame-aware send queue drops to the next keyframe if the network falls behind. Audio must never wait behind video, so it gets its own UDP socket. Moonlight-style UDP+FEC video is a possible v2. |
 | No TLS | Tailscale (WireGuard) already encrypts and authenticates both machines. |
 | FFmpeg outputs FLV, mpv gets a raw stream with a trailing delimiter after each frame | Raw H.264/HEVC/AV1 streams have no frame lengths, so a parser only knows a frame is finished when the next one starts — a full frame of extra delay at each end. FLV has explicit lengths; on the viewer side we write the next frame's delimiter immediately so mpv's parser completes the frame at once. See `gf_proto::bitstream`. |
@@ -85,6 +85,10 @@ Everything is symmetric: both PCs run the same pipelines in both directions.
 5. Watch: on `ShareStarted` the viewer side opens mpv automatically
    (setting, default on) and sends `Watching{on:true}`. Closing the mpv
    window sends `Watching{on:false}`; an "Open viewer" button reopens it.
+   mpv is started on a helper thread (launching mpv.exe took ~0.37 s on the
+   RTX 5080 PC), so incoming audio keeps flowing; video that arrives
+   meanwhile is kept from the latest keyframe on and handed to the new
+   viewer, which keeps it until mpv reads (up to 300 frames / 16 MB).
 6. Game audio: toggled independently of video (always off at launch);
    `GameAudio{active}` tells the peer (for the UI) once the capture runs.
    Starting/stopping the capture can block for seconds, so the engine hands
@@ -107,6 +111,31 @@ ability is assumed; mpv falls back to software decoding if needed.
 
 Defaults: AV1 20 Mbps, HEVC 25 Mbps, H.264 35 Mbps at 1440p60; adjustable
 5–80 Mbps.
+
+## Capture and viewer details (from the hardware tests)
+
+- **Turned monitors.** Desktop Duplication delivers a portrait monitor's
+  picture unturned. `gf_sys::Monitor::rotation` (from DXGI) tells gf-video
+  to turn it upright on the CPU path (`transpose=clock` for 90°), so the
+  stream size is still `output_size(monitor_size(i))` (`monitor_size` is the
+  upright desktop size).
+- **Scaling.** ddagrab → `scale_d3d11` fails on NVIDIA with FFmpeg 8 (error
+  80070057, reproduced without capture), and mapping ddagrab's frames to CUDA
+  is impossible, so that step was removed. A scaled share falls back to CPU
+  scaling (~1.6–1.9 cores at 4K → 1440p); a GPU step that failed is skipped
+  for the rest of the app run. A CUDA path (`hwdownload` → `hwupload_cuda` →
+  `scale_cuda`/`transpose_cuda`) is built and tested with test frames but
+  off (`args::CUDA_TRANSFORM`) until a live-desktop run confirms it.
+- **Frame pacing.** ddagrab spaces frames in ~15.6 ms steps (Windows timer),
+  so at 60 fps about every 10th gap is ~31 ms, and 120/144 fps only reach
+  ~74–89 fps. The UI marks 120 and 144 "experimental".
+- **Filler.** NVENC's CBR mode pads H.264 (72–78% of the bytes in a quiet
+  picture). The FLV demuxer drops H.264 (NAL 12) and HEVC (NAL 38) filler
+  and AV1 padding OBUs, so the wire carries only the picture.
+- **mpv options** that matter for delay: `--demuxer=lavf` (else mpv's probe
+  waits for 8 KB of input), `--hwdec-threads=1` (else H.264/HEVC hardware
+  decoding holds 3 frames, ~47 ms). `$` in the window title is written as
+  `$$` (mpv expands `${...}`). mpv's stdout and stderr both go to the log.
 
 ## Ports and firewall
 
@@ -131,4 +160,5 @@ click Allow. The README explains this.
 - Windows: the workspace builds and its tests run natively on
   `x86_64-pc-windows-msvc` (the owner's PC and GitHub Actions); on Linux it
   can be cross-checked for `x86_64-pc-windows-gnu`. Real NVENC / mpv
-  behaviour can only be confirmed on the two PCs.
+  behaviour can only be confirmed on the two PCs (see "Hardware test
+  results" in [HANDOFF.md](HANDOFF.md)).

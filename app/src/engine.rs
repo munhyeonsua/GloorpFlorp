@@ -3,9 +3,10 @@
 //! through `Command`s and reads a `Snapshot`. Never blocks the UI.
 //!
 //! Slow work (finding the Tailscale address, probing encoders, starting
-//! FFmpeg, listing devices, stopping child processes) runs on short-lived
-//! helper threads that report back to the engine thread. Starting audio and
-//! starting/stopping game audio run in order on one audio thread.
+//! FFmpeg and mpv, listing devices, stopping child processes) runs on
+//! short-lived helper threads that report back to the engine thread.
+//! Starting audio and starting/stopping game audio run in order on one
+//! audio thread.
 
 mod inner;
 

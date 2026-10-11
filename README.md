@@ -42,9 +42,10 @@ The rest of this guide explains each step.
   one PC to the other inside your Tailscale network, which encrypts
   everything. If Tailscale can't link your PCs directly, it passes the
   still-encrypted data through one of its relay servers, which can't read it.
-- **Only two files, both on your own PC:**
+- **Only these files, all on your own PC:**
   - your settings: `%APPDATA%\GloorpFlorp\settings.json`
   - a log for troubleshooting: `%APPDATA%\GloorpFlorp\log.txt`
+  - the log from the time before: `%APPDATA%\GloorpFlorp\log.old.txt`
 - To remove GloorpFlorp completely, delete its folder and the
   `%APPDATA%\GloorpFlorp` folder.
 
@@ -182,7 +183,7 @@ Good to know:
 - Press **f** or **double-click** the picture to switch fullscreen on or off.
 - Close the window whenever you like. Your friend's PC then stops sending
   video, which saves bandwidth. Click **Open viewer** to bring it back.
-- A newly opened window can stay black for up to 2 seconds, until the next
+- A newly opened window can stay black for a few seconds, until the next
   full picture arrives.
 
 ### Game audio
@@ -260,6 +261,8 @@ are going:
   them.
 - **Quality:** 1440p at 60 fps with about **20–25 Mbps** looks great.
   Fast-moving games look better with more bitrate, if your upload allows it.
+- **Frame rate: stay at 60.** 120 and 144 fps are marked "experimental": in
+  tests the screen capture only reached about 75–90 pictures per second.
 - **Upload speed matters most.** The sharer's upload speed must be well above
   the bitrate. Test it at [speedtest.net](https://www.speedtest.net). If your
   upload is 30 Mbps, use 20 Mbps or less. With slower upload, choose 1080p
@@ -284,12 +287,12 @@ are going:
 | GloorpFlorp says Tailscale isn't running | Start Tailscale from the Start menu and sign in. The tray icon should show you as connected. Then click **Host** again. |
 | The friend can't connect | Is GloorpFlorp still open on the host's PC? Are both PCs connected in Tailscale, and can each see the other in Tailscale's device list? With two Tailscale accounts, the person whose PC is *shared* must host. Check the host's firewall (next row). In Command Prompt on the friend's PC, run `tailscale ping <host's PC name>`: if that fails, the problem is in Tailscale, not GloorpFlorp. |
 | Firewall: you clicked Cancel, or only ticked Private | Press Start, type **Allow an app through Windows Firewall** and open it. Click **Change settings**, find **GloorpFlorp**, tick both **Private** and **Public**, then **OK**. If it isn't listed, click **Allow another app...** and pick `GloorpFlorp.exe`. Windows asks again if you move the GloorpFlorp folder. |
-| "Wrong code" or "typo" message | Copy and paste the code instead of typing it. If the host restarted GloorpFlorp or clicked **New code**, the code has changed: ask for the current one. |
+| "Wrong room code" or "typo" message | Copy and paste the code instead of typing it. If the host restarted GloorpFlorp or clicked **New code**, the code has changed: ask for the current one. |
 | A message about different versions | You're using different builds. Both of you use the same zip (compare `VERSIONS.txt`). |
 | Everything is slow or laggy | Open Command Prompt and run `tailscale status`. If the line for your friend's PC says **relay** (instead of **direct**), your data goes through Tailscale's relay servers, which are much slower. Restart Tailscale on both PCs, turn off any other VPN and try again. Some home routers need UPnP turned on for a direct connection. Until then, use a low bitrate. |
 | The viewer window stays black | Wait a few seconds. Check that your friend is still sharing and picked the right monitor. Games in exclusive fullscreen can't always be captured: switch the game to borderless windowed. On a laptop, the shared monitor must be connected to the NVIDIA graphics card. Close the viewer and click **Open viewer**. |
 | Video is choppy or freezes now and then | Lower the bitrate (try 15 Mbps) or choose 1080p. Check `tailscale status` for **relay** (see above). Pause downloads. If **dropped frames** in the connection details keeps climbing, the network can't keep up. |
-| An error about NVENC, the encoder or the driver when you start sharing | Update your NVIDIA driver and restart the PC; this fixes most of these. Then try another codec (H.264) in the settings. Close other programs that record with the graphics card (OBS, NVIDIA Instant Replay) and try again. |
+| An error about NVENC, the encoder or the driver when you start sharing | Update your NVIDIA driver and restart the PC; this fixes most of these. Then choose another codec (H.264) under **Codec** in "Your screen". Close other programs that record with the graphics card (OBS, NVIDIA Instant Replay) and try again. |
 | "Couldn't find FFmpeg", or the viewer never opens | GloorpFlorp can't find its `ffmpeg` or `mpv` folder. Extract the whole zip again and run `GloorpFlorp.exe` from the extracted folder. If your antivirus removed a file, restore it, then extract again. |
 | Your friend hears no game audio | Check that GloorpFlorp says "Sending game audio." (click **Start sending game audio**) and that the right program is chosen. Some games play sound from a different program than the one with the window: try **Everything except GloorpFlorp**. If you restarted the game, click **Start sending game audio** again. Ask your friend to check their game-audio volume slider and that they're not deafened. |
 | Your friend hears an echo of their own voice | You're probably on speakers: use a headset, or turn your speakers down and keep echo cancellation on. If you're also in a Discord call together, send only one program's game audio (see [Game audio](#game-audio)). |
@@ -303,7 +306,8 @@ it's the most useful thing to send to whoever is helping you.
 
 1. Press **Windows + R**, paste `%APPDATA%\GloorpFlorp` and press Enter.
 2. Send `log.txt` from that folder (from both PCs, if you can), and say
-   roughly when the problem happened.
+   roughly when the problem happened. If you have restarted GloorpFlorp
+   since, send `log.old.txt` too: it's the log from the time before.
 
 The log contains technical details such as your PC's name, Tailscale
 addresses and audio device names. It doesn't contain any of your audio or
@@ -327,7 +331,8 @@ To be honest about what GloorpFlorp is and isn't:
 - **No recording, no remote control.**
 - **Not code-signed**, so Windows shows the "Windows protected your PC"
   warning the first time.
-- **Not fully tested yet.** Screen sharing and a real session between the two
+- **Not fully tested yet.** Most parts have been tested on one PC (the RTX
+  5080), but sharing a real game screen and a real session between the two
   PCs haven't been tried yet, so the first real session may uncover problems.
   When something doesn't work, send the log files from both PCs.
 
@@ -362,7 +367,7 @@ cargo build --release
 
 The app is `target\release\GloorpFlorp.exe`. To run it, copy the `ffmpeg`
 and `mpv` folders from a release zip next to it (or have `ffmpeg` and `mpv`
-on your PATH).
+on your PATH). The viewer needs mpv 0.41 or newer.
 
 **Tests:** `cargo test --workspace`. Most tests also run on Linux (install
 `libasound2-dev`, `cmake` and `ffmpeg`). There, the Windows-specific parts

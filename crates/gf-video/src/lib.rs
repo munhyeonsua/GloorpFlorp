@@ -36,9 +36,10 @@ pub fn clock_us() -> u64 {
     EPOCH.get_or_init(Instant::now).elapsed().as_micros() as u64
 }
 
-/// Size of monitor `index` (`gf_sys::Monitor::index`) as the encoder sees it;
-/// 1920×1080 if it can't be found. Together with [`output_size`] this gives
-/// the stream size before `EncoderEvent::Started` arrives.
+/// Size of monitor `index` (`gf_sys::Monitor::index`) as the desktop shows
+/// it (upright, also for a turned monitor); 1920×1080 if it can't be found.
+/// Together with [`output_size`] this gives the stream size before
+/// `EncoderEvent::Started` arrives.
 pub fn monitor_size(index: u32) -> (u32, u32) {
     encoder::monitor_size(index)
 }
@@ -105,9 +106,18 @@ pub enum EncoderEvent {
 /// Start-up tries a short ladder of FFmpeg command lines, moving to the next
 /// if FFmpeg exits or produces no frame within a few seconds:
 /// 1. GPU all the way: ddagrab (D3D11) straight into NVENC; when scaling is
-///    needed, scale on the GPU.
-/// 2. Same but scaling via CUDA (`hwmap=derive_device=cuda,scale_cuda`).
-/// 3. Safe fallback: `hwdownload` to system memory, CPU scale, then NVENC.
+///    needed, `scale_d3d11` (FFmpeg 8 can't create its frames on NVIDIA
+///    cards, so this step fails there). Skipped for a turned monitor. If a
+///    scaling step fails where step 2 then works, later starts in the same
+///    run of the app go straight to step 2. (A CUDA way, `hwdownload` +
+///    `hwupload_cuda` + `scale_cuda` / `transpose_cuda`, is built but off
+///    until it has run on a live desktop: `args::CUDA_TRANSFORM`.)
+/// 2. Safe fallback: `hwdownload` to system memory, CPU scale/turn/convert
+///    (BT.601, tagged), then NVENC.
+///
+/// A monitor that Windows shows turned (`gf_sys::Monitor::rotation`) is
+/// captured unturned by Desktop Duplication; the picture is turned upright,
+/// so the stream size is still [`output_size`] of [`monitor_size`].
 ///
 /// NVENC flags aim for low latency: `-preset p4 -tune ull -rc cbr`, no
 /// B-frames, `-zerolatency 1`, `-delay 0`, `-g keyframe_interval`. Output is
@@ -141,16 +151,21 @@ impl Encoder {
 
 /// The viewer window (mpv), fed through stdin. Stops when dropped.
 ///
-/// mpv runs with low-latency options (`--profile=low-latency --untimed
-/// --no-cache`, tiny probe size, the right raw demuxer for the codec:
-/// `h264` / `hevc` / `obu`), fed with `gf_proto::bitstream::viewer_prologue`
-/// and `write_viewer_frame`,
-/// hardware decoding (`--hwdec=auto-safe`), no audio, a resizable window
-/// (double-click or `f` for fullscreen), titled with the friend's name.
+/// mpv (0.41 or newer) runs with low-latency options (`--profile=low-latency
+/// --untimed --no-cache`, tiny probe size, straight to the right raw demuxer
+/// for the codec: `--demuxer=lavf`, `h264` / `hevc` / `obu`), fed with
+/// `gf_proto::bitstream::viewer_prologue` and `write_viewer_frame`,
+/// hardware decoding (`--hwdec=auto-safe --hwdec-threads=1`, so no frame is
+/// held back), no audio, a resizable window (double-click or `f` for
+/// fullscreen), titled with the friend's name (shown as is). mpv's messages
+/// go to the log.
 ///
-/// Frames are handed to a writer thread through a small queue. If mpv falls
-/// behind (queue full) the queue is cleared and frames are skipped until the
-/// next keyframe. Frames before the first keyframe are skipped.
+/// Frames are handed to a writer thread through a queue. While mpv starts
+/// (~0.6 s on Windows) everything from the latest keyframe on waits for it
+/// (up to 300 frames / 16 MB), so a new viewer shows the opening keyframe.
+/// After that, if mpv falls behind (6 frames waiting) the queue is cleared
+/// and frames are skipped until the next keyframe. Frames before the first
+/// keyframe are skipped.
 ///
 /// Non-Windows without a display (or with `GLOORP_FAKE_VIDEO=1` and no mpv):
 /// `ffmpeg -f <fmt> -i pipe:0 -f null -` stands in for mpv.
@@ -159,6 +174,9 @@ pub struct Viewer {
 }
 
 impl Viewer {
+    /// Starts the viewer process. Can block for several hundred ms (starting
+    /// the large mpv.exe took ~0.36 s on an RTX 5080 PC, probably antivirus
+    /// scanning), so call it off threads that must stay responsive.
     pub fn start(tools: &Tools, codec: VideoCodec, title: &str) -> anyhow::Result<Viewer> {
         viewer::ViewerInner::start(tools, codec, title).map(|inner| Viewer { inner })
     }
