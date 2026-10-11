@@ -19,6 +19,14 @@ pub(crate) fn launch<F>(name: &str, body: F) -> anyhow::Result<LoopbackCapture>
 where
     F: FnOnce(&AtomicBool, &dyn Fn()) -> Result<(), String> + Send + 'static,
 {
+    launch_within(name, START_TIMEOUT, body)
+}
+
+/// [`launch`] with its own start timeout.
+fn launch_within<F>(name: &str, timeout: Duration, body: F) -> anyhow::Result<LoopbackCapture>
+where
+    F: FnOnce(&AtomicBool, &dyn Fn()) -> Result<(), String> + Send + 'static,
+{
     let stop = Arc::new(AtomicBool::new(false));
     let error = Arc::new(Mutex::new(None::<String>));
     let (tx, rx) = mpsc::channel::<Result<(), String>>();
@@ -51,7 +59,7 @@ where
         error,
         thread: Some(thread),
     };
-    match rx.recv_timeout(START_TIMEOUT) {
+    match rx.recv_timeout(timeout) {
         Ok(Ok(())) => Ok(capture),
         Ok(Err(e)) => Err(anyhow::anyhow!(e)),
         Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -177,8 +185,15 @@ mod tests {
 
     #[test]
     fn panic_becomes_error() {
-        let err = launch("test-panic", |_, _| panic!("boom")).err().unwrap();
-        assert!(err.to_string().contains("stopped unexpectedly"));
+        // With RUST_BACKTRACE set, the panic hook symbolizes a backtrace
+        // before unwinding; on a cold CI runner that took over the normal
+        // 10 s start timeout, which then won the race.
+        let err = launch_within("test-panic", Duration::from_secs(120), |_, _| {
+            panic!("boom")
+        })
+        .err()
+        .unwrap();
+        assert!(err.to_string().contains("stopped unexpectedly"), "{err}");
     }
 
     #[test]
