@@ -73,11 +73,11 @@ pub fn output_size(monitor_w: u32, monitor_h: u32, max_height: Option<u32>) -> (
     match max_height {
         Some(max) if max >= 2 && monitor_h > max && monitor_w > 0 => {
             let h = max & !1;
-            let w = (u64::from(monitor_w) * u64::from(h) + u64::from(monitor_h) / 2)
-                / u64::from(monitor_h);
-            // Round to the nearest even number, at least 2.
-            let w = (((w + 1) / 2) * 2).max(2);
-            (w.min(u64::from(u32::MAX - 1)) as u32, h)
+            // Nearest even width to the exact aspect-preserving width, at least 2.
+            let num = u64::from(monitor_w) * u64::from(h);
+            let den = 2 * u64::from(monitor_h);
+            let w = (2 * ((num + den / 2) / den)).clamp(2, u64::from(u32::MAX - 1));
+            (w as u32, h)
         }
         _ => (monitor_w, monitor_h),
     }
@@ -110,14 +110,32 @@ pub(crate) fn encoder_args(
     let rate = format!("{}k", settings.bitrate_kbps.max(1));
     let bufsize = format!("{}k", bufsize_kbps(settings.bitrate_kbps, fps));
 
-    let mut a = s(&["-hide_banner", "-nostdin", "-loglevel", "warning", "-nostats"]);
+    let mut a = s(&[
+        "-hide_banner",
+        "-nostdin",
+        "-loglevel",
+        "warning",
+        "-nostats",
+    ]);
     if step == Step::TestSource {
         a.extend(s(&["-re", "-f", "lavfi", "-i"]));
         a.push(format!("testsrc2=size={w}x{h}:rate={fps}"));
-        a.extend(s(&["-pix_fmt", "yuv420p", "-c:v", software_encoder(settings.codec)]));
+        a.extend(s(&[
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            software_encoder(settings.codec),
+        ]));
         match settings.codec {
             VideoCodec::H264 => {
-                a.extend(s(&["-preset", "ultrafast", "-tune", "zerolatency", "-bf", "0"]));
+                a.extend(s(&[
+                    "-preset",
+                    "ultrafast",
+                    "-tune",
+                    "zerolatency",
+                    "-bf",
+                    "0",
+                ]));
                 a.extend(s(&["-sc_threshold", "0", "-g"]));
                 a.push(gop.to_string());
                 a.extend(s(&["-b:v", &rate, "-maxrate", &rate, "-bufsize", &bufsize]));
@@ -147,7 +165,9 @@ pub(crate) fn encoder_args(
         let vf = match (step, needs_scale) {
             (Step::GpuDirect, false) => None,
             // scale_d3d11 (FFmpeg 8) only outputs nv12/p010 and needs it spelled out.
-            (Step::GpuDirect, true) => Some(format!("scale_d3d11=width={w}:height={h}:format=nv12")),
+            (Step::GpuDirect, true) => {
+                Some(format!("scale_d3d11=width={w}:height={h}:format=nv12"))
+            }
             (Step::GpuCuda, _) => Some(format!(
                 "hwmap=derive_device=cuda,scale_cuda=w={w}:h={h}:format=nv12"
             )),
@@ -160,8 +180,17 @@ pub(crate) fn encoder_args(
             a.push("-vf".into());
             a.push(vf);
         }
-        a.extend(s(&["-c:v", nvenc_encoder(settings.codec), "-preset", "p4", "-tune", "ull"]));
-        a.extend(s(&["-rc", "cbr", "-b:v", &rate, "-maxrate", &rate, "-bufsize", &bufsize]));
+        a.extend(s(&[
+            "-c:v",
+            nvenc_encoder(settings.codec),
+            "-preset",
+            "p4",
+            "-tune",
+            "ull",
+        ]));
+        a.extend(s(&[
+            "-rc", "cbr", "-b:v", &rate, "-maxrate", &rate, "-bufsize", &bufsize,
+        ]));
         a.push("-g".into());
         a.push(gop.to_string());
         // -bf is a generic codec option, so it is safe for av1_nvenc too.
@@ -170,7 +199,13 @@ pub(crate) fn encoder_args(
             a.extend(s(&["-forced-idr", "1"]));
         }
     }
-    a.extend(s(&["-an", "-f", "flv", "-flvflags", "no_duration_filesize"]));
+    a.extend(s(&[
+        "-an",
+        "-f",
+        "flv",
+        "-flvflags",
+        "no_duration_filesize",
+    ]));
     a.extend(s(&["-flush_packets", "1", "pipe:1"]));
     a
 }
@@ -242,7 +277,18 @@ pub(crate) fn mpv_args(codec: VideoCodec, title: &str) -> Vec<String> {
 
 /// Dev/test sink used when mpv isn't available (non-Windows only).
 pub(crate) fn null_sink_args(codec: VideoCodec) -> Vec<String> {
-    s(&["-hide_banner", "-v", "error", "-f", raw_format(codec), "-i", "pipe:0", "-f", "null", "-"])
+    s(&[
+        "-hide_banner",
+        "-v",
+        "error",
+        "-f",
+        raw_format(codec),
+        "-i",
+        "pipe:0",
+        "-f",
+        "null",
+        "-",
+    ])
 }
 
 /// Window titles can't contain line breaks; keep them short.
@@ -336,7 +382,7 @@ pub(crate) fn flv_metadata_size(flv: &[u8]) -> Option<(u32, u32)> {
         pat.push(0); // AMF0 number marker
         let at = body.windows(pat.len()).position(|w| w == pat.as_slice())? + pat.len();
         let v = f64::from_be_bytes(body.get(at..at + 8)?.try_into().ok()?);
-        (v.is_finite() && v >= 1.0 && v <= 16384.0).then_some(v as u32)
+        (1.0..=16384.0).contains(&v).then_some(v as u32)
     };
     Some((number("width")?, number("height")?))
 }
@@ -382,7 +428,7 @@ mod tests {
         assert_eq!(bufsize_kbps(20_000, 60), 2_500);
         // Low fps: at least two frames' worth.
         assert_eq!(bufsize_kbps(20_000, 10), 4_000);
-        assert_eq!(bufsize_kbps(0, 0), 1);
+        assert_eq!(bufsize_kbps(0, 0), 2);
     }
 
     #[test]
@@ -397,7 +443,11 @@ mod tests {
 
     #[test]
     fn gpu_direct_native() {
-        let a = encoder_args(Step::GpuDirect, &settings(VideoCodec::Av1, None), (2560, 1440));
+        let a = encoder_args(
+            Step::GpuDirect,
+            &settings(VideoCodec::Av1, None),
+            (2560, 1440),
+        );
         let expected = "-hide_banner -nostdin -loglevel warning -nostats \
             -f lavfi -i ddagrab=output_idx=1:framerate=60:draw_mouse=1 \
             -c:v av1_nvenc -preset p4 -tune ull -rc cbr -b:v 20000k -maxrate 20000k \
@@ -428,7 +478,11 @@ mod tests {
         assert!(j.contains(
             "-vf hwdownload,format=bgra,scale=1920:1080:flags=bicubic,format=nv12 -c:v h264_nvenc"
         ));
-        let j = joined(&encoder_args(Step::Cpu, &settings(VideoCodec::H264, None), (2560, 1440)));
+        let j = joined(&encoder_args(
+            Step::Cpu,
+            &settings(VideoCodec::H264, None),
+            (2560, 1440),
+        ));
         assert!(j.contains("-vf hwdownload,format=bgra,format=nv12 -c:v"));
     }
 
@@ -440,7 +494,16 @@ mod tests {
                 assert!(joined(&a).ends_with(
                     "-an -f flv -flvflags no_duration_filesize -flush_packets 1 pipe:1"
                 ));
-                assert_eq!(&a[..5], ["-hide_banner", "-nostdin", "-loglevel", "warning", "-nostats"]);
+                assert_eq!(
+                    &a[..5],
+                    [
+                        "-hide_banner",
+                        "-nostdin",
+                        "-loglevel",
+                        "warning",
+                        "-nostats"
+                    ]
+                );
             }
         }
     }
@@ -506,11 +569,17 @@ mod tests {
             VideoCodec::Av1,
         );
         assert!(nv.contains("NVIDIA") && nv.contains("AV1"));
-        let dd = advice("[Parsed_ddagrab_0 @ 0x2] Desktop duplication access denied", VideoCodec::H264);
+        let dd = advice(
+            "[Parsed_ddagrab_0 @ 0x2] Desktop duplication access denied",
+            VideoCodec::H264,
+        );
         assert!(dd.contains("Windows refused"));
         let dd = advice("AcquireNextFrame failed: 887a0026", VideoCodec::H264);
         assert!(dd.contains("borderless windowed"));
-        let rc = advice("[Parsed_ddagrab_0 @ 0x2] Output parameters changed!", VideoCodec::H264);
+        let rc = advice(
+            "[Parsed_ddagrab_0 @ 0x2] Output parameters changed!",
+            VideoCodec::H264,
+        );
         assert!(rc.contains("changed resolution"));
         assert!(advice("No such filter: 'scale_d3d11'", VideoCodec::H264).contains("zip again"));
         assert!(advice("something odd", VideoCodec::H264).contains("stopped unexpectedly"));

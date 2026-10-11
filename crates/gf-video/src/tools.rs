@@ -34,7 +34,10 @@ pub(crate) fn find_program(
     bundled.chain(on_path).find(|p| p.is_file())
 }
 
-pub(crate) fn locate_in(exe_dir: Option<&Path>, path_var: Option<OsString>) -> anyhow::Result<Tools> {
+pub(crate) fn locate_in(
+    exe_dir: Option<&Path>,
+    path_var: Option<OsString>,
+) -> anyhow::Result<Tools> {
     let ffmpeg = find_program("ffmpeg", exe_dir, path_var.clone()).ok_or_else(|| {
         anyhow::anyhow!(
             "Couldn't find FFmpeg next to GloorpFlorp.exe. Extract the whole zip again, \
@@ -87,8 +90,18 @@ pub(crate) fn run_short(
             String::from_utf8_lossy(&buf).into_owned()
         })
     };
-    let out = read_all(child.stdout.take().map(|r| Box::new(r) as Box<dyn Read + Send>));
-    let err = read_all(child.stderr.take().map(|r| Box::new(r) as Box<dyn Read + Send>));
+    let out = read_all(
+        child
+            .stdout
+            .take()
+            .map(|r| Box::new(r) as Box<dyn Read + Send>),
+    );
+    let err = read_all(
+        child
+            .stderr
+            .take()
+            .map(|r| Box::new(r) as Box<dyn Read + Send>),
+    );
     let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
@@ -192,9 +205,15 @@ mod tests {
         assert_eq!(t.ffmpeg, app.join(exe_name("ffmpeg")));
         assert_eq!(t.mpv, Some(app.join("mpv").join(exe_name("mpv"))));
 
-        touch(&app.join("ffmpeg").join(exe_name("ffmpeg")));
-        let t = locate_in(Some(&app), Some(path)).unwrap();
-        assert_eq!(t.ffmpeg, app.join("ffmpeg").join(exe_name("ffmpeg")));
+        // The `ffmpeg/` subfolder wins over a flat exe (on Linux the two
+        // names would clash, so only the subfolder is tested there).
+        let app2 = root.join("app2");
+        touch(&app2.join("ffmpeg").join(exe_name("ffmpeg")));
+        if cfg!(windows) {
+            touch(&app2.join(exe_name("ffmpeg")));
+        }
+        let t = locate_in(Some(&app2), Some(path)).unwrap();
+        assert_eq!(t.ffmpeg, app2.join("ffmpeg").join(exe_name("ffmpeg")));
         let _ = std::fs::remove_dir_all(&root);
     }
 

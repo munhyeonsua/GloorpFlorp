@@ -8,9 +8,11 @@
 //! viewer:  VideoFrame --> writer thread --stdin--> mpv (raw stream, hw decode, low-latency)
 //! ```
 //!
-//! Non-Windows (development and tests only): the encoder uses FFmpeg's
-//! `testsrc2` pattern and software encoders (libx264 / libx265 / libsvtav1),
-//! and the viewer runs `mpv` if it exists, else `ffmpeg -f null` as a sink.
+//! Non-Windows (development and tests only), or Windows with
+//! `GLOORP_FAKE_VIDEO=1`: the encoder uses FFmpeg's `testsrc2` pattern and
+//! software encoders (libx264 / libx265 / libsvtav1), and the viewer runs
+//! `mpv` if it exists (and, off Windows, a display does), else
+//! `ffmpeg -f <fmt> -i pipe:0 -f null -` as a sink.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -84,11 +86,18 @@ pub struct EncoderSettings {
 #[derive(Clone, Debug)]
 pub enum EncoderEvent {
     /// First frame produced; this is the actual output size.
-    Started { codec: VideoCodec, width: u32, height: u32, fps: u32 },
+    Started {
+        codec: VideoCodec,
+        width: u32,
+        height: u32,
+        fps: u32,
+    },
     Frame(VideoFrame),
     /// The encoder exited. `error` is a plain-language explanation followed by
     /// the last lines FFmpeg printed, or `None` after a normal `stop()`.
-    Stopped { error: Option<String> },
+    Stopped {
+        error: Option<String>,
+    },
 }
 
 /// A running FFmpeg capture+encode process. Stops (kills FFmpeg) when dropped.
@@ -99,6 +108,7 @@ pub enum EncoderEvent {
 ///    needed, scale on the GPU.
 /// 2. Same but scaling via CUDA (`hwmap=derive_device=cuda,scale_cuda`).
 /// 3. Safe fallback: `hwdownload` to system memory, CPU scale, then NVENC.
+///
 /// NVENC flags aim for low latency: `-preset p4 -tune ull -rc cbr`, no
 /// B-frames, `-zerolatency 1`, `-delay 0`, `-g keyframe_interval`. Output is
 /// FLV on stdout (`-f flv -flvflags no_duration_filesize -flush_packets 1`)

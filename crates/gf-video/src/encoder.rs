@@ -27,7 +27,10 @@ const META_BYTES: usize = 4096;
 
 /// Size of the monitor `index`, or 1920×1080 if it can't be found.
 pub(crate) fn monitor_size(index: u32) -> (u32, u32) {
-    match gf_sys::list_monitors().into_iter().find(|m| m.index == index) {
+    match gf_sys::list_monitors()
+        .into_iter()
+        .find(|m| m.index == index)
+    {
         Some(m) if m.width > 0 && m.height > 0 => (m.width, m.height),
         _ => {
             log::warn!("monitor {index} not found; assuming 1920x1080");
@@ -148,7 +151,9 @@ fn read_flv(mut out: impl Read, tx: &Sender<Internal>) {
 }
 
 /// Stops the attempt's process and collects its last stderr lines.
-fn finish_attempt(current: &SharedChild) -> Option<(Option<std::process::ExitStatus>, Vec<String>)> {
+fn finish_attempt(
+    current: &SharedChild,
+) -> Option<(Option<std::process::ExitStatus>, Vec<String>)> {
     let mut attempt = current.lock().ok()?.take()?;
     let status = proc::kill(&mut attempt.child);
     if let Some(r) = attempt.reader.take() {
@@ -173,7 +178,9 @@ impl Out {
             Ok(()) => self.skipping = false,
             Err(TrySendError::Full(_)) => {
                 if !self.skipping {
-                    log::warn!("video frames aren't being picked up; skipping to the next keyframe");
+                    log::warn!(
+                        "video frames aren't being picked up; skipping to the next keyframe"
+                    );
                 }
                 self.skipping = true;
             }
@@ -292,7 +299,13 @@ impl Supervisor {
         for i in 0..self.steps.len() {
             let step = self.steps[i];
             if i > 0 {
-                match spawn_attempt(&self.tools, step, &self.settings, self.monitor, &self.internal_tx) {
+                match spawn_attempt(
+                    &self.tools,
+                    step,
+                    &self.settings,
+                    self.monitor,
+                    &self.internal_tx,
+                ) {
                     Ok(a) => {
                         if let Ok(mut cur) = self.current.lock() {
                             *cur = Some(a);
@@ -344,7 +357,9 @@ impl Supervisor {
                 match self.internal_rx.recv_timeout(left) {
                     Ok(m) => Some(m),
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                        let mut lines = finish_attempt(&self.current).map(|f| f.1).unwrap_or_default();
+                        let mut lines = finish_attempt(&self.current)
+                            .map(|f| f.1)
+                            .unwrap_or_default();
                         // Drop what the killed attempt's reader sent last, keeping a stop request.
                         while let Ok(m) = self.internal_rx.try_recv() {
                             if matches!(m, Internal::Stop) {
@@ -395,7 +410,8 @@ impl Supervisor {
                     if matches!(self.internal_rx.try_recv(), Ok(Internal::Stop)) {
                         return StepResult::Stopped;
                     }
-                    let (status, mut lines) = finish_attempt(&self.current).unwrap_or((None, Vec::new()));
+                    let (status, mut lines) =
+                        finish_attempt(&self.current).unwrap_or((None, Vec::new()));
                     if let Some(e) = demux_err {
                         lines.push(format!("(couldn't read FFmpeg's output: {e})"));
                     }
@@ -415,7 +431,10 @@ impl Supervisor {
 
 /// Advice based on everything every step printed, then the details of each.
 fn ladder_failure_message(failures: &[(Step, Vec<String>)], codec: VideoCodec) -> String {
-    let all: Vec<String> = failures.iter().flat_map(|(_, l)| l.iter().cloned()).collect();
+    let all: Vec<String> = failures
+        .iter()
+        .flat_map(|(_, l)| l.iter().cloned())
+        .collect();
     let advice = args::advice(&all.join("\n"), codec);
     let mut details = String::new();
     for (step, lines) in failures {
@@ -438,11 +457,20 @@ mod tests {
     #[test]
     fn ladder_message_combines_steps() {
         let failures = vec![
-            (Step::GpuDirect, vec!["No such filter: 'scale_d3d11'".to_string()]),
-            (Step::Cpu, vec!["OpenEncodeSessionEx failed: out of memory (10)".to_string()]),
+            (
+                Step::GpuDirect,
+                vec!["No such filter: 'scale_d3d11'".to_string()],
+            ),
+            (
+                Step::Cpu,
+                vec!["OpenEncodeSessionEx failed: out of memory (10)".to_string()],
+            ),
         ];
         let m = ladder_failure_message(&failures, VideoCodec::Hevc);
-        assert!(m.starts_with("The NVIDIA video encoder couldn't start for HEVC"), "{m}");
+        assert!(
+            m.starts_with("The NVIDIA video encoder couldn't start for HEVC"),
+            "{m}"
+        );
         assert!(m.contains("[GPU (D3D11 -> NVENC)]\nNo such filter"));
         assert!(m.ends_with("OpenEncodeSessionEx failed: out of memory (10)"));
         let m = ladder_failure_message(&[(Step::TestSource, vec![])], VideoCodec::H264);

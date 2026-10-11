@@ -30,8 +30,18 @@
 //! from the first datagram with the right token and answers `Pong`. Both
 //! sides answer pings. Datagrams with a wrong token or malformed header are
 //! ignored. Audio loss is estimated from gaps in per-stream sequence numbers.
+//! The host pings too once it knows the joiner's address, so both sides see
+//! the round-trip time.
+
+mod framer;
+mod loss;
+mod queue;
+mod session;
+#[cfg(test)]
+mod tests;
 
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 
 use crossbeam_channel::Receiver;
 use gf_proto::wire::TcpMsg;
@@ -49,6 +59,8 @@ pub enum Role {
 #[derive(Clone, Debug)]
 pub struct NetConfig {
     pub role: Role,
+    /// Host: port to listen on for TCP and UDP; 0 lets the OS pick one
+    /// (reported in [`NetEvent::Listening`]). Joiner: the host's port.
     pub port: u16,
     pub secret: u32,
     /// Display name sent to the friend.
@@ -74,55 +86,98 @@ pub struct NetStats {
 
 #[derive(Clone, Debug)]
 pub enum NetEvent {
-    /// Host is ready for the friend to join.
-    Listening { addr: SocketAddr },
+    /// Host is ready for the friend to join (again after each disconnect).
+    /// `addr` has the real port, also when [`NetConfig::port`] was 0.
+    Listening {
+        addr: SocketAddr,
+    },
     /// Handshake done.
-    Connected { peer_name: String, peer_encoders: Vec<VideoCodec> },
+    Connected {
+        peer_name: String,
+        peer_encoders: Vec<VideoCodec>,
+    },
     /// Join refused by the host (wrong code, room full, version mismatch).
-    Rejected { reason: String },
+    Rejected {
+        reason: String,
+    },
     /// Any control message other than Hello/Welcome/Reject/Ping/Pong/Video/Bye.
     Msg(TcpMsg),
     Video(VideoFrame),
-    Audio { stream: AudioStream, seq: u16, ts: u32, payload: Vec<u8> },
+    Audio {
+        stream: AudioStream,
+        seq: u16,
+        ts: u32,
+        payload: Vec<u8>,
+    },
     /// Sent about once per second while running.
     Stats(NetStats),
-    /// The peer left or the connection died. Host keeps listening afterwards.
-    Disconnected { reason: String, will_retry: bool },
-    /// Fatal problem (e.g. cannot bind the port). The session has stopped.
+    /// The peer left or the connection died. Host keeps listening afterwards
+    /// (`will_retry: false`, then `Listening`). Joiner: `will_retry: true` while
+    /// it tries to reconnect, `false` once it has given up or the friend left.
+    Disconnected {
+        reason: String,
+        will_retry: bool,
+    },
+    /// Fatal problem (e.g. the joiner can't reach the host). The session has
+    /// stopped. The text is plain language for the UI.
     Error(String),
 }
 
-/// A running session. Dropping it closes everything.
+/// A running session. Dropping it closes everything (like [`NetTx::close`]),
+/// even if clones of `tx` are still around. Because of that `Drop`, fields
+/// can't be moved out; clone `events` / `tx` instead.
 pub struct Net {
     pub events: Receiver<NetEvent>,
     pub tx: NetTx,
 }
 
-/// Cheap to clone; all methods are non-blocking and safe from any thread.
-/// Calls while not connected are silently ignored.
-#[derive(Clone)]
-pub struct NetTx {}
-
-impl NetTx {
-    /// Control message (anything except `Video`).
-    pub fn send(&self, msg: TcpMsg) {
-        todo!()
-    }
-
-    pub fn send_video(&self, frame: VideoFrame) {
-        todo!()
-    }
-
-    pub fn send_audio(&self, stream: AudioStream, seq: u16, ts: u32, payload: &[u8]) {
-        todo!()
-    }
-
-    /// Sends `Bye` and shuts the session down.
-    pub fn close(&self) {
-        todo!()
+impl Drop for Net {
+    fn drop(&mut self) {
+        self.tx.close();
     }
 }
 
+/// Cheap to clone; all methods are non-blocking and safe from any thread.
+/// Calls while not connected are silently ignored.
+#[derive(Clone)]
+pub struct NetTx {
+    shared: Arc<session::Shared>,
+}
+
+impl NetTx {
+    /// Control message (anything except `Video`; a `Video` message is
+    /// treated like [`NetTx::send_video`]).
+    pub fn send(&self, msg: TcpMsg) {
+        self.shared.send(msg)
+    }
+
+    pub fn send_video(&self, frame: VideoFrame) {
+        self.shared.send_video(frame)
+    }
+
+    pub fn send_audio(&self, stream: AudioStream, seq: u16, ts: u32, payload: &[u8]) {
+        self.shared.send_audio(stream, seq, ts, payload)
+    }
+
+    /// Sends `Bye` and shuts the session down. Returns within about 150 ms;
+    /// the background threads finish on their own. No events follow.
+    pub fn close(&self) {
+        self.shared.close()
+    }
+}
+
+/// Starts hosting or joining. Never blocks on the network: the host binds
+/// its port here (a failure is returned as a plain-language error, e.g.
+/// "Port 47800 is already in use. Is GloorpFlorp already open?"), the
+/// joiner connects in the background and reports the outcome as an event.
 pub fn start(cfg: NetConfig) -> anyhow::Result<Net> {
-    todo!()
+    start_with(cfg, session::Timing::default())
+}
+
+fn start_with(cfg: NetConfig, timing: session::Timing) -> anyhow::Result<Net> {
+    let (events, shared) = session::start(cfg, timing)?;
+    Ok(Net {
+        events,
+        tx: NetTx { shared },
+    })
 }
