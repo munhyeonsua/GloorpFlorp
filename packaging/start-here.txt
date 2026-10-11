@@ -1,0 +1,31 @@
+GloorpFlorp - private screen sharing and voice chat for two PCs
+================================================================
+
+Full guide: open "GloorpFlorp Guide.html" in this folder.
+
+1. Keep everything in this folder together. GloorpFlorp.exe needs the
+   "ffmpeg" and "mpv" folders next to it. Don't run it from inside the zip:
+   extract the whole zip first (right-click the zip > Extract All).
+
+2. Install Tailscale on both PCs and sign in: https://tailscale.com/download
+   Both PCs must show up in Tailscale. If you use two different Tailscale
+   accounts, one of you shares their PC with the other ("Share" in the
+   Tailscale admin console). The person who shared their PC clicks Host.
+
+3. Double-click GloorpFlorp.exe.
+   - "Windows protected your PC": click "More info", then "Run anyway".
+   - Windows Firewall asks for permission: tick BOTH "Private" and
+     "Public", then click "Allow access".
+
+4. One of you clicks Host and sends the code (like K7QM-2XPA-9TD) to the
+   other. The other pastes the code and clicks Join.
+
+5. To show your screen: pick a monitor, then click Start sharing.
+   Your friend's screen opens in its own window. Press f or double-click
+   it for fullscreen. Close it any time; reopen it with "Open viewer".
+
+Something wrong? See "Troubleshooting" in the guide. When asking for help,
+send your log file: press Windows+R, paste %APPDATA%\GloorpFlorp and press
+Enter, then send log.txt from that folder.
+
+You and your friend need the same version of GloorpFlorp (see VERSIONS.txt).

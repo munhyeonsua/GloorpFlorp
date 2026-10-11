@@ -1,0 +1,45 @@
+Third-party software in GloorpFlorp
+===================================
+
+This folder contains two separate open-source programs, FFmpeg and mpv.
+GloorpFlorp starts them as their own processes and talks to them through
+pipes; they are unmodified builds made by their packagers. Both are licensed
+under the GNU General Public License (GPL). You may share them under the
+terms of the GPL, which includes passing on where to get their source code
+(the links below). The exact builds are listed in VERSIONS.txt.
+
+
+FFmpeg  (ffmpeg\ffmpeg.exe)
+---------------------------
+Used for: capturing your screen and encoding the video with NVENC.
+License:  GNU GPL version 3 or later. This is a "gpl" build that also
+          includes other GPL-compatible libraries (for example x264 and x265).
+          License text: licenses\FFmpeg-LICENSE.txt
+Built by: BtbN's automated FFmpeg builds.
+Source:   FFmpeg:                       https://ffmpeg.org/download.html
+          Build scripts and the exact
+          versions of all libraries:    https://github.com/BtbN/FFmpeg-Builds
+
+
+mpv  (mpv\)
+-----------
+Used for: showing your friend's screen in the viewer window.
+License:  GNU GPL version 2 or later. This Windows build also contains
+          FFmpeg and other libraries.
+          License text: licenses\GPL-2.0.txt (and any licenses\mpv-* files)
+Built by: shinchiro's automated mpv builds for Windows.
+Source:   mpv:                          https://github.com/mpv-player/mpv
+          Build scripts and the exact
+          versions of all libraries:    https://github.com/shinchiro/mpv-winbuild-cmake
+
+
+GloorpFlorp.exe
+---------------
+GloorpFlorp's own code is under the MIT license. GloorpFlorp.exe is built
+from the open-source Rust libraries ("crates") listed below, each under the
+license shown in brackets (mostly MIT and/or Apache-2.0). It also contains
+libopus, the Opus audio codec (BSD 3-Clause license, https://opus-codec.org),
+built into the opusic-sys crate. Each crate's license text can be found on
+its page at https://crates.io.
+
+Rust crates in GloorpFlorp.exe:

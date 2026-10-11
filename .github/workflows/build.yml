@@ -1,0 +1,173 @@
+# Tests GloorpFlorp on Linux and Windows and builds the ready-to-run Windows
+# zip (GloorpFlorp.exe + FFmpeg + mpv). Download it from a run's "Artifacts"
+# section. Pushing a tag like v0.1.0 also publishes it as a GitHub Release.
+name: Build
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch cancels the older, still-running build.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  linux-tests:
+    name: Linux tests + clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libasound2-dev ffmpeg cmake pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  windows:
+    name: Windows tests + package
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      FFMPEG_URL: https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip
+      MPV_REPO: shinchiro/mpv-winbuild-cmake
+      # The plain x86_64 build, e.g. mpv-x86_64-20250101-git-abc1234.7z.
+      # The digit after "x86_64-" excludes mpv-x86_64-v3-... and mpv-dev-....
+      MPV_PATTERN: 'mpv-x86_64-[0-9]*.7z'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Build GloorpFlorp.exe
+        run: cargo build --release -p gloorpflorp
+
+      - name: Download FFmpeg
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP 'ffmpeg-win64-gpl.zip'
+          curl.exe --fail --location --retry 3 --retry-delay 10 --silent --show-error --output $zip $env:FFMPEG_URL
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::Could not download FFmpeg from $env:FFMPEG_URL (curl exit code $LASTEXITCODE). If the file was renamed upstream, update FFMPEG_URL in .github/workflows/build.yml."
+            exit 1
+          }
+          Write-Host "FFmpeg: downloaded $([math]::Round((Get-Item $zip).Length / 1MB)) MB"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "FFMPEG_ZIP=$zip"
+
+      - name: Download mpv
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = gh release view --repo $env:MPV_REPO --json tagName --jq .tagName
+          if ($LASTEXITCODE -ne 0 -or -not $tag) {
+            Write-Host "::error::Could not find the latest release of $env:MPV_REPO on GitHub."
+            exit 1
+          }
+          $dir = Join-Path $env:RUNNER_TEMP 'mpv-download'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          gh release download $tag --repo $env:MPV_REPO --pattern $env:MPV_PATTERN --dir $dir
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::Release $tag of $env:MPV_REPO has no file matching '$env:MPV_PATTERN' (or the download failed). If the file names changed, update MPV_PATTERN in .github/workflows/build.yml."
+            exit 1
+          }
+          $files = @(Get-ChildItem -LiteralPath $dir -File)
+          if ($files.Count -ne 1) {
+            Write-Host "::error::Expected exactly one mpv file but got: $($files.Name -join ', '). Make MPV_PATTERN in .github/workflows/build.yml more specific."
+            exit 1
+          }
+          Write-Host "mpv: downloaded $($files[0].Name) from release $tag"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "MPV_ARCHIVE=$($files[0].FullName)", "MPV_RELEASE=$tag"
+
+      - name: Package
+        run: |
+          $params = @{
+            AppExe     = 'target/release/GloorpFlorp.exe'
+            FfmpegZip  = $env:FFMPEG_ZIP
+            FfmpegUrl  = $env:FFMPEG_URL
+            MpvArchive = $env:MPV_ARCHIVE
+            MpvRelease = $env:MPV_RELEASE
+            MpvRepo    = $env:MPV_REPO
+            OutDir     = 'dist/GloorpFlorp'
+            Commit     = $env:GITHUB_SHA
+            Ref        = $env:GITHUB_REF_NAME
+            RepoUrl    = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY"
+          }
+          ./packaging/package-windows.ps1 @params
+
+      # The Actions page offers this as GloorpFlorp-windows-x64.zip, which
+      # contains the GloorpFlorp folder (a single zip, not a zip in a zip).
+      - name: Upload GloorpFlorp-windows-x64
+        uses: actions/upload-artifact@v4
+        with:
+          name: GloorpFlorp-windows-x64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux-tests, windows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download the package
+        uses: actions/download-artifact@v4
+        with:
+          name: GloorpFlorp-windows-x64
+          path: dist
+
+      - name: Zip
+        run: |
+          if [ ! -f dist/GloorpFlorp/GloorpFlorp.exe ]; then
+            echo "::error::The downloaded package has no GloorpFlorp/GloorpFlorp.exe."
+            exit 1
+          fi
+          (cd dist && zip -r -9 -q ../GloorpFlorp-windows-x64.zip GloorpFlorp)
+          unzip -l GloorpFlorp-windows-x64.zip
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: GloorpFlorp-windows-x64.zip
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          body: |
+            **To install:** download `GloorpFlorp-windows-x64.zip` below, right-click it, choose *Extract All*, then open `START HERE.txt` in the extracted `GloorpFlorp` folder.
+            You and your friend need the same version.

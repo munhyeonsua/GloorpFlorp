@@ -130,7 +130,6 @@ impl JitterBuffer {
             // The sender restarted: forget the old stream and take this
             // packet as the first of a new one.
             self.clear_stream();
-            self.update_jitter(EXT_BASE + u64::from(seq), now);
             return self.push(seq, payload, now);
         }
         self.consecutive_late = 0;
@@ -266,5 +265,327 @@ impl JitterBuffer {
         }
         let wanted = ((2.0 * self.jitter_ms + frame) / frame).ceil() as usize;
         self.target = wanted.clamp(self.min_packets, self.max_packets);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    use std::time::Duration;
+
+    struct Clock(Instant);
+    impl Clock {
+        fn at(&self, ms: u64) -> Instant {
+            self.0 + Duration::from_millis(ms)
+        }
+    }
+
+    fn pkt(seq: u16) -> Vec<u8> {
+        seq.to_le_bytes().to_vec()
+    }
+
+    fn frame(seq: u16) -> Pop {
+        Pop::Frame(pkt(seq))
+    }
+
+    /// Pushes `seqs` arriving 10 ms apart starting at `start_ms`.
+    fn push_all(jb: &mut JitterBuffer, clock: &Clock, start_ms: u64, seqs: &[u16]) {
+        for (i, &s) in seqs.iter().enumerate() {
+            jb.push(s, pkt(s), clock.at(start_ms + 10 * i as u64));
+        }
+    }
+
+    #[test]
+    fn in_order_with_priming() {
+        let clock = Clock(Instant::now());
+        let mut jb = JitterBuffer::new(JitterConfig::default());
+        assert_eq!(jb.stats().delay_ms, 20);
+        assert_eq!(jb.pop(), Pop::Empty);
+        jb.push(0, pkt(0), clock.at(0));
+        assert_eq!(jb.pop(), Pop::Empty, "still priming with 1 of 2 packets");
+        for s in 1..100u16 {
+            jb.push(s, pkt(s), clock.at(10 * s as u64));
+            assert_eq!(jb.pop(), frame(s - 1));
+        }
+        let st = jb.stats();
+        assert_eq!((st.received, st.lost, st.late_dropped, st.buffered), (100, 0, 0, 1));
+        assert_eq!(st.delay_ms, 20);
+    }
+
+    #[test]
+    fn reorders() {
+        let clock = Clock(Instant::now());
+        let mut jb = JitterBuffer::new(JitterConfig::default());
+        push_all(&mut jb, &clock, 0, &[1, 0, 3, 2, 4]);
+        for s in 0..5 {
+            assert_eq!(jb.pop(), frame(s));
+        }
+        assert_eq!(jb.stats().lost, 0);
+        assert_eq!(jb.pop(), Pop::Empty);
+    }
+
+    #[test]
+    fn loss_offers_next_packet_for_fec_without_consuming_it() {
+        let clock = Clock(Instant::now());
+        let mut jb = JitterBuffer::new(JitterConfig::default());
+        push_all(&mut jb, &clock, 0, &[0, 1, 3, 4]);
+        assert_eq!(jb.pop(), frame(0));
+        assert_eq!(jb.pop(), frame(1));
+        assert_eq!(jb.pop(), Pop::Lost { next: Some(pkt(3)) });
+        assert_eq!(jb.stats().buffered, 2);
+        assert_eq!(jb.pop(), frame(3));
+        assert_eq!(jb.pop(), frame(4));
+        assert_eq!(jb.stats().lost, 1);
+    }
+
+    #[test]
+    fn burst_loss() {
+        let clock = Clock(Instant::now());
+        let mut jb = JitterBuffer::new(JitterConfig::default());
+        push_all(&mut jb, &clock, 0, &[0, 1, 4]);
+        assert_eq!(jb.pop(), frame(0));
+        assert_eq!(jb.pop(), frame(1));
+        assert_eq!(jb.pop(), Pop::Lost { next: None });
+        assert_eq!(jb.pop(), Pop::Lost { next: Some(pkt(4)) });
+        assert_eq!(jb.pop(), frame(4));
+        assert_eq!(jb.stats().lost, 2);
+    }
+
+    #[test]
+    fn sequence_wraparound() {
+        let clock = Clock(Instant::now());
+        let mut jb = JitterBuffer::new(JitterConfig::default());
+        let seqs: Vec<u16> = (0..20u16).map(|i| 65530u16.wrapping_add(i)).collect();
+        jb.push(seqs[0], pkt(seqs[0]), clock.at(0));
+        for (i, w) in seqs.windows(2).enumerate() {
+            jb.push(w[1], pkt(w[1]), clock.at(10 * (i as u64 + 1)));
+            assert_eq!(jb.pop(), frame(w[0]));
+        }
+        // Reordering across the wrap.
+        let mut jb = JitterBuffer::new(JitterConfig::default());
+        push_all(&mut jb, &clock, 0, &[65534, 0, 65535, 1]);
+        for s in [65534, 65535, 0, 1] {
+            assert_eq!(jb.pop(), frame(s));
+        }
+        assert_eq!(jb.stats().lost, 0);
+    }
+
+    #[test]
+    fn duplicates_ignored() {
+        let clock = Clock(Instant::now());
+        let mut jb = JitterBuffer::new(JitterConfig::default());
+        push_all(&mut jb, &clock, 0, &[0, 1, 1, 0, 2]);
+        assert_eq!(jb.stats().received, 3);
+        assert_eq!(jb.pop(), frame(0));
+        assert_eq!(jb.pop(), frame(1));
+        assert_eq!(jb.pop(), frame(2));
+        assert_eq!(jb.pop(), Pop::Empty);
+    }
+
+    #[test]
+    fn late_packets_discarded() {
+        let clock = Clock(Instant::now());
+        let mut jb = JitterBuffer::new(JitterConfig::default());
+        push_all(&mut jb, &clock, 0, &[0, 2, 3]);
+        assert_eq!(jb.pop(), frame(0));
+        assert_eq!(jb.pop(), Pop::Lost { next: Some(pkt(2)) });
+        jb.push(1, pkt(1), clock.at(40));
+        jb.push(0, pkt(0), clock.at(41));
+        assert_eq!(jb.stats().late_dropped, 2);
+        assert_eq!(jb.pop(), frame(2));
+        assert_eq!(jb.pop(), frame(3));
+        assert_eq!(jb.pop(), Pop::Empty);
+    }
+
+    #[test]
+    fn silence_then_reprime() {
+        let clock = Clock(Instant::now());
+        let mut jb = JitterBuffer::new(JitterConfig::default());
+        push_all(&mut jb, &clock, 0, &[0, 1, 2, 3, 4]);
+        for s in 0..5 {
+            assert_eq!(jb.pop(), frame(s));
+        }
+        // Push-to-talk released: the buffer runs dry.
+        for _ in 0..50 {
+            assert_eq!(jb.pop(), Pop::Empty);
+        }
+        jb.push(5, pkt(5), clock.at(3000));
+        assert_eq!(jb.pop(), Pop::Empty, "re-priming");
+        jb.push(6, pkt(6), clock.at(3010));
+        assert_eq!(jb.pop(), frame(5));
+        jb.push(7, pkt(7), clock.at(3020));
+        assert_eq!(jb.pop(), frame(6));
+        let st = jb.stats();
+        assert_eq!((st.lost, st.late_dropped), (0, 0));
+        assert_eq!(st.delay_ms, 20, "the pause must not count as jitter");
+    }
+
+    #[test]
+    fn reprime_skips_packets_lost_during_silence() {
+        let clock = Clock(Instant::now());
+        let mut jb = JitterBuffer::new(JitterConfig::default());
+        push_all(&mut jb, &clock, 0, &[0, 1]);
+        assert_eq!(jb.pop(), frame(0));
+        assert_eq!(jb.pop(), frame(1));
+        assert_eq!(jb.pop(), Pop::Empty);
+        push_all(&mut jb, &clock, 2000, &[5, 4]);
+        assert_eq!(jb.pop(), frame(4));
+        assert_eq!(jb.pop(), frame(5));
+        assert_eq!(jb.stats().lost, 2);
+    }
+
+    #[test]
+    fn drift_drops_oldest() {
+        let clock = Clock(Instant::now());
+        let mut jb = JitterBuffer::new(JitterConfig::default());
+        // A burst of 11 packets all at once (target stays 2 since the burst
+        // carries no history yet).
+        for s in 0..11u16 {
+            jb.push(s, pkt(s), clock.at(0));
+        }
+        let target = (jb.stats().delay_ms / 10) as usize;
+        let keep = target + DRIFT_SLACK;
+        assert_eq!(jb.pop(), frame((11 - keep) as u16));
+        let st = jb.stats();
+        assert_eq!(st.late_dropped, (11 - keep) as u64);
+        assert_eq!(st.buffered, keep - 1);
+        assert_eq!(st.lost, 0);
+    }
+
+    #[test]
+    fn no_drift_drop_at_threshold() {
+        let clock = Clock(Instant::now());
+        let mut jb = JitterBuffer::new(JitterConfig::default());
+        push_all(&mut jb, &clock, 0, &[0, 1, 2, 3, 4]);
+        assert_eq!(jb.pop(), frame(0), "5 = target + 3 buffered is allowed");
+        assert_eq!(jb.stats().late_dropped, 0);
+    }
+
+    #[test]
+    fn target_adapts_to_jitter() {
+        let clock = Clock(Instant::now());
+        let cfg = JitterConfig::default();
+        let mut jb = JitterBuffer::new(cfg);
+        // Packets arrive in pairs every 20 ms, alternating 0 / 20 ms gaps
+        // (|D| = 10 ms per packet -> jitter -> 10 ms -> target 3 packets).
+        let mut t = 0;
+        for s in 0..400u16 {
+            jb.push(s, pkt(s), clock.at(t));
+            if s % 2 == 1 {
+                t += 20;
+            }
+            jb.pop();
+        }
+        assert_eq!(jb.stats().delay_ms, 30);
+        // Big jitter (packets in bursts of 10 every 100 ms): clamped to max.
+        for s in 400..2000u16 {
+            jb.push(s, pkt(s), clock.at(t));
+            if s % 10 == 9 {
+                t += 100;
+            }
+        }
+        let d = jb.stats().delay_ms;
+        assert!(d >= 40 && d <= cfg.max_delay_ms, "delay {d}");
+        // Smooth again: back to the minimum.
+        for s in 2000..2400u16 {
+            t += 10;
+            jb.push(s, pkt(s), clock.at(t));
+        }
+        assert_eq!(jb.stats().delay_ms, cfg.min_delay_ms);
+    }
+
+    #[test]
+    fn target_clamped_to_max() {
+        let clock = Clock(Instant::now());
+        let cfg = JitterConfig { frame_ms: 10, min_delay_ms: 20, max_delay_ms: 50 };
+        let mut jb = JitterBuffer::new(cfg);
+        let mut t = 0;
+        for s in 0..500u16 {
+            jb.push(s, pkt(s), clock.at(t));
+            if s % 10 == 9 {
+                t += 100;
+            }
+        }
+        assert_eq!(jb.stats().delay_ms, 50);
+    }
+
+    #[test]
+    fn sender_restart_resyncs() {
+        let clock = Clock(Instant::now());
+        let mut jb = JitterBuffer::new(JitterConfig::default());
+        for s in 1000..1100u16 {
+            jb.push(s, pkt(s), clock.at(10 * s as u64));
+            jb.pop();
+        }
+        let mut frames = 0;
+        for s in 0..200u16 {
+            jb.push(s, pkt(s), clock.at(20_000 + 10 * s as u64));
+            if matches!(jb.pop(), Pop::Frame(_)) {
+                frames += 1;
+            }
+        }
+        assert!(frames > 100, "only {frames} frames played after restart");
+    }
+
+    #[test]
+    fn big_jump_forward() {
+        let clock = Clock(Instant::now());
+        let mut jb = JitterBuffer::new(JitterConfig::default());
+        push_all(&mut jb, &clock, 0, &[0, 1, 2]);
+        assert_eq!(jb.pop(), frame(0));
+        push_all(&mut jb, &clock, 30, &[20_000, 20_001]);
+        assert_eq!(jb.pop(), frame(20_000));
+        assert_eq!(jb.pop(), frame(20_001));
+    }
+
+    #[test]
+    fn reset_forgets_everything() {
+        let clock = Clock(Instant::now());
+        let mut jb = JitterBuffer::new(JitterConfig::default());
+        push_all(&mut jb, &clock, 0, &[100, 101, 102]);
+        jb.pop();
+        jb.reset();
+        assert_eq!(jb.stats(), JitterStats { delay_ms: 20, ..Default::default() });
+        assert_eq!(jb.pop(), Pop::Empty);
+        push_all(&mut jb, &clock, 100, &[5, 6]);
+        assert_eq!(jb.pop(), frame(5));
+    }
+
+    #[test]
+    fn random_fuzz_never_panics_and_keeps_order() {
+        let mut rng = StdRng::seed_from_u64(9);
+        let clock = Clock(Instant::now());
+        let mut jb = JitterBuffer::new(JitterConfig::default());
+        let mut last: Option<u16> = None;
+        let mut seq = rng.random::<u16>();
+        let mut t = 0u64;
+        for _ in 0..100_000 {
+            match rng.random_range(0..10) {
+                0..=4 => {
+                    let s = seq.wrapping_add(rng.random_range(0..6)).wrapping_sub(3);
+                    if rng.random_bool(0.9) {
+                        seq = seq.wrapping_add(1);
+                    }
+                    t += rng.random_range(0..25);
+                    jb.push(s, pkt(s), clock.at(t));
+                }
+                5 => jb.push(rng.random(), vec![], clock.at(t)),
+                _ => match jb.pop() {
+                    Pop::Frame(p) if p.len() == 2 => {
+                        let s = u16::from_le_bytes([p[0], p[1]]);
+                        if let Some(l) = last {
+                            let d = s.wrapping_sub(l) as i16;
+                            assert!(d > 0 || d < -1000, "went backwards {l} -> {s}");
+                        }
+                        last = Some(s);
+                    }
+                    _ => {}
+                },
+            }
+            let st = jb.stats();
+            assert!(st.buffered <= jb.slots.len());
+            assert!((20..=200).contains(&st.delay_ms));
+        }
     }
 }
