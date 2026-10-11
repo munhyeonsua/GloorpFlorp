@@ -105,13 +105,13 @@ pub enum EncoderEvent {
 ///
 /// Start-up tries a short ladder of FFmpeg command lines, moving to the next
 /// if FFmpeg exits or produces no frame within a few seconds:
-/// 1. GPU all the way: ddagrab (D3D11) straight into NVENC; when scaling is
-///    needed, `scale_d3d11` (FFmpeg 8 can't create its frames on NVIDIA
-///    cards, so this step fails there). Skipped for a turned monitor. If a
-///    scaling step fails where step 2 then works, later starts in the same
-///    run of the app go straight to step 2. (A CUDA way, `hwdownload` +
-///    `hwupload_cuda` + `scale_cuda` / `transpose_cuda`, is built but off
-///    until it has run on a live desktop: `args::CUDA_TRANSFORM`.)
+/// 1. GPU: at native size on an upright monitor, ddagrab (D3D11) straight
+///    into NVENC. When the picture is scaled or turned, the CUDA way
+///    instead: `hwdownload`, `hwupload_cuda`, then `scale_cuda` /
+///    `transpose_cuda` (`args::CUDA_TRANSFORM`; `scale_d3d11` isn't tried,
+///    as FFmpeg 8 can't create its frames on NVIDIA cards). If this scaling
+///    step fails where step 2 then works, later starts in the same run of
+///    the app go straight to step 2.
 /// 2. Safe fallback: `hwdownload` to system memory, CPU scale/turn/convert
 ///    (BT.601, tagged), then NVENC.
 ///

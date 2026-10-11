@@ -116,19 +116,23 @@ Defaults: AV1 20 Mbps, HEVC 25 Mbps, H.264 35 Mbps at 1440p60; adjustable
 
 - **Turned monitors.** Desktop Duplication delivers a portrait monitor's
   picture unturned. `gf_sys::Monitor::rotation` (from DXGI) tells gf-video
-  to turn it upright on the CPU path (`transpose=clock` for 90°), so the
-  stream size is still `output_size(monitor_size(i))` (`monitor_size` is the
-  upright desktop size).
+  to turn it upright (`transpose_cuda=dir=clock` for 90°, or
+  `transpose=clock` on the CPU fallback), so the stream size is still
+  `output_size(monitor_size(i))` (`monitor_size` is the upright desktop
+  size).
 - **Scaling.** ddagrab → `scale_d3d11` fails on NVIDIA with FFmpeg 8 (error
   80070057, reproduced without capture), and mapping ddagrab's frames to CUDA
-  is impossible, so that step was removed. A scaled share falls back to CPU
-  scaling (~1.6–1.9 cores at 4K → 1440p); a GPU step that failed is skipped
-  for the rest of the app run. A CUDA path (`hwdownload` → `hwupload_cuda` →
-  `scale_cuda`/`transpose_cuda`) is built and tested with test frames but
-  off (`args::CUDA_TRANSFORM`) until a live-desktop run confirms it.
+  is impossible (`hwmap` error -40). So a scaled or turned share uses the
+  CUDA path (`args::CUDA_TRANSFORM`): `hwdownload` → `hwupload_cuda` →
+  `scale_cuda`/`transpose_cuda` → NVENC. On a live desktop (RTX 5080) it
+  starts in ~0.95 s with ~0.1–0.35 CPU cores, against ~1.6 s and 0.4–2.1
+  cores for CPU scaling/turning, which stays as the fallback. A GPU step
+  that failed is skipped for the rest of the app run.
 - **Frame pacing.** ddagrab spaces frames in ~15.6 ms steps (Windows timer),
-  so at 60 fps about every 10th gap is ~31 ms, and 120/144 fps only reach
-  ~74–89 fps. The UI marks 120 and 144 "experimental".
+  so at 60 fps there is often a ~31 ms gap every few frames (p95 ~30 ms, up
+  to ~54 ms on a still screen), and 120/144 fps only reach ~72–95 fps with
+  less bitrate per second than 60 fps. The UI marks 120 and 144
+  "experimental".
 - **Filler.** NVENC's CBR mode pads H.264 (72–78% of the bytes in a quiet
   picture). The FLV demuxer drops H.264 (NAL 12) and HEVC (NAL 38) filler
   and AV1 padding OBUs, so the wire carries only the picture.

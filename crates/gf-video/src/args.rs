@@ -35,10 +35,13 @@ impl Step {
     }
 }
 
-/// Whether to scale/turn with `GpuCuda`. It works on the RTX 5080 test PC
-/// with D3D11 test frames (same picture as the CPU way, ~1/15 of its CPU
-/// time), but hasn't run on a live desktop yet, so it stays off until then.
-pub(crate) const CUDA_TRANSFORM: bool = false;
+/// Whether to scale/turn with `GpuCuda` (instead of `scale_d3d11`, which
+/// fails on NVIDIA with FFmpeg 8, or the CPU). Checked on a live desktop on
+/// the RTX 5080 test PC: 4K -> 1440p and the turned monitor (scaled and
+/// native) come out right with ~0.1-0.3 CPU cores instead of 0.6-2.1 on the
+/// CPU way, and a scaled share starts ~0.6 s sooner (no failing
+/// `scale_d3d11` step). If CUDA fails, the ladder falls back to the CPU.
+pub(crate) const CUDA_TRANSFORM: bool = true;
 
 /// The GPU step that can scale/turn the picture, if any. `turn`: the
 /// monitor is turned (only CUDA can do that on the GPU).
@@ -416,6 +419,8 @@ pub(crate) fn advice(stderr: &str, codec: VideoCodec) -> String {
         "minimum required Nvidia driver",
         "Cannot load nvEncodeAPI",
         "Cannot load nvcuda",
+        "cuInit",
+        "CUDA_ERROR",
         "No capable devices found",
         "InitializeEncoder failed",
     ]) {
@@ -553,6 +558,43 @@ mod tests {
         assert_eq!(gpu_transform_step(true, false), None);
         assert_eq!(gpu_transform_step(false, true), cuda);
         assert_eq!(gpu_transform_step(true, true), cuda);
+    }
+
+    /// What ships: a scaled or turned share tries CUDA, then the CPU, and
+    /// never `scale_d3d11` (it fails on NVIDIA with FFmpeg 8); a native
+    /// upright share stays GPU-direct.
+    #[test]
+    fn shipped_ladders() {
+        let shipped = |screen: Screen, max_height| {
+            let transform = screen.needs_transform(max_height);
+            let gpu = gpu_transform_step(screen.turned(), CUDA_TRANSFORM);
+            ladder(false, transform, gpu)
+        };
+        let portrait = Screen {
+            width: 2160,
+            height: 3840,
+            rotation: 90,
+        };
+        let cuda_then_cpu = vec![Step::GpuCuda, Step::Cpu];
+        assert_eq!(shipped(upright(3840, 2160), Some(1440)), cuda_then_cpu);
+        assert_eq!(shipped(portrait, Some(1440)), cuda_then_cpu);
+        assert_eq!(shipped(portrait, None), cuda_then_cpu);
+        assert_eq!(
+            shipped(upright(3840, 2160), None),
+            vec![Step::GpuDirect, Step::Cpu]
+        );
+        for (screen, max_height) in [
+            (upright(3840, 2160), Some(1440)),
+            (upright(2560, 1440), Some(1080)),
+            (portrait, Some(1440)),
+            (portrait, None),
+        ] {
+            let st = settings(VideoCodec::Av1, max_height);
+            for step in shipped(screen, max_height) {
+                let j = joined(&encoder_args(step, &st, screen));
+                assert!(!j.contains("scale_d3d11"), "{step:?}: {j}");
+            }
+        }
     }
 
     #[test]
@@ -766,6 +808,11 @@ mod tests {
             VideoCodec::Av1,
         );
         assert!(nv.contains("NVIDIA") && nv.contains("AV1"));
+        let nv = advice(
+            "[AVHWDeviceContext @ 0x3] cuInit(0) failed -> CUDA_ERROR_NO_DEVICE: no CUDA-capable device is detected",
+            VideoCodec::Hevc,
+        );
+        assert!(nv.contains("Update your NVIDIA graphics driver"));
         let dd = advice(
             "[Parsed_ddagrab_0 @ 0x2] Desktop duplication access denied",
             VideoCodec::H264,
