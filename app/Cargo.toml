@@ -1,0 +1,27 @@
+[package]
+name = "gloorpflorp"
+description = "Private two-person screen sharing and voice chat over Tailscale"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "GloorpFlorp"
+path = "src/main.rs"
+
+[dependencies]
+gf-proto.workspace = true
+gf-net.workspace = true
+gf-video.workspace = true
+gf-audio.workspace = true
+gf-sys.workspace = true
+anyhow.workspace = true
+log.workspace = true
+crossbeam-channel.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+eframe.workspace = true
+egui.workspace = true
+directories.workspace = true
+simplelog.workspace = true

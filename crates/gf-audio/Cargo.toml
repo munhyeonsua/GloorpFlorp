@@ -1,0 +1,19 @@
+[package]
+name = "gf-audio"
+description = "Voice chat and game audio: capture, echo cancellation, Opus, jitter buffering, mixing, playback"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+gf-proto.workspace = true
+gf-sys.workspace = true
+anyhow.workspace = true
+log.workspace = true
+crossbeam-channel.workspace = true
+cpal.workspace = true
+opus.workspace = true
+sonora.workspace = true
+rubato.workspace = true
+rtrb.workspace = true

@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = ["crates/gf-proto", "crates/gf-net", "crates/gf-video", "crates/gf-audio", "crates/gf-sys", "app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+gf-proto = { path = "crates/gf-proto" }
+gf-net = { path = "crates/gf-net" }
+gf-video = { path = "crates/gf-video" }
+gf-audio = { path = "crates/gf-audio" }
+gf-sys = { path = "crates/gf-sys" }
+anyhow = "1"
+thiserror = "2"
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+serde_json = "1"
+postcard = { version = "1", default-features = false, features = ["use-std"] }
+crossbeam-channel = "0.5"
+rand = "0.9"
+if-addrs = "0.13"
+cpal = "0.18"
+opus = "0.4"
+sonora = "0.2"
+rubato = "5"
+rtrb = "0.3"
+wasapi = "0.25"
+windows = "0.62"
+eframe = "0.36"
+egui = "0.36"
+directories = "6"
+simplelog = "0.12"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+
+# Audio DSP and codecs are too slow unoptimized; keep debug builds usable.
+[profile.dev.package."*"]
+opt-level = 2
