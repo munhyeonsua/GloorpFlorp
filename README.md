@@ -233,6 +233,14 @@ Also:
 
 - **Mute**: your microphone sends nothing.
 - **Deafen**: you hear nothing from your friend (no voice, no game audio).
+- **Shortcut keys** for Mute and Deafen (not set at first): in the
+  "Shortcut keys" line under the two checkboxes, click the button after Mute
+  or Deafen, then press a keyboard key or mouse button. Each press switches
+  it on or off, also while the game is in focus or GloorpFlorp is minimized
+  (unless the game runs as administrator, like push-to-talk). **Clear**
+  removes the shortcut. The game still receives the key too, so pick one you
+  don't use in the game. A key can only do one thing: your push-to-talk key
+  (even while push-to-talk is off) or the other shortcut's key isn't taken.
 - **Volume**: separate sliders for your friend's voice and your friend's game
   audio.
 - **Microphone and speakers**: choose them under "Voice". "System default"
@@ -241,8 +249,9 @@ Also:
 - **Noise suppression, echo cancellation and automatic mic volume** are on by
   default. Leave them on unless you have a reason not to.
 
-Push-to-talk works by asking Windows whether the key is being held.
-GloorpFlorp doesn't hook into your keyboard or touch the game in any way.
+Push-to-talk and the shortcut keys work by asking Windows whether the key is
+being held. GloorpFlorp doesn't hook into your keyboard or touch the game in
+any way.
 
 ### Connection details
 
@@ -302,8 +311,8 @@ are going:
 | "Couldn't find FFmpeg", or the viewer never opens | GloorpFlorp can't find its `ffmpeg` or `mpv` folder. Extract the whole zip again and run `GloorpFlorp.exe` from the extracted folder. If your antivirus removed a file, restore it, then extract again. |
 | Your friend hears no game audio | Check that GloorpFlorp says "Sending game audio." (click **Start sending game audio**) and that the right program is chosen. Some games play sound from a different program than the one with the window: try **Everything except GloorpFlorp**. If you restarted the game, click **Start sending game audio** again. Ask your friend to check their game-audio volume slider and that they're not deafened. |
 | Your friend hears an echo of their own voice | You're probably on speakers: use a headset, or turn your speakers down and keep echo cancellation on. If you're also in a Discord call together, send only one program's game audio (see [Game audio](#game-audio)). |
-| Your friend can't hear you | Check that you're not muted, the right microphone is chosen, and the mic meter moves when you talk. With push-to-talk, hold the key while talking. In Windows Settings, under Privacy, Microphone, make sure desktop apps may use the microphone. |
-| Push-to-talk doesn't work while the game is running | If the game (or its launcher) runs as administrator, Windows hides its key presses from normal programs. Close GloorpFlorp, right-click `GloorpFlorp.exe` and choose **Run as administrator**. Or use **Voice activation** instead. |
+| Your friend can't hear you | Check that you're not muted (a Mute shortcut key switches it from anywhere), the right microphone is chosen, and the mic meter moves when you talk. With push-to-talk, hold the key while talking. In Windows Settings, under Privacy, Microphone, make sure desktop apps may use the microphone. |
+| Push-to-talk (or the Mute/Deafen shortcut keys) doesn't work while the game is running | If the game (or its launcher) runs as administrator, Windows hides its key presses from normal programs. Close GloorpFlorp, right-click `GloorpFlorp.exe` and choose **Run as administrator**. Or use **Voice activation** instead of push-to-talk. |
 
 ### The log file
 

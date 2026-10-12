@@ -46,8 +46,13 @@ pub enum Command {
     /// Start sending game audio from the source in the settings.
     StartGameAudio,
     StopGameAudio,
-    /// The settings changed (the engine saves them a moment later).
+    /// The settings changed (the engine saves them a moment later). Mute
+    /// and deafen in them are ignored: those change only with `SetMuted`,
+    /// `SetDeafened` and the shortcut keys, so an older copy can't undo a
+    /// shortcut.
     ApplySettings(Box<Settings>),
+    SetMuted(bool),
+    SetDeafened(bool),
     /// List monitors, audio devices and running programs again.
     RefreshLists,
     DismissError,
@@ -133,6 +138,10 @@ pub struct Snapshot {
     /// couldn't start at all (see `error`).
     pub audio_running: bool,
     pub audio: AudioStatus,
+    /// Mute and deafen as the engine has them. The checkboxes show these:
+    /// the shortcut keys change them without the window.
+    pub mic_muted: bool,
+    pub deafened: bool,
     /// The game-audio capture's problem, while game audio is still on.
     pub game_audio_note: Option<String>,
     /// Push-to-talk is on and a program running as administrator has (or

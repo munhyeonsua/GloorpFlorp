@@ -11,7 +11,8 @@ GPUs, connected over Tailscale. No servers, accounts, database or analytics.
 - Game audio: only the game's sound (or "everything except this app"), stereo,
   high quality. The sharer still hears their own game normally.
 - Voice: two-way, push-to-talk (global key, works in-game) / voice activity /
-  always on, noise suppression, echo cancellation, auto gain, mute, deafen,
+  always on, noise suppression, echo cancellation, auto gain, mute, deafen
+  (each with an optional global toggle key),
   separate volumes for friend's voice and friend's game audio.
 - Viewer: friend's screen opens in its own resizable window (fullscreen with
   `f` or double-click).
@@ -37,7 +38,7 @@ non-NVIDIA support, internet use without Tailscale.
 | Opus for both audio streams, 10 ms frames | Lowest delay; in-band FEC for loss. |
 | `sonora` (pure Rust WebRTC audio processing) | Echo cancellation (AEC3), noise suppression, AGC with no C++ build. |
 | WASAPI process loopback (`wasapi` crate) | Capture only the game, or everything except our own playback, so the friend never hears themselves echoed. |
-| `GetAsyncKeyState` polling for push-to-talk | Works while the game has focus, no hooks or injection (anti-cheat friendly). |
+| `GetAsyncKeyState` polling for push-to-talk and the mute/deafen keys | Works while the game has focus, no hooks or injection (anti-cheat friendly). The mute/deafen keys are polled every 10 ms on an engine-owned thread (the window may not draw while minimized); mute and deafen then belong to the engine, which the UI follows through `Snapshot` and changes with `SetMuted`/`SetDeafened`. |
 | egui (eframe) UI | Pure Rust, one small window. |
 | Settings as one JSON file | "No database" — just remembered preferences, stored locally. |
 | GitHub Actions builds a ready-to-run zip | The user never installs a compiler; FFmpeg and mpv are bundled in the zip. |

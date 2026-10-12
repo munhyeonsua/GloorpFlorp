@@ -27,12 +27,47 @@ const INFO: Color32 = Color32::from_rgb(140, 180, 230);
 const PTT_BLOCKED: &str = "The program in front runs as administrator, so Windows hides your \
                            push-to-talk key from GloorpFlorp. Run GloorpFlorp as administrator \
                            too, or use Voice activation.";
+const SHORTCUT_TIP: &str = "Click, then press the key or mouse button that switches this on and \
+                            off. Works while the game has focus or GloorpFlorp is minimized, \
+                            unless the game runs as administrator. The game still gets the key \
+                            too, so pick one you don't use in the game.";
 
-/// Push-to-talk key capture in progress.
+/// A key that can be bound with "click, then press a key".
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BindTarget {
+    PushToTalk,
+    Mute,
+    Deafen,
+}
+
+impl BindTarget {
+    const ALL: [BindTarget; 3] = [BindTarget::PushToTalk, BindTarget::Mute, BindTarget::Deafen];
+
+    fn label(self) -> &'static str {
+        match self {
+            BindTarget::PushToTalk => "Push-to-talk",
+            BindTarget::Mute => "Mute",
+            BindTarget::Deafen => "Deafen",
+        }
+    }
+
+    fn key(self, s: &Settings) -> Option<u32> {
+        match self {
+            BindTarget::PushToTalk => Some(s.audio.ptt_key),
+            BindTarget::Mute => s.mute_key,
+            BindTarget::Deafen => s.deafen_key,
+        }
+    }
+}
+
+/// Key capture in progress.
 struct KeyBinding {
+    target: BindTarget,
     /// Becomes true once no key is held, so a key that was already down
     /// (e.g. the one that clicked the button) isn't taken.
     armed: bool,
+    /// Why the last key pressed wasn't taken (another binding has it).
+    refused: Option<String>,
 }
 
 pub struct GloorpApp {
@@ -711,8 +746,6 @@ impl GloorpApp {
             .clone()
             .unwrap_or_else(|| "Your friend".into());
         let mut refresh = false;
-        let mut start_binding = false;
-        let mut cancel_binding = false;
         {
             let a = &mut self.settings.audio;
             Grid::new("devices").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
@@ -748,25 +781,15 @@ impl GloorpApp {
                 VoiceModeChoice::PushToTalk => {
                     ui.horizontal_wrapped(|ui| {
                         ui.label("Push-to-talk key:");
-                        if self.binding.is_some() {
-                            ui.label(
-                                RichText::new("Press a key or mouse button… (Esc cancels)")
-                                    .color(YELLOW),
-                            );
-                            if ui.button("Cancel").clicked() {
-                                cancel_binding = true;
-                            }
-                        } else if ui
-                            .button(gf_sys::keys::name(a.ptt_key))
-                            .on_hover_text(
-                                "Click, then press the key or mouse button to hold while talking. \
-                                 The side mouse buttons (Mouse 4 / Mouse 5) work well. The game \
-                                 still gets the key too, so pick one you don't use in the game.",
-                            )
-                            .clicked()
-                        {
-                            start_binding = true;
-                        }
+                        key_button(
+                            ui,
+                            &mut self.binding,
+                            BindTarget::PushToTalk,
+                            Some(a.ptt_key),
+                            "Click, then press the key or mouse button to hold while talking. \
+                             The side mouse buttons (Mouse 4 / Mouse 5) work well. The game \
+                             still gets the key too, so pick one you don't use in the game.",
+                        );
                     });
                     if snap.ptt_blocked {
                         ui.label(RichText::new(PTT_BLOCKED).color(ORANGE));
@@ -790,10 +813,37 @@ impl GloorpApp {
                 VoiceModeChoice::AlwaysOn => {}
             }
             ui.horizontal(|ui| {
-                ui.checkbox(&mut a.mic_muted, "Mute")
-                    .on_hover_text("Your microphone sends nothing.");
-                ui.checkbox(&mut a.deafened, "Deafen")
-                    .on_hover_text("You hear nothing from your friend (no voice, no game audio).");
+                if ui
+                    .checkbox(&mut a.mic_muted, "Mute")
+                    .on_hover_text("Your microphone sends nothing.")
+                    .changed()
+                {
+                    self.commands.push(Command::SetMuted(a.mic_muted));
+                }
+                if ui
+                    .checkbox(&mut a.deafened, "Deafen")
+                    .on_hover_text("You hear nothing from your friend (no voice, no game audio).")
+                    .changed()
+                {
+                    self.commands.push(Command::SetDeafened(a.deafened));
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Shortcut keys: Mute");
+                let (mute, deafen) = (self.settings.mute_key, self.settings.deafen_key);
+                if key_button(ui, &mut self.binding, BindTarget::Mute, mute, SHORTCUT_TIP) {
+                    self.settings.mute_key = None;
+                }
+                ui.label("Deafen");
+                if key_button(
+                    ui,
+                    &mut self.binding,
+                    BindTarget::Deafen,
+                    deafen,
+                    SHORTCUT_TIP,
+                ) {
+                    self.settings.deafen_key = None;
+                }
             });
             ui.horizontal(|ui| {
                 let label = ui.label("Friend's voice volume");
@@ -842,15 +892,10 @@ impl GloorpApp {
         if refresh {
             self.cmd(Command::RefreshLists);
         }
-        if start_binding {
-            self.binding = Some(KeyBinding { armed: false });
-        }
-        if cancel_binding {
-            self.binding = None;
-        }
     }
 
-    /// While binding the push-to-talk key: take the first key pressed.
+    /// While binding a key: take the first key pressed, unless another
+    /// binding has it.
     fn poll_key_binding(&mut self, ctx: &egui::Context) {
         let Some(b) = &mut self.binding else { return };
         const ESC: u32 = 0x1B;
@@ -862,8 +907,24 @@ impl GloorpApp {
             None => b.armed = true,
             Some(ESC) => self.binding = None,
             Some(vk) if b.armed => {
-                log::info!("push-to-talk key set to {}", gf_sys::keys::name(vk));
-                self.settings.audio.ptt_key = vk;
+                let s = &mut self.settings;
+                let name = gf_sys::keys::name(vk);
+                // shortcut: the push-to-talk key counts as taken even while
+                // push-to-talk is off (it's kept for when it's back on); free
+                // it then if people want that key for Mute or Deafen.
+                let taken = BindTarget::ALL
+                    .into_iter()
+                    .find(|&t| t != b.target && t.key(s) == Some(vk));
+                if let Some(other) = taken {
+                    b.refused = Some(format!("{name} is already the {} key.", other.label()));
+                    return;
+                }
+                log::info!("{} key set to {name}", b.target.label());
+                match b.target {
+                    BindTarget::PushToTalk => s.audio.ptt_key = vk,
+                    BindTarget::Mute => s.mute_key = Some(vk),
+                    BindTarget::Deafen => s.deafen_key = Some(vk),
+                }
                 self.binding = None;
             }
             Some(_) => {}
@@ -969,6 +1030,10 @@ impl GloorpApp {
 impl eframe::App for GloorpApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.snap = self.engine.snapshot();
+        // Mute and deafen belong to the engine (the shortcut keys change
+        // them there); the checkboxes send SetMuted / SetDeafened.
+        self.settings.audio.mic_muted = self.snap.mic_muted;
+        self.settings.audio.deafened = self.snap.deafened;
         self.poll_key_binding(ui.ctx());
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical()
@@ -990,6 +1055,8 @@ impl eframe::App for GloorpApp {
                     self.details(ui);
                 });
         });
+        self.sent.audio.mic_muted = self.settings.audio.mic_muted;
+        self.sent.audio.deafened = self.settings.audio.deafened;
         if self.settings != self.sent {
             self.sent = self.settings.clone();
             self.commands
@@ -1019,6 +1086,45 @@ impl eframe::App for GloorpApp {
         log::info!("window closed; shutting down");
         self.engine.shutdown(Duration::from_secs(3));
     }
+}
+
+/// The button for `target`'s key: click it, then press the key (see
+/// `poll_key_binding`); while binding, a prompt and Cancel instead.
+/// Mute and Deafen also get Clear: returns true when it was clicked.
+fn key_button(
+    ui: &mut Ui,
+    binding: &mut Option<KeyBinding>,
+    target: BindTarget,
+    key: Option<u32>,
+    tip: &str,
+) -> bool {
+    if let Some(b) = binding.as_ref().filter(|b| b.target == target) {
+        let prompt = match &b.refused {
+            Some(why) => format!("{why} Press another key… (Esc cancels)"),
+            None => "Press a key or mouse button… (Esc cancels)".to_string(),
+        };
+        ui.label(RichText::new(prompt).color(YELLOW));
+        if ui.button("Cancel").clicked() {
+            *binding = None;
+        }
+        return false;
+    }
+    let name = key.map_or_else(|| "Not set".to_string(), gf_sys::keys::name);
+    let r = ui.button(&name).on_hover_text(tip);
+    set_accessible_name(&r, &format!("{} key: {name}", target.label()));
+    if r.clicked() {
+        *binding = Some(KeyBinding {
+            target,
+            armed: false,
+            refused: None,
+        });
+    }
+    if target == BindTarget::PushToTalk || key.is_none() {
+        return false;
+    }
+    let r = ui.button("Clear").on_hover_text("Remove this shortcut.");
+    set_accessible_name(&r, &format!("Clear the {} key", target.label()));
+    r.clicked()
 }
 
 /// A small filled circle (the default fonts have no "●").

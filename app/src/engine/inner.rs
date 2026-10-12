@@ -5,7 +5,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{never, select, tick, Receiver, Sender};
+use crossbeam_channel::{never, select, tick, Receiver, Sender, TryRecvError};
 use gf_audio::{AudioEngine, AudioSettings, PacketSink};
 use gf_net::{Net, NetConfig, NetEvent, NetTx, Role};
 use gf_proto::room::{is_tailscale_ipv4, RoomCode};
@@ -42,6 +42,9 @@ const ELEVATED_CHECK: Duration = Duration::from_millis(500);
 /// How long the "runs as administrator" hint stays after that program
 /// lost focus.
 const ELEVATED_HINT_HOLD: Duration = Duration::from_secs(10);
+/// How often the mute and deafen shortcut keys are looked at: a quick tap
+/// (~30 ms) must not fit between two looks. One cheap system call per key.
+const HOTKEY_POLL: Duration = Duration::from_millis(10);
 
 const TAILSCALE_MISSING: &str = "Tailscale isn't running or isn't signed in on this PC. Open Tailscale, sign in, then click Host again.";
 const NO_AUDIO: &str = "Sound isn't working in GloorpFlorp right now, so game audio can't be sent. Restart GloorpFlorp, then try again.";
@@ -85,6 +88,8 @@ enum Internal {
         /// The running programs, when the audio thread looked them up.
         apps: Option<Vec<AudioApp>>,
     },
+    /// A shortcut key (mute or deafen) was pressed.
+    Hotkey(u32),
 }
 
 /// What to send as game audio, as chosen in the settings.
@@ -174,6 +179,47 @@ fn start_game_audio(
         audio.start_game_audio(source).map_err(|e| e.to_string()),
         apps,
     )
+}
+
+/// Watches the shortcut keys (`[mute, deafen]`, sent by the engine whenever
+/// they change) and reports each press. Its own thread: the engine only
+/// ticks every 100 ms, and the window doesn't draw while minimized. Waits
+/// without polling while no shortcut is set; ends with the engine.
+fn hotkey_thread(keys: Receiver<[Option<u32>; 2]>, tx: Sender<Internal>) {
+    let mut bound = [None; 2];
+    let mut held = [true; 2];
+    loop {
+        let update = if bound == [None; 2] {
+            keys.recv().map_err(|_| TryRecvError::Disconnected)
+        } else {
+            keys.try_recv()
+        };
+        match update {
+            Ok(k) => {
+                bound = k;
+                // A key held right now (e.g. the one just pressed to bind
+                // it) counts only after it has been released.
+                held = [true; 2];
+            }
+            Err(TryRecvError::Disconnected) => return,
+            Err(TryRecvError::Empty) => {}
+        }
+        for (key, held) in bound.iter().zip(&mut held) {
+            let Some(vk) = *key else { continue };
+            if press_edge(held, gf_sys::keys::is_down(vk)) && tx.send(Internal::Hotkey(vk)).is_err()
+            {
+                return;
+            }
+        }
+        std::thread::sleep(HOTKEY_POLL);
+    }
+}
+
+/// True once per press: the key is down now and was up at the last look.
+fn press_edge(held: &mut bool, down: bool) -> bool {
+    let pressed = down && !*held;
+    *held = down;
+    pressed
 }
 
 /// Drops `value` (stopping a child process, a session, ...) on a helper
@@ -290,6 +336,8 @@ struct Core {
     elevated_check_at: Instant,
     /// When an elevated program last had focus (with push-to-talk on).
     elevated_seen: Option<Instant>,
+    /// The shortcut keys for the hotkey thread.
+    hotkeys: Sender<[Option<u32>; 2]>,
 
     save_at: Option<Instant>,
     fps_at: Instant,
@@ -305,11 +353,22 @@ pub(super) fn run(
     shared: Arc<Mutex<Snapshot>>,
 ) {
     let (internal_tx, internal_rx) = crossbeam_channel::unbounded();
+    let (hotkeys, hotkeys_rx) = crossbeam_channel::unbounded();
+    let _ = hotkeys.send([settings.mute_key, settings.deafen_key]);
+    {
+        let tx = internal_tx.clone();
+        spawn_helper("hotkeys", move || hotkey_thread(hotkeys_rx, tx));
+    }
+    let snap = Snapshot {
+        mic_muted: settings.audio.mic_muted,
+        deafened: settings.audio.deafened,
+        ..Snapshot::default()
+    };
     let mut core = Core {
         settings,
         opts,
         shared,
-        snap: Snapshot::default(),
+        snap,
         urgent: true,
         internal_tx,
         tools: None,
@@ -341,6 +400,7 @@ pub(super) fn run(
         game_dead_since: None,
         elevated_check_at: Instant::now(),
         elevated_seen: None,
+        hotkeys,
         save_at: None,
         fps_at: Instant::now(),
         fps_sent: 0,
@@ -536,7 +596,13 @@ impl Core {
             Command::OpenViewer => self.open_viewer_cmd(),
             Command::StartGameAudio => self.start_game_audio(),
             Command::StopGameAudio => self.stop_game_audio(true),
-            Command::ApplySettings(s) => self.apply_settings(*s),
+            Command::ApplySettings(mut s) => {
+                s.audio.mic_muted = self.settings.audio.mic_muted;
+                s.audio.deafened = self.settings.audio.deafened;
+                self.apply_settings(*s);
+            }
+            Command::SetMuted(on) => self.set_mute(on, self.settings.audio.deafened),
+            Command::SetDeafened(on) => self.set_mute(self.settings.audio.mic_muted, on),
             Command::RefreshLists => self.refresh_lists(),
             Command::DismissError => self.snap.error = None,
             Command::Shutdown => {}
@@ -1129,6 +1195,12 @@ impl Core {
             return;
         }
         let old = std::mem::replace(&mut self.settings, new);
+        self.snap.mic_muted = self.settings.audio.mic_muted;
+        self.snap.deafened = self.settings.audio.deafened;
+        let keys = [self.settings.mute_key, self.settings.deafen_key];
+        if keys != [old.mute_key, old.deafen_key] {
+            let _ = self.hotkeys.send(keys);
+        }
         if old.audio != self.settings.audio {
             if let Some(a) = &self.audio {
                 a.set_settings(AudioSettings::from(&self.settings.audio));
@@ -1159,6 +1231,14 @@ impl Core {
             self.start_game_audio();
         }
         self.save_at = Some(Instant::now() + SAVE_DELAY);
+    }
+
+    /// Mute and deafen change only here (the checkboxes and the shortcut keys).
+    fn set_mute(&mut self, muted: bool, deafened: bool) {
+        let mut s = self.settings.clone();
+        s.audio.mic_muted = muted;
+        s.audio.deafened = deafened;
+        self.apply_settings(s);
     }
 
     // ------------------------------------------------------------ events
@@ -1272,6 +1352,16 @@ impl Core {
                 if gen == self.game_gen {
                     self.game_audio_started(result);
                 }
+            }
+            Internal::Hotkey(vk) => {
+                let s = &self.settings;
+                let muted = s.audio.mic_muted ^ (s.mute_key == Some(vk));
+                let deafened = s.audio.deafened ^ (s.deafen_key == Some(vk));
+                log::info!(
+                    "{} pressed: mute {muted}, deafen {deafened}",
+                    gf_sys::keys::name(vk)
+                );
+                self.set_mute(muted, deafened);
             }
         }
     }
@@ -1558,6 +1648,8 @@ fn command_name(cmd: &Command) -> &'static str {
         Command::StartGameAudio => "StartGameAudio",
         Command::StopGameAudio => "StopGameAudio",
         Command::ApplySettings(_) => "ApplySettings",
+        Command::SetMuted(_) => "SetMuted",
+        Command::SetDeafened(_) => "SetDeafened",
         Command::RefreshLists => "RefreshLists",
         Command::DismissError => "DismissError",
         Command::Shutdown => "Shutdown",
@@ -1609,5 +1701,23 @@ mod tests {
         assert!(p.frames.is_empty(), "the byte limit counts too");
         p.push(h264, frame(h264, true, 1));
         assert_eq!((p.frames.len(), p.bytes), (1, 1));
+    }
+
+    /// One toggle per press, none while held, and none for a key that was
+    /// already down when it was bound.
+    #[test]
+    fn a_shortcut_toggles_once_per_press() {
+        // One look every HOTKEY_POLL: down while being bound, released, a
+        // 30 ms tap, released, then held for a long time.
+        let looks = [
+            true, true, false, true, true, true, false, true, true, true, true, true,
+        ];
+        let mut held = true;
+        let presses: Vec<usize> = (0..looks.len())
+            .filter(|&i| press_edge(&mut held, looks[i]))
+            .collect();
+        assert_eq!(presses, [3, 7]);
+        // A 30 ms tap can't slip between two looks, even if one is late.
+        assert!(HOTKEY_POLL * 2 < Duration::from_millis(30));
     }
 }
