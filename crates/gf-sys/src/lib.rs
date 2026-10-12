@@ -13,7 +13,7 @@ pub use prio::{keep_audio_thread_priority, raise_audio_thread_priority, AudioThr
 
 use std::io::Read;
 use std::net::Ipv4Addr;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -265,7 +265,7 @@ fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Option<String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     hide_console_window(&mut cmd);
-    let mut child = cmd.spawn().ok()?;
+    let mut child = spawn_bound(&mut cmd).ok()?;
     let stdout = child.stdout.take()?;
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -299,14 +299,43 @@ fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Option<String> {
     String::from_utf8(out?).ok()
 }
 
-/// Ensures child processes (ffmpeg, mpv) die when this app exits or crashes.
-/// Windows: assigns the child to a job object with KILL_ON_JOB_CLOSE
-/// (created once, held for the life of the process). Elsewhere: no-op.
-pub fn bind_child_to_app_lifetime(child: &std::process::Child) {
+/// Set by `close_children`; spawning and tying a child happen under this
+/// lock, so a child starting at that moment can't escape.
+static CHILDREN_CLOSED: Mutex<bool> = Mutex::new(false);
+
+/// Starts `cmd` so the child (ffmpeg, mpv) dies when this app exits or
+/// crashes. Windows: assigns it to a job object with KILL_ON_JOB_CLOSE
+/// (created once, held for the life of the process). Refused once
+/// `close_children` has run.
+pub fn spawn_bound(cmd: &mut Command) -> std::io::Result<Child> {
+    let closed = CHILDREN_CLOSED.lock().unwrap_or_else(|e| e.into_inner());
+    if *closed {
+        return Err(std::io::Error::other("GloorpFlorp is closing"));
+    }
+    let child = cmd.spawn()?;
     #[cfg(windows)]
-    win::bind_child_to_app_lifetime(child);
-    #[cfg(not(windows))]
-    let _ = child;
+    win::bind_child_to_app_lifetime(&child);
+    Ok(child)
+}
+
+/// For closing the app: ends every child started with `spawn_bound` at
+/// once (Windows: the whole job, so all engines in this process lose
+/// theirs) and refuses new ones. Elsewhere it only refuses new ones.
+pub fn close_children() {
+    let mut closed = CHILDREN_CLOSED.lock().unwrap_or_else(|e| e.into_inner());
+    *closed = true;
+    #[cfg(windows)]
+    win::close_children();
+}
+
+/// Ends this process at once with `code`. Windows: skips the shutdown code
+/// in loaded libraries (drivers, audio), which can hang when it waits on a
+/// thread the normal exit already stopped.
+pub fn exit_now(code: i32) -> ! {
+    log::logger().flush();
+    #[cfg(windows)]
+    win::exit_now(code);
+    std::process::exit(code)
 }
 
 /// Windows: sets CREATE_NO_WINDOW so console programs (ffmpeg) don't flash a

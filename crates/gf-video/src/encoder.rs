@@ -96,13 +96,12 @@ fn spawn_attempt(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     gf_sys::hide_console_window(&mut cmd);
-    let mut child = cmd.spawn().map_err(|e| {
+    let mut child = gf_sys::spawn_bound(&mut cmd).map_err(|e| {
         anyhow::anyhow!(
             "Couldn't start FFmpeg ({e}). Extract the whole GloorpFlorp zip again, \
              then restart GloorpFlorp."
         )
     })?;
-    gf_sys::bind_child_to_app_lifetime(&child);
     let stderr = StderrTail::spawn("ffmpeg", child.stderr.take());
     let stdout = child.stdout.take();
     let tx = internal.clone();

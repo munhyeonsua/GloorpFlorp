@@ -15,7 +15,7 @@ agents that built the crates: `.claude/handoff/phase1-agent-reports.json` (proto
 | Part | State | Tests (owner's PC, FFmpeg + mpv on PATH) |
 |---|---|---|
 | `gf-proto`: room codes, wire format, FLV demuxer + viewer writer, jitter buffer | ✅ done | 58 unit + 7 FFmpeg stream tests pass |
-| `gf-sys`: monitors, game-audio capture (process loopback), push-to-talk keys, Tailscale IP, child-process job object | ✅ done | 23 pass |
+| `gf-sys`: monitors, game-audio capture (process loopback), push-to-talk keys, Tailscale IP, child-process job object | ✅ done | 23 + 1 pass |
 | `gf-net`: TCP+UDP session, handshake, reconnect, video queue, stats | ✅ done | 35 pass |
 | `gf-video`: FFmpeg encoder (ddagrab → NVENC → FLV), mpv viewer | ✅ done | 37 unit + 3 integration pass |
 | `.github/workflows/build.yml`, `packaging/`, `README.md` | ✅ done | actionlint clean; packaging script run end to end with the real FFmpeg zip |
@@ -428,6 +428,51 @@ shipped `Step::Cpu` arguments ran). Per frame rate, ranges over the 7 paths
 Scripts and evidence: `scratchpad/hwpace/` (`run1.ps1`, `matrix.ps1`,
 `motion.ps1`, `results.txt`, `motion.txt`, `ev/`); raw streams were
 deleted after decoding.
+
+## Closing the app (friend's report, 2026-10-12)
+
+The friend saw mpv in Alt+Tab and processes in the background after closing
+GloorpFlorp. mpv is in a kill-on-close job that only GloorpFlorp.exe holds,
+so it can only outlive the window while GloorpFlorp.exe hasn't finished
+exiting. Two ways that can happen: a normal exit stops our other threads
+mid-call and then runs shutdown code in the loaded libraries (graphics
+driver, audio), which can hang; and when the engine's shutdown took over
+3 s (some of its waits have no limit), nobody killed the children. It never
+happened in 74 test closes on this PC, only with simulated hangs (below). A
+process stuck in its exit can't even be ended with `taskkill /F` ("no
+running instance of the task").
+
+What changed:
+- `gf_sys::spawn_bound` starts every child (FFmpeg encoder and probes, mpv,
+  `tailscale`, `hostname`) and puts it in the job under one lock;
+  `gf_sys::close_children` (`TerminateJobObject`) ends them all and refuses
+  new ones, so a child starting at that moment can't escape. It is called in
+  `on_exit` after `Engine::shutdown`, whatever that returned; not in
+  `Engine::shutdown`, as the job is shared by the whole process (the
+  end-to-end test runs two engines in one).
+- After "GloorpFlorp closed", `main` ends the process with
+  `gf_sys::exit_now` (`TerminateProcess` on itself), skipping the libraries'
+  shutdown code. If the window's own teardown hangs, a watchdog started in
+  `on_exit` does the same after 5 s ("closing took over 5 s"). Settings are
+  saved first thing in the engine's shutdown (temp file + rename) and the
+  log file isn't buffered, so nothing is lost.
+- The engine closes the viewer before stopping the encoder.
+
+Live, two copies on 127.0.0.1 with the packaged FFmpeg and mpv (58 closes:
+idle, hosting, connected, sharing, viewer open, both sharing with viewers
+and game audio (also after 30 s), closing 0–350 ms after mpv appeared or
+0–900 ms after Start sharing, X button, SC_CLOSE, the taskbar's Close
+window, `taskkill /F`): GloorpFlorp.exe and all its children gone 0.1–0.6 s
+after the window closed (1.75 s once: the first start of a freshly copied
+folder, closed while the encoder check was starting FFmpeg), no window
+left; apart from `taskkill /F`, settings saved and the log ends with
+"GloorpFlorp closed". A throwaway build with test hooks: engine
+shutdown stuck → mpv and FFmpeg killed and the process gone 3.1–3.3 s after
+closing; exit stuck (a thread-local destructor that sleeps) → gone in
+0.4 s; window teardown stuck → children killed at once, process ended by
+the watchdog after 5.4 s. The same hooks on ace1f87 with the engine and the
+exit stuck gave the friend's report: the main window closed, mpv stayed in
+Alt+Tab, and GloorpFlorp.exe, FFmpeg and mpv kept running.
 
 ## What the finished crates need from `gf-audio` and `app`
 
