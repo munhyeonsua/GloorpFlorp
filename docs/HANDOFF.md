@@ -16,7 +16,7 @@ agents that built the crates: `.claude/handoff/phase1-agent-reports.json` (proto
 |---|---|---|
 | `gf-proto`: room codes, wire format, FLV demuxer + viewer writer, jitter buffer | ✅ done | 58 unit + 7 FFmpeg stream tests pass |
 | `gf-sys`: monitors, game-audio capture (process loopback), push-to-talk keys, Tailscale IP, child-process job object | ✅ done | 23 pass |
-| `gf-net`: TCP+UDP session, handshake, reconnect, video queue, stats | ✅ done | 35 pass |
+| `gf-net`: TCP+UDP session, handshake, reconnect, video queue, stats | ✅ done | 36 pass |
 | `gf-video`: FFmpeg encoder (ddagrab or one window's gfxcapture → NVENC → FLV), mpv viewer | ✅ done | 40 unit + 3 integration pass |
 | `.github/workflows/build.yml`, `packaging/`, `README.md` | ✅ done | actionlint clean; packaging script run end to end with the real FFmpeg zip |
 | `gf-audio`: mic, echo cancellation, Opus, jitter, mixing, playback, game audio | ✅ done | 48 pass |
@@ -471,8 +471,15 @@ under the screen saver), each measured here with the desktop visible:
   fails while the window is minimized), the engine keeps its share's latest
   keyframe group (`PendingFrames`, ≤300 frames / 16 MB) and sends it to a
   viewer that started watching once the encoder has sent nothing for 1 s
-  (`STILL_SHARE`). Never triggers on a monitor share (ddagrab always
-  delivers frames).
+  (`STILL_SHARE`), queued in one go with `NetTx::send_video_group`: sent
+  frame by frame, a group of more than 30 frames (gf-net's
+  `MAX_VIDEO_QUEUE`, ~0.5 s of motion at 60 fps) was thrown away by the
+  queue, keyframe and all. Never triggers on a monitor share (ddagrab
+  always delivers frames). A larger group isn't kept, so that viewer waits
+  until the window changes (a `shortcut:` in the engine).
+- **Settings changed while the window is minimized:** restarting the
+  encoder would fail (start refuses a minimized window) and end the share,
+  so the restart waits until the window is restored.
 
 Live, through the real `gf_video::Encoder` and two real engines (packaged
 FFmpeg N-127271; test window = a renamed copy of mpv playing `testsrc2`;
@@ -503,6 +510,15 @@ harness and scripts in `scratchpad/winshare/`):
   would stay black without the fix). Closing the window: the host's share
   stopped in 0.08 s with that message as the banner, and the friend's
   viewer closed. A monitor share right after: 60 fps.
+- **Group replay** (fix after review; a 60 fps window minimized 0.25, 1.4,
+  2.6 or 3.5 s after the share went live, the friend joins ~1.5 s later):
+  18, 84–89, 39 and 93 frames replayed, all received, 0 dropped; the
+  replay went out 0.03 s after the friend started watching. Before the fix
+  (reviewers' runs): 88 sent / 87 dropped / 1 received at 1.4 s (an old
+  picture), 41/41/0 at 2.6 s (black). Harness: `scratchpad/winshare-fix/e2e`.
+- **Bitrate changed while minimized** (same harness): the share stays
+  live; restored, the encoder restarted 0.7 s later at the new bitrate.
+  Before the fix the share ended with the "minimized" message.
 - The CPU and CUDA forms of the graph also run (180 frames at 60 fps,
   keyframes every 2 s).
 - **App:** the Share box (driven through UI Automation) lists the monitors
@@ -643,7 +659,15 @@ From the agents' reports (also check the code's doc comments):
   Ti. A program with several windows shares the one in front when sharing
   starts; a window resized to another shape is drawn top-left, not centred
   (gfxcapture's `scale_aspect`). At 144 fps it sends what the window
-  delivers (~115–140 fps here).
+  delivers (~115–140 fps here). When a burst of changes ends with two
+  frames in one 1/fps slot, the pacing drops the final picture and a still
+  window sends nothing to replace it: the friend sees a picture a frame or
+  two old until the window or the pointer over it moves (a 144 fps test
+  window that stops at 2.993: the last frame sent showed 2.965–2.979 at a
+  60 fps share). Windows' own limit (`max_framerate=fps`, no `select`)
+  dropped it too (3 of 3 runs at 30 and 60 fps,
+  `scratchpad/winshare-fix/lastframe-win.sh`); a fix needs pacing with a
+  timer, which FFmpeg's filters don't have.
 - **FFmpeg 8.0 or newer is required** for sharing the screen: the pacing
   filter uses `setpts=…:strip_fps=1`, an option FFmpeg 8.0 added (absent at
   n6.1.1, n7.0, n7.1). The zip ships BtbN's master build, so the app is

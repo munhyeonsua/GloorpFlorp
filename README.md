@@ -181,7 +181,11 @@ Good to know:
   than a monitor share. Things to know:
   - If the window is **minimized**, sharing can't start (restore it first).
     Minimizing it while sharing pauses the picture: your friend sees the
-    last picture until you restore it.
+    last picture until you restore it. Quality changes you make while it's
+    minimized apply once you restore it.
+  - When the window stops changing, your friend's picture can be a moment
+    behind yours (for example the last step of a scroll). Moving the pointer
+    over the window brings it up to date.
   - If you **close** the program, sharing stops and GloorpFlorp says so.
     Start the program again, then click **Start sharing**.
   - If you **resize** the window, the picture keeps its size for your friend;

@@ -129,6 +129,7 @@ pub(crate) struct EncoderInner {
     current: SharedChild,
     internal: Sender<Internal>,
     supervisor: Option<JoinHandle<()>>,
+    pub(crate) window: Option<u64>,
 }
 
 fn spawn_attempt(
@@ -325,6 +326,7 @@ impl EncoderInner {
                 current,
                 internal: internal_tx,
                 supervisor,
+                window: screen.window,
             },
             rx,
         ))

@@ -288,6 +288,13 @@ pub(crate) const WINDOW_CAPTURE_FPS: u32 = 1000;
 /// (not gfxcapture's [`WINDOW_CAPTURE_FPS`]). Quoted like [`pace_filter`].
 pub(crate) fn window_pace_filter(fps: u32) -> String {
     let fps = fps.max(1);
+    // shortcut: when a burst of changes ends with two frames in one slot,
+    // the final picture is dropped and a still window sends nothing to
+    // replace it, so the friend sees a picture a frame or two old until the
+    // window (or the pointer over it) moves again. Windows' own limit
+    // (`max_framerate=fps`) drops it too (checked on the test PC). Upgrade
+    // to pacing that sends the held frame when no newer one comes within a
+    // slot (FFmpeg's filters can't wait on a timer) if this bothers anyone.
     format!(
         "select='if(gte(floor(t*{fps}),ld(0)),st(0,floor(t*{fps})+1),0)',\
          setpts=floor(T*{fps})/{fps}/TB:strip_fps=1,settb=1/{fps}"

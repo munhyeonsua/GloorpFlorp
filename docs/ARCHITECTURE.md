@@ -160,11 +160,14 @@ Defaults: AV1 20 Mbps, HEVC 25 Mbps, H.264 35 Mbps at 1440p60; adjustable
   changes (no polling: ~0.02–0.14 cores, ~80–240 MB), so pacing is
   `args::window_pace_filter` (the slot rule without the half-frame rule),
   `max_framerate=1000`, and keyframes are also forced by time. Minimized:
-  `start` refuses; while sharing, nothing is sent. Closed: FFmpeg exits
-  with code 0 and the encoder says the window was closed. A still window
-  sends nothing, so the engine keeps its share's latest keyframe group and
-  sends it to a viewer that started watching after the share went still
-  for 1 s (`STILL_SHARE`). Numbers: HANDOFF.md, "Window sharing".
+  `start` refuses; while sharing, nothing is sent, and a settings change
+  waits until the window is restored (restarting would fail). Closed:
+  FFmpeg exits with code 0 and the encoder says the window was closed. A
+  still window sends nothing, so the engine keeps its share's latest
+  keyframe group (≤300 frames / 16 MB) and queues it in one go
+  (`NetTx::send_video_group`, past gf-net's 30-frame limit) for a viewer
+  that started watching after the share went still for 1 s
+  (`STILL_SHARE`). Numbers: HANDOFF.md, "Window sharing".
 - **Filler.** NVENC's CBR mode pads H.264 (72–78% of the bytes in a quiet
   picture). The FLV demuxer drops H.264 (NAL 12) and HEVC (NAL 38) filler
   and AV1 padding OBUs, so the wire carries only the picture.

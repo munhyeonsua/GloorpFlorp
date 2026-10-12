@@ -180,6 +180,11 @@ impl Encoder {
         Ok((Encoder { inner }, rx))
     }
 
+    /// The shared window (an HWND), for a window share.
+    pub fn window(&self) -> Option<u64> {
+        self.inner.window
+    }
+
     /// Kills FFmpeg and waits for it; the last event is `Stopped { error: None }`
     /// (unless the encoder had already stopped by itself).
     pub fn stop(&mut self) {

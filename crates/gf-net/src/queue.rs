@@ -44,6 +44,14 @@ impl VideoQueue {
         self.frames.push_back(frame);
     }
 
+    /// Replaces whatever is queued with `group` (a keyframe and the frames
+    /// after it), all of it even past `max`: pushed one by one, a group
+    /// longer than `max` would be thrown away, keyframe and all.
+    pub fn replace(&mut self, group: Vec<VideoFrame>) {
+        self.frames = group.into();
+        self.waiting_for_key = false;
+    }
+
     pub fn pop(&mut self) -> Option<VideoFrame> {
         self.frames.pop_front()
     }
@@ -127,6 +135,21 @@ mod tests {
         assert_eq!(q.dropped(), 2);
         q.push(frame(3, false));
         assert_eq!(drain(&mut q), vec![2, 3]);
+    }
+
+    #[test]
+    fn replaced_group_is_kept_past_the_limit() {
+        let mut q = VideoQueue::new(3);
+        for n in 0..4 {
+            q.push(frame(n, n == 0));
+        }
+        assert_eq!(q.dropped(), 4);
+        q.replace((10..20).map(|n| frame(n, n == 10)).collect());
+        assert_eq!(drain(&mut q), (10..20).collect::<Vec<_>>());
+        // No longer waiting for a keyframe: the group was one.
+        q.push(frame(20, false));
+        assert_eq!(drain(&mut q), vec![20]);
+        assert_eq!(q.dropped(), 4);
     }
 
     #[test]
