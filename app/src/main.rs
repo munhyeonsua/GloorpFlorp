@@ -25,16 +25,21 @@ fn main() {
         ..Default::default()
     };
     let dev = dev_overrides();
-    let result = eframe::run_native(
-        "GloorpFlorp",
-        options,
-        Box::new(move |cc| {
-            Ok(Box::new(ui::GloorpApp::new(
-                cc, settings, notice, path, dev,
-            )?))
-        }),
-    );
-    if let Err(e) = &result {
+    // winit re-raises a UI-thread panic after its loop ends; catch it so a
+    // crash still reaches the close-and-exit below (the panic hook logged it).
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        eframe::run_native(
+            "GloorpFlorp",
+            options,
+            Box::new(move |cc| {
+                Ok(Box::new(ui::GloorpApp::new(
+                    cc, settings, notice, path, dev,
+                )?))
+            }),
+        )
+    }));
+    let ok = matches!(result, Ok(Ok(())));
+    if let Ok(Err(e)) = &result {
         log::error!("the window couldn't be shown: {e}");
         let e = e.to_string();
         show_error(&format!(
@@ -50,7 +55,7 @@ fn main() {
     // file isn't buffered.
     gf_sys::close_children();
     log::info!("GloorpFlorp closed");
-    gf_sys::exit_now(if result.is_ok() { 0 } else { 1 })
+    gf_sys::exit_now(if ok { 0 } else { 1 })
 }
 
 /// A message box: without a window (and, in release builds, without a
