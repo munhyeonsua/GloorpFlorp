@@ -9,6 +9,7 @@ use eframe::egui::{
     self, Align, Color32, ComboBox, Grid, Layout, ProgressBar, RichText, Slider, TextEdit, Ui,
 };
 use gf_proto::VideoCodec;
+use gf_sys::AudioApp;
 use gloorpflorp::engine::{
     Command, Engine, EngineOptions, Phase, ShareState, Snapshot, NO_ENCODER,
 };
@@ -325,32 +326,74 @@ impl GloorpApp {
                 s.monitor = m.index;
             }
         }
+        let mut refresh = false;
         Grid::new("my-screen").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-            let label = ui.label("Monitor").on_hover_text("Which monitor to share. Everything on it is visible to your friend.");
-            let selected = monitor
-                .as_ref()
-                .map(|m| m.name.clone())
-                .unwrap_or_else(|| format!("Monitor {}", s.monitor + 1));
-            ComboBox::from_id_salt("monitor")
-                .selected_text(selected)
-                .width(240.0)
-                .show_ui(ui, |ui| {
-                    for m in &snap.monitors {
-                        ui.selectable_value(&mut s.monitor, m.index, &m.name);
-                    }
-                    if snap.monitors.is_empty() {
-                        ui.label("No monitors found");
-                    }
-                })
-                .response
-                .labelled_by(label.id);
+            let label = ui.label("Share").on_hover_text(
+                "A whole monitor: your friend sees everything on it. Or only one program's \
+                 window: your friend sees just that window, even when other windows cover it, \
+                 and never your other windows, notifications or popups. If you minimize that \
+                 window, your friend sees its last picture until you restore it; if you close \
+                 it, sharing stops. Games in exclusive fullscreen can't be shared as one \
+                 window: switch them to borderless windowed mode, or share the monitor.",
+            );
+            let selected = match &s.share_app {
+                Some(exe) if snap.audio_apps.iter().any(|a| a.exe.eq_ignore_ascii_case(exe)) => {
+                    format!("Only one program: {exe}")
+                }
+                Some(exe) => format!("Only one program: {exe} (not running)"),
+                None => monitor
+                    .as_ref()
+                    .map(|m| m.name.clone())
+                    .unwrap_or_else(|| format!("Monitor {}", s.monitor + 1)),
+            };
+            ui.horizontal(|ui| {
+                ComboBox::from_id_salt("monitor")
+                    .selected_text(selected)
+                    .width(240.0)
+                    .show_ui(ui, |ui| {
+                        for m in &snap.monitors {
+                            let picked = s.share_app.is_none() && s.monitor == m.index;
+                            if ui.selectable_label(picked, &m.name).clicked() {
+                                s.monitor = m.index;
+                                s.share_app = None;
+                            }
+                        }
+                        if snap.monitors.is_empty() {
+                            ui.label("No monitors found");
+                        }
+                        ui.separator();
+                        for app in programs(&snap.audio_apps) {
+                            let picked = s
+                                .share_app
+                                .as_ref()
+                                .is_some_and(|e| e.eq_ignore_ascii_case(&app.exe));
+                            let label = format!("Only one program: {}", program_label(app));
+                            if ui.selectable_label(picked, label).clicked() {
+                                s.share_app = Some(app.exe.clone());
+                            }
+                        }
+                    })
+                    .response
+                    .labelled_by(label.id);
+                if ui
+                    .button("Refresh")
+                    .on_hover_text("Look for monitors and running programs again.")
+                    .clicked()
+                {
+                    refresh = true;
+                }
+            });
             ui.end_row();
 
             let label = ui.label("Resolution").on_hover_text(
                 "Your screen is scaled down to this height if it is bigger. \
                  Lower needs less upload speed.",
             );
-            let native = monitor.as_ref().map(|m| (m.width, m.height));
+            // A window's size can change, so it isn't shown.
+            let native = monitor
+                .as_ref()
+                .filter(|_| s.share_app.is_none())
+                .map(|m| (m.width, m.height));
             let height_label = |h: Option<u32>| match (h, native) {
                 (None, Some((w, hh))) => format!("Native ({w}×{hh})"),
                 (None, None) => "Native".to_string(),
@@ -489,7 +532,8 @@ impl GloorpApp {
                         egui::Button::new(RichText::new("Start sharing").size(16.0)),
                     )
                     .on_hover_text(
-                        "Show your whole monitor to your friend. You can start before they join.",
+                        "Show what you chose under Share to your friend. You can start before \
+                         they join.",
                     )
                     .on_disabled_hover_text(why_not);
                 if r.clicked() {
@@ -522,6 +566,9 @@ impl GloorpApp {
             ui.label(
                 RichText::new("Changes to these settings restart sharing after a moment.").weak(),
             );
+        }
+        if refresh {
+            self.commands.push(Command::RefreshLists);
         }
     }
 
@@ -569,19 +616,9 @@ impl GloorpApp {
                 .selected_text(selected)
                 .width(190.0)
                 .show_ui(ui, |ui| {
-                    let mut seen = Vec::new();
-                    for app in &snap.audio_apps {
-                        if seen.contains(&app.exe.to_lowercase()) {
-                            continue;
-                        }
-                        seen.push(app.exe.to_lowercase());
-                        let label = if app.title.is_empty() {
-                            app.exe.clone()
-                        } else {
-                            format!("{} - {}", app.exe, shorten(&app.title, 40))
-                        };
+                    for app in programs(&snap.audio_apps) {
                         let picked = current.eq_ignore_ascii_case(&app.exe);
-                        if ui.selectable_label(picked, label).clicked() {
+                        if ui.selectable_label(picked, program_label(app)).clicked() {
                             s.game_audio = GameAudioMode::App {
                                 exe: app.exe.clone(),
                             };
@@ -1138,6 +1175,28 @@ fn accept_set_value(r: &egui::Response, text: &mut String, max_chars: usize) {
     if let Some(v) = new {
         *text = v.chars().take(max_chars).collect();
         r.ctx.request_repaint();
+    }
+}
+
+/// One entry per program (the first of several processes with one exe,
+/// which is also the one game audio and sharing look up).
+fn programs(apps: &[AudioApp]) -> Vec<&AudioApp> {
+    let mut seen = Vec::new();
+    apps.iter()
+        .filter(|a| {
+            let exe = a.exe.to_lowercase();
+            let new = !seen.contains(&exe);
+            seen.push(exe);
+            new
+        })
+        .collect()
+}
+
+fn program_label(app: &AudioApp) -> String {
+    if app.title.is_empty() {
+        app.exe.clone()
+    } else {
+        format!("{} - {}", app.exe, shorten(&app.title, 40))
     }
 }
 

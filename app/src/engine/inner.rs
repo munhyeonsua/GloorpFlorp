@@ -36,6 +36,10 @@ const GAME_DEAD_AFTER: Duration = Duration::from_secs(1);
 /// itself keeps while mpv starts).
 const PENDING_FRAMES: usize = 300;
 const PENDING_BYTES: usize = 16 << 20;
+/// My share sent no frame for this long: the picture is still (a shared
+/// window only sends frames when it changes), so a new viewer gets the
+/// latest picture instead of waiting for a keyframe that won't come.
+const STILL_SHARE: Duration = Duration::from_secs(1);
 /// How often to check whether an elevated program has focus (a few cheap
 /// system calls; only with push-to-talk).
 const ELEVATED_CHECK: Duration = Duration::from_millis(500);
@@ -187,9 +191,10 @@ fn dispose<T: Send + 'static>(what: &str, value: T) {
     }
 }
 
-/// Video that arrives while the viewer starts, from the latest keyframe on.
-/// The new viewer gets it once it runs, so it can start at the opening
-/// keyframe instead of waiting for the next one.
+/// Video from the latest keyframe on: what arrives while the viewer starts
+/// (the new viewer gets it once it runs, so it can start at the opening
+/// keyframe instead of waiting for the next one), and my share's latest
+/// picture (see `STILL_SHARE`).
 #[derive(Default)]
 struct PendingFrames {
     frames: Vec<VideoFrame>,
@@ -269,6 +274,9 @@ struct Core {
     need_keyframe: bool,
     /// The friend was told `ShareStarted` (and not yet `ShareStopped`).
     share_announced: bool,
+    /// My share's latest picture, and when the encoder last sent a frame.
+    share_latest: PendingFrames,
+    last_frame_at: Option<Instant>,
 
     viewer: Option<Viewer>,
     /// What the open viewer shows, and when it opened.
@@ -332,6 +340,8 @@ pub(super) fn run(
         share_restart_at: None,
         need_keyframe: true,
         share_announced: false,
+        share_latest: PendingFrames::default(),
+        last_frame_at: None,
         viewer: None,
         viewer_for: None,
         viewer_starting: None,
@@ -725,6 +735,7 @@ impl Core {
             max_height: s.max_height,
             bitrate_kbps: s.bitrate_kbps(codec),
             keyframe_interval: s.keyframe_interval(),
+            window_exe: s.share_app.clone(),
         })
     }
 
@@ -759,8 +770,11 @@ impl Core {
         self.enc_gen += 1;
         let gen = self.enc_gen;
         log::info!(
-            "starting to share monitor {} ({} {} kbps, {} fps, max height {:?})",
-            es.monitor,
+            "starting to share {} ({} {} kbps, {} fps, max height {:?})",
+            match &es.window_exe {
+                Some(exe) => format!("{exe}'s window"),
+                None => format!("monitor {}", es.monitor),
+            },
             es.codec.label(),
             es.bitrate_kbps,
             es.fps,
@@ -804,6 +818,8 @@ impl Core {
         }
         self.enc_settings = None;
         self.share_restart_at = None;
+        self.share_latest.clear();
+        self.last_frame_at = None;
         self.snap.my_share = ShareState::Off;
         self.snap.frames_sent = 0;
         self.snap.send_fps = 0.0;
@@ -856,7 +872,11 @@ impl Core {
                 self.urgent = true;
                 self.announce_share(info);
             }
-            EncoderEvent::Frame(frame) => self.send_frame(frame),
+            EncoderEvent::Frame(frame) => {
+                self.last_frame_at = Some(Instant::now());
+                self.share_latest.push(frame.codec, frame.clone());
+                self.send_frame(frame);
+            }
             EncoderEvent::Stopped { error } => {
                 self.stop_sharing(true);
                 if let Some(e) = error {
@@ -1147,7 +1167,8 @@ impl Core {
                 self.settings.fps,
                 self.settings.codec,
                 self.settings.bitrate_mbps,
-            ) || old.keyframe_secs != self.settings.keyframe_secs;
+            ) || old.keyframe_secs != self.settings.keyframe_secs
+                || old.share_app != self.settings.share_app;
             if changed {
                 self.share_restart_at = Some(Instant::now() + RESTART_DELAY);
             }
@@ -1486,6 +1507,18 @@ impl Core {
             self.fps_sent = self.snap.frames_sent;
             self.fps_recv = self.snap.frames_received;
             self.fps_at = now;
+        }
+        if self.need_keyframe
+            && self.snap.peer_watching
+            && !self.share_latest.frames.is_empty()
+            && self
+                .last_frame_at
+                .is_some_and(|t| now.duration_since(t) >= STILL_SHARE)
+        {
+            log::debug!("my share is still; sending the friend's new viewer its latest picture");
+            for f in self.share_latest.frames.clone() {
+                self.send_frame(f);
+            }
         }
         if self.share_restart_at.is_some_and(|t| now >= t) {
             self.restart_sharing();

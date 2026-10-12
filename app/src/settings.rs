@@ -182,6 +182,9 @@ pub struct Settings {
     pub port: u16,
     /// `gf_sys::Monitor::index` of the monitor to share.
     pub monitor: u32,
+    /// Share only this program's window instead of the monitor (exe name,
+    /// looked up among the running programs when sharing starts).
+    pub share_app: Option<String>,
     /// Scale the shared screen down to this height (`None` = native).
     pub max_height: Option<u32>,
     pub fps: u32,
@@ -204,6 +207,7 @@ impl Default for Settings {
             name: default_name(),
             port: gf_proto::DEFAULT_PORT,
             monitor: 0,
+            share_app: None,
             max_height: Some(1440),
             fps: 60,
             codec: CodecChoice::Auto,
@@ -250,6 +254,9 @@ impl Settings {
         }
         if self.port == 0 {
             self.port = gf_proto::DEFAULT_PORT;
+        }
+        if self.share_app.as_ref().is_some_and(|e| e.trim().is_empty()) {
+            self.share_app = None;
         }
         if !FPS_CHOICES.contains(&self.fps) {
             self.fps = 60;
@@ -370,6 +377,7 @@ mod tests {
             name: "Alex".into(),
             port: 47900,
             monitor: 1,
+            share_app: Some("mpv.exe".into()),
             max_height: Some(1080),
             fps: 144,
             codec: CodecChoice::Hevc,
@@ -441,7 +449,7 @@ mod tests {
         std::fs::write(
             &path,
             r#"{ "fps": 59, "bitrate_mbps": 500, "keyframe_secs": -3,
-                 "port": 0, "name": "  ", "unknown_field": 1,
+                 "port": 0, "name": "  ", "unknown_field": 1, "share_app": " ",
                  "audio": { "voice_volume": 9.0, "vad_sensitivity": -1 } }"#,
         )
         .unwrap();
@@ -457,6 +465,7 @@ mod tests {
         assert_eq!(s.audio.vad_sensitivity, 0.0);
         assert_eq!(s.audio.game_volume, d.audio.game_volume);
         assert_eq!(s.max_height, Some(1440));
+        assert_eq!(s.share_app, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -7,6 +7,7 @@ GPUs, connected over Tailscale. No servers, accounts, database or analytics.
 
 - Share a whole monitor at up to 1440p, 60 fps (or more), NVENC encoded
   (AV1 when the sender's GPU can encode it, else HEVC, else H.264), low delay.
+  Or only one program's window (picked like the game-audio program).
 - Either person can share; both can share at the same time.
 - Game audio: only the game's sound (or "everything except this app"), stereo,
   high quality. The sharer still hears their own game normally.
@@ -147,6 +148,23 @@ Defaults: AV1 20 Mbps, HEVC 25 Mbps, H.264 35 Mbps at 1440p60; adjustable
   CBR bitrate at 0.92–0.99× of the target at 60/120/144 with a moving
   picture. Cost: ~0.6–1.3 more CPU cores while sharing on the GPU paths
   (polling); see HANDOFF.md for the numbers.
+- **One program's window** (`EncoderSettings::window_exe`, the setting
+  `share_app`): FFmpeg's `gfxcapture` (Windows Graphics Capture, FFmpeg 8)
+  with `hwnd=` the program's front-most window from
+  `gf_sys::list_audio_apps` (looked up when sharing starts, on the encoder's
+  start thread). Only that window's pixels, also while covered; no yellow
+  border (`display_border=0`). The size is fixed at start
+  (`args::window_output_size` of the window's inside) and gfxcapture
+  scales the window into it, so no step scales or turns, and the ladder is
+  GPU-direct then CPU. Windows hands over a frame only when the window
+  changes (no polling: ~0.02–0.14 cores, ~80–240 MB), so pacing is
+  `args::window_pace_filter` (the slot rule without the half-frame rule),
+  `max_framerate=1000`, and keyframes are also forced by time. Minimized:
+  `start` refuses; while sharing, nothing is sent. Closed: FFmpeg exits
+  with code 0 and the encoder says the window was closed. A still window
+  sends nothing, so the engine keeps its share's latest keyframe group and
+  sends it to a viewer that started watching after the share went still
+  for 1 s (`STILL_SHARE`). Numbers: HANDOFF.md, "Window sharing".
 - **Filler.** NVENC's CBR mode pads H.264 (72–78% of the bytes in a quiet
   picture). The FLV demuxer drops H.264 (NAL 12) and HEVC (NAL 38) filler
   and AV1 padding OBUs, so the wire carries only the picture.

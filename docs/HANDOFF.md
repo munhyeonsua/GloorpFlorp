@@ -17,7 +17,7 @@ agents that built the crates: `.claude/handoff/phase1-agent-reports.json` (proto
 | `gf-proto`: room codes, wire format, FLV demuxer + viewer writer, jitter buffer | ✅ done | 58 unit + 7 FFmpeg stream tests pass |
 | `gf-sys`: monitors, game-audio capture (process loopback), push-to-talk keys, Tailscale IP, child-process job object | ✅ done | 23 pass |
 | `gf-net`: TCP+UDP session, handshake, reconnect, video queue, stats | ✅ done | 35 pass |
-| `gf-video`: FFmpeg encoder (ddagrab → NVENC → FLV), mpv viewer | ✅ done | 37 unit + 3 integration pass |
+| `gf-video`: FFmpeg encoder (ddagrab or one window's gfxcapture → NVENC → FLV), mpv viewer | ✅ done | 40 unit + 3 integration pass |
 | `.github/workflows/build.yml`, `packaging/`, `README.md` | ✅ done | actionlint clean; packaging script run end to end with the real FFmpeg zip |
 | `gf-audio`: mic, echo cancellation, Opus, jitter, mixing, playback, game audio | ✅ done | 48 pass |
 | `app`: engine, settings, logging, egui UI, end-to-end test | ✅ done | 7 + 2 (UI) unit + 4 end-to-end pass |
@@ -429,6 +429,95 @@ Scripts and evidence: `scratchpad/hwpace/` (`run1.ps1`, `matrix.ps1`,
 `motion.ps1`, `results.txt`, `motion.txt`, `ev/`); raw streams were
 deleted after decoding.
 
+## Window sharing (one program; RTX 5080, 2026-10-12)
+
+Owner's ask #4. **Share** in "Your screen" lists the monitors, then "Only
+one program: exe - title" (the game-audio program list,
+`gf_sys::list_audio_apps`, which now also returns each program's window as
+`AudioApp::hwnd`). The setting is `share_app` (exe name; missing or `null`
+= the monitor, so old settings files load). Starting a share looks the exe
+up again on the encoder's start thread and captures its front-most window
+with FFmpeg's `gfxcapture` (Windows Graphics Capture):
+
+```
+-f lavfi -i gfxcapture=hwnd=0x…:max_framerate=1000:capture_cursor=1:display_border=0:width=W:height=H:resize_mode=scale_aspect:scale_mode=bicubic
+-vf select='if(gte(floor(t*F),ld(0)),st(0,floor(t*F)+1),0)',setpts=floor(T*F)/F/TB:strip_fps=1,settb=1/F   (+ hwdownload,… on the CPU step)
+-fps_mode vfr -c:v *_nvenc … -g G … -force_key_frames expr:isnan(prev_forced_t)+gte(t,prev_forced_t+G/F) -forced-idr 1
+```
+
+W×H is `args::window_output_size`: the window's inside at start, scaled to
+the Resolution cap, even, at least 256×144 (AV1 NVENC refused 146×50; HEVC
+and H.264 128×72). Monitor shares' arguments are unchanged (their tests
+pass as before). Ladder: GPU-direct, then CPU; no CUDA step (gfxcapture
+scales by itself; the research measured 624 MB with CUDA against 222 MB).
+
+Changed from the research's recommendation (`scratchpad/gfxcap`, measured
+under the screen saver), each measured here with the desktop visible:
+- **`max_framerate=1000` + slot timing instead of `max_framerate=fps` + a
+  cap `select`.** This desktop stamps window frames on a 1/240 s grid
+  (monitor at 144 Hz), and Windows' own limit drops frames that come one
+  step early. Through NVENC (AV1 20 Mbps, 7 s, 2 runs each), research way
+  / shipped: 144 fps window at 60 fps 59.1–59.3 / 60.04–60.07; 60 fps
+  window at 60 58.7–59.4 / 59.94–60.00; at 120 109.7–111.0 / 116.5–119.4;
+  at 144 115.9–119.0 / 114.4–141.5 (the window itself delivered ~140 fps).
+  Bitrate shipped 0.96–1.00× (research way 0.81–0.95×). Cost: 0.03–0.14 CPU
+  cores (0.02–0.07), GPU 3D ~2% (~1%), same memory.
+- **Keyframes by `prev_forced_t`, not `n_forced*N`:** real FFmpeg (libx264,
+  30 fps, 5 s pause) gave keyframes at frames 0, 30 against 0, 30, 31, 32
+  (a burst after every pause). `-forced-idr 1` for AV1 too (av1_nvenc
+  ignores forced keyframes without it).
+- **Still windows:** a still window sends nothing, so a new viewer would
+  wait forever for a keyframe. Instead of restarting the encoder (which
+  fails while the window is minimized), the engine keeps its share's latest
+  keyframe group (`PendingFrames`, ≤300 frames / 16 MB) and sends it to a
+  viewer that started watching once the encoder has sent nothing for 1 s
+  (`STILL_SHARE`). Never triggers on a monitor share (ddagrab always
+  delivers frames).
+
+Live, through the real `gf_video::Encoder` and two real engines (packaged
+FFmpeg N-127271; test window = a renamed copy of mpv playing `testsrc2`;
+harness and scripts in `scratchpad/winshare/`):
+- **Start:** `Started` 0.23–0.27 s after `Encoder::start` (once 0.74 s);
+  FFmpeg 0.02–0.11 cores, 79–92 MB at 1280×720, 238 MB for a near-4K window
+  shared at 1440p.
+- **Rates** (shipped graph): 60 → 60.00 fps (gap sd 0.4–0.5 ms on a smooth
+  window), 30 → 30.07, 120 → 119.97 at 1.00× bitrate, 144 → 115–141
+  (limited by what the window delivers). Alternating all three codecs on
+  one window: 59.5–60.05 fps each. In the runs that opened a fresh 60 fps
+  window per codec, HEVC and H.264 came out at 52–54 fps twice: that was the
+  test window's own cadence (60 fps mpv on a 144 Hz screen), as the
+  research also saw.
+- **Window events** (AV1 60 fps, 720p): resized to 1600×900, 800×450,
+  1000×800: 60.00 fps throughout and the stream stays 1280×720 (767 frames
+  decoded, 0 errors; a differently shaped window sits top-left with black
+  on the right or bottom). Minimized 3 s: 0 frames, FFmpeg keeps running;
+  restored: a keyframe at once, then 60 fps. Closed (WM_CLOSE): `Stopped`
+  0.11 s later with "<exe>'s window was closed, so sharing stopped. …".
+  Start is refused with plain messages when the program isn't running or
+  its window is minimized.
+- **Still window:** a paused window sent 1 frame in 8 s. Moving the pointer
+  over it sends frames, and the pointer is drawn (`capture_cursor=1`). No
+  yellow border around the shared window (checked on the desktop).
+- **Two engines** on 127.0.0.1 with a paused window: the friend's viewer
+  got the picture 1.5 s after it started watching (17 frames replayed; it
+  would stay black without the fix). Closing the window: the host's share
+  stopped in 0.08 s with that message as the banner, and the friend's
+  viewer closed. A monitor share right after: 60 fps.
+- The CPU and CUDA forms of the graph also run (180 frames at 60 fps,
+  keyframes every 2 s).
+- **App:** the Share box (driven through UI Automation) lists the monitors
+  and programs; picking one saves `"share_app": "<exe>"`, and it is still
+  picked after a restart; the owner's old settings.json (no `share_app`)
+  loaded. `%APPDATA%\GloorpFlorp` was backed up first and restored byte for
+  byte.
+
+Not verified: a real game (exclusive fullscreen should give no picture,
+then "No picture came from <exe>'s window…" after both ladder steps' 5 s;
+borderless should work), an elevated (admin) window, the friend's 3070 Ti
+and its Windows version (older Windows only warns when it can't hide the
+border or set the pointer option), a monitor with display scaling other
+than the test PC's.
+
 ## What the finished crates need from `gf-audio` and `app`
 
 From the agents' reports (also check the code's doc comments):
@@ -466,7 +555,8 @@ From the agents' reports (also check the code's doc comments):
   runner needs `GLOORP_FAKE_VIDEO=1` and ffmpeg on PATH, or must skip video.
 - UI labels the README uses (keep them, or update README.md and
   `packaging/start-here.txt`): **Host**, **Join**, **Start sharing**,
-  **Stop sharing**, **Open viewer**, "Everything except GloorpFlorp",
+  **Stop sharing**, **Open viewer**, **Share** (monitor or "Only one
+  program" for video), **Refresh**, "Everything except GloorpFlorp",
   "Only one program", **Push-to-talk**, **Voice activation**, **Always on**,
   **Mute**, **Deafen**, connection details (Ping, Bitrates, Dropped frames,
   Audio loss). Log file at `%APPDATA%\GloorpFlorp\log.txt`. The README says
@@ -548,6 +638,12 @@ From the agents' reports (also check the code's doc comments):
   Windows never activates capture, `start()` gives up after 10 s and leaves
   a stuck thread (logged).
 - `list_monitors` only lists adapter 0's outputs (what ddagrab uses).
+- **Window sharing** has only run on the RTX 5080 with test windows (see
+  "Window sharing"): not with a real game, an admin window or on the 3070
+  Ti. A program with several windows shares the one in front when sharing
+  starts; a window resized to another shape is drawn top-left, not centred
+  (gfxcapture's `scale_aspect`). At 144 fps it sends what the window
+  delivers (~115–140 fps here).
 - **FFmpeg 8.0 or newer is required** for sharing the screen: the pacing
   filter uses `setpts=…:strip_fps=1`, an option FFmpeg 8.0 added (absent at
   n6.1.1, n7.0, n7.1). The zip ships BtbN's master build, so the app is

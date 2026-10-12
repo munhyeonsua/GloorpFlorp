@@ -167,13 +167,27 @@ Good to know:
 
 ### Share your screen
 
-1. Choose the **monitor** to share.
+1. Under **Share**, choose a **monitor**, or **Only one program** and the
+   program (start it first; click **Refresh** if it's missing).
 2. Choose the **quality** (resolution, frame rate and bitrate). The defaults
    are a good start; see [tips](#recommended-settings-and-tips).
 3. Click **Start sharing**. Click **Stop sharing** when you're done.
 
-- GloorpFlorp shares your **whole monitor**, including everything else on it
-  (chat windows, notifications).
+- A **monitor** share shows your **whole monitor**, including everything
+  else on it (chat windows, notifications).
+- **Only one program** shows just that program's window (its front-most one
+  if it has several). Other windows, notifications and popups are never
+  sent, even when they cover it. It also uses less of the computer's power
+  than a monitor share. Things to know:
+  - If the window is **minimized**, sharing can't start (restore it first).
+    Minimizing it while sharing pauses the picture: your friend sees the
+    last picture until you restore it.
+  - If you **close** the program, sharing stops and GloorpFlorp says so.
+    Start the program again, then click **Start sharing**.
+  - If you **resize** the window, the picture keeps its size for your friend;
+    a window with a different shape gets black bars on the right or bottom.
+  - Games in **exclusive fullscreen** can't be shared this way. Switch the
+    game to borderless windowed mode, or share the monitor.
 - You can both share at the same time.
 - Sharing uses your graphics card's separate video encoder (NVENC), so it
   barely affects your game's frame rate.
@@ -296,7 +310,7 @@ are going:
 | "Wrong room code" or "typo" message | Copy and paste the code instead of typing it. If the host restarted GloorpFlorp or clicked **New code**, the code has changed: ask for the current one. |
 | A message about different versions | You're using different builds. Both of you use the same zip (compare `VERSIONS.txt`). |
 | Everything is slow or laggy | Open Command Prompt and run `tailscale status`. If the line for your friend's PC says **relay** (instead of **direct**), your data goes through Tailscale's relay servers, which are much slower. Restart Tailscale on both PCs, turn off any other VPN and try again. Some home routers need UPnP turned on for a direct connection. Until then, use a low bitrate. |
-| The viewer window stays black | Wait a few seconds. Check that your friend is still sharing and picked the right monitor. Games in exclusive fullscreen can't always be captured: switch the game to borderless windowed. On a laptop, the shared monitor must be connected to the NVIDIA graphics card. Close the viewer and click **Open viewer**. |
+| The viewer window stays black | Wait a few seconds. Check that your friend is still sharing and picked the right monitor or program. If they share one program, its window must not be minimized. Games in exclusive fullscreen can't always be captured: switch the game to borderless windowed. On a laptop, the shared monitor must be connected to the NVIDIA graphics card. Close the viewer and click **Open viewer**. |
 | Video is choppy or freezes now and then | Lower the bitrate (try 15 Mbps) or choose 1080p. Check `tailscale status` for **relay** (see above). Pause downloads. If **dropped frames** in the connection details keeps climbing, the network can't keep up. |
 | An error about NVENC, the encoder or the driver when you start sharing | Update your NVIDIA driver and restart the PC; this fixes most of these. Then choose another codec (H.264) under **Codec** in "Your screen". Close other programs that record with the graphics card (OBS, NVIDIA Instant Replay) and try again. |
 | "Couldn't find FFmpeg", or the viewer never opens | GloorpFlorp can't find its `ffmpeg` or `mpv` folder. Extract the whole zip again and run `GloorpFlorp.exe` from the extracted folder. If your antivirus removed a file, restore it, then extract again. |
@@ -332,8 +346,9 @@ To be honest about what GloorpFlorp is and isn't:
   never arrives garbled, but when the network hiccups the picture briefly
   freezes and then skips ahead to catch up. Voice and game audio travel
   separately and keep going.
-- **Whole monitors only**, not single windows. Everything on the shared
-  monitor is visible.
+- **A whole monitor or one program's window**, nothing in between (no
+  part of the screen, no several windows). Everything on a shared monitor
+  is visible.
 - **No recording, no remote control.**
 - **Not code-signed**, so Windows shows the "Windows protected your PC"
   warning the first time.

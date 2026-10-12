@@ -68,14 +68,17 @@ pub(crate) fn ladder(test_source: bool, transform: bool, gpu_transform: Option<S
     }
 }
 
-/// The monitor as the encoder sees it.
+/// The monitor (or window) as the encoder sees it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Screen {
-    /// Desktop (upright) size.
+    /// Desktop (upright) size; for a window, the fixed size it is shared at
+    /// ([`window_output_size`]), so no step scales or turns it.
     pub width: u32,
     pub height: u32,
     /// `gf_sys::Monitor::rotation`: degrees clockwise.
     pub rotation: u32,
+    /// Capture only this window (an HWND) with gfxcapture, not the monitor.
+    pub window: Option<u64>,
 }
 
 impl Screen {
@@ -191,6 +194,22 @@ pub fn output_size(monitor_w: u32, monitor_h: u32, max_height: Option<u32>) -> (
     }
 }
 
+/// The smallest picture NVENC encodes with every codec (on the RTX 5080 AV1
+/// refused 146×50, HEVC and H.264 128×72).
+const MIN_WINDOW_SIZE: (u32, u32) = (256, 144);
+
+/// The fixed size a window whose inside is `w`×`h` is shared at: as
+/// [`output_size`], in even numbers, at least [`MIN_WINDOW_SIZE`]. It stays
+/// the same when the window is resized (gfxcapture scales the window into
+/// it, keeping its shape), and is known before the window shows anything.
+pub(crate) fn window_output_size(w: u32, h: u32, max_height: Option<u32>) -> (u32, u32) {
+    let (w, h) = output_size(w, h, max_height);
+    (
+        (w & !1).max(MIN_WINDOW_SIZE.0),
+        (h & !1).max(MIN_WINDOW_SIZE.1),
+    )
+}
+
 /// VBV buffer size in kbit. Smaller means less burst delay on a link that
 /// is barely faster than the bitrate, but starves keyframes and scene cuts
 /// (visible quality pulses). 1/8 s lets a keyframe be ~7× an average frame
@@ -256,14 +275,34 @@ pub(crate) fn pace_filter(fps: u32) -> String {
     )
 }
 
+/// gfxcapture's highest `max_framerate`: Windows then hands over every frame
+/// the window draws. With `max_framerate=fps` Windows' own limit dropped
+/// frames that came one 1/240 s step early (the test PC's frame times sit
+/// on that grid), so 120 and 144 fps only reached ~110 and ~116.
+pub(crate) const WINDOW_CAPTURE_FPS: u32 = 1000;
+
+/// [`pace_filter`] for a window share, without the half-frame rule: Windows
+/// stamps a window's frames on a coarse grid (1/240 s on the test PC), and
+/// that rule then cut 120 fps to ~98. Keeps the first frame of each
+/// 1/`fps` s slot and time-stamps it in slots, so NVENC budgets for `fps`
+/// (not gfxcapture's [`WINDOW_CAPTURE_FPS`]). Quoted like [`pace_filter`].
+pub(crate) fn window_pace_filter(fps: u32) -> String {
+    let fps = fps.max(1);
+    format!(
+        "select='if(gte(floor(t*{fps}),ld(0)),st(0,floor(t*{fps})+1),0)',\
+         setpts=floor(T*{fps})/{fps}/TB:strip_fps=1,settb=1/{fps}"
+    )
+}
+
 fn s(v: &[&str]) -> Vec<String> {
     v.iter().map(|x| x.to_string()).collect()
 }
 
 /// Full FFmpeg argument list for one ladder step. Every step that captures
 /// with ddagrab asks it for [`CAPTURE_POLL_FPS`] and paces the frames with
-/// [`pace_filter`] (variable rate, no `-r`); the test pattern already runs
-/// at `fps`.
+/// [`pace_filter`] (variable rate, no `-r`); a window is captured with
+/// gfxcapture and paced with [`window_pace_filter`]; the test pattern
+/// already runs at `fps`.
 pub(crate) fn encoder_args(step: Step, settings: &EncoderSettings, screen: Screen) -> Vec<String> {
     let fps = settings.fps.max(1);
     let gop = settings.keyframe_interval.max(1);
@@ -319,12 +358,27 @@ pub(crate) fn encoder_args(step: Step, settings: &EncoderSettings, screen: Scree
         }
     } else {
         a.extend(s(&["-f", "lavfi", "-i"]));
-        a.push(format!(
-            "ddagrab=output_idx={}:framerate={CAPTURE_POLL_FPS}:draw_mouse=1",
-            settings.monitor
-        ));
+        let pace = match screen.window {
+            // Windows hands over a frame only when the window changes (no
+            // polling), and gfxcapture scales it to the fixed size itself
+            // (keeping its shape) with no yellow border drawn around it.
+            Some(hwnd) => {
+                a.push(format!(
+                    "gfxcapture=hwnd={hwnd:#x}:max_framerate={WINDOW_CAPTURE_FPS}:\
+                     capture_cursor=1:display_border=0:width={w}:height={h}:\
+                     resize_mode=scale_aspect:scale_mode=bicubic"
+                ));
+                window_pace_filter(fps)
+            }
+            None => {
+                a.push(format!(
+                    "ddagrab=output_idx={}:framerate={CAPTURE_POLL_FPS}:draw_mouse=1",
+                    settings.monitor
+                ));
+                pace_filter(fps)
+            }
+        };
         // Pace first, so only the kept frames are copied, scaled or turned.
-        let pace = pace_filter(fps);
         a.push("-vf".into());
         a.push(match capture_filters(step, screen, (w, h)) {
             Some(vf) => format!("{pace},{vf}"),
@@ -348,7 +402,19 @@ pub(crate) fn encoder_args(step: Step, settings: &EncoderSettings, screen: Scree
         a.push(gop.to_string());
         // -bf is a generic codec option, so it is safe for av1_nvenc too.
         a.extend(s(&["-zerolatency", "1", "-delay", "0", "-bf", "0"]));
-        if settings.codec != VideoCodec::Av1 {
+        if screen.window.is_some() {
+            // A still or minimized window sends no frames, so `-g` (counted
+            // in frames) can stretch the keyframe gap: also force one on the
+            // first frame a keyframe interval after the last forced one. (Not
+            // `n_forced*N`: after a pause that makes every frame a keyframe
+            // until it catches up.)
+            a.push("-force_key_frames".into());
+            a.push(format!(
+                "expr:isnan(prev_forced_t)+gte(t,prev_forced_t+{gop}/{fps})"
+            ));
+        }
+        // av1_nvenc ignores forced keyframes without it.
+        if settings.codec != VideoCodec::Av1 || screen.window.is_some() {
             a.extend(s(&["-forced-idr", "1"]));
         }
     }
@@ -582,6 +648,7 @@ mod tests {
             max_height,
             bitrate_kbps: 20_000,
             keyframe_interval: 120,
+            window_exe: None,
         }
     }
 
@@ -619,6 +686,7 @@ mod tests {
             width,
             height,
             rotation: 0,
+            window: None,
         }
     }
 
@@ -657,6 +725,7 @@ mod tests {
             width: 2160,
             height: 3840,
             rotation: 90,
+            window: None,
         };
         let cuda_then_cpu = vec![Step::GpuCuda, Step::Cpu];
         assert_eq!(shipped(upright(3840, 2160), Some(1440)), cuda_then_cpu);
@@ -704,6 +773,7 @@ mod tests {
                 width: 2160,
                 height: 3840,
                 rotation,
+                window: None,
             };
             assert!(s.needs_transform(None), "{rotation}");
         }
@@ -826,6 +896,7 @@ mod tests {
             width: 2160,
             height: 3840,
             rotation: 90,
+            window: None,
         };
         let screens = [
             (upright(2560, 1440), None),
@@ -961,7 +1032,9 @@ mod tests {
     /// 100 ms hold-up comes out as exactly the frames the Rust model keeps,
     /// time-stamped in 1/fps slots. So the hold-up stays a gap (no copies
     /// of the last frame fill it, no burst after it) and no new frame is
-    /// dropped. Skipped without FFmpeg, or with one older than 8.0.
+    /// dropped. The window pacing gives the same here (on evenly spaced 1 ms
+    /// frames the half-frame rule never decides). Skipped without FFmpeg, or
+    /// with one older than 8.0.
     #[test]
     fn ffmpeg_paces_a_fast_source() {
         let Ok(tools) = crate::tools::locate() else {
@@ -987,14 +1060,17 @@ mod tests {
             .map(|k| f64::from(k) * (1.0 / f64::from(CAPTURE_POLL_FPS)))
             .filter(|&t| !(1.0..=1.1).contains(&t))
             .collect();
-        for fps in [30, 60, 120, 144] {
+        let filters = [30, 60, 120, 144]
+            .into_iter()
+            .flat_map(|fps| [(fps, pace_filter(fps)), (fps, window_pace_filter(fps))]);
+        for (fps, vf) in filters {
             let mut a = s(&["-hide_banner", "-nostdin", "-loglevel", "error"]);
             a.extend(s(&["-f", "lavfi", "-i"]));
             a.push(format!(
                 "testsrc2=size=64x36:rate={CAPTURE_POLL_FPS}:duration=3,\
                  select='not(between(t,1,1.1))'"
             ));
-            a.extend(["-vf".into(), pace_filter(fps)]);
+            a.extend(["-vf".into(), vf]);
             a.extend(s(&["-fps_mode", "vfr", "-f", "framecrc", "-"]));
             let run =
                 crate::tools::run_short(&tools.ffmpeg, &a, std::time::Duration::from_secs(60));
@@ -1087,6 +1163,128 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn window_sizes() {
+        assert_eq!(window_output_size(1281, 721, None), (1280, 720));
+        assert_eq!(window_output_size(1281, 721, Some(1440)), (1280, 720));
+        assert_eq!(window_output_size(3754, 2112, Some(1440)), (2560, 1440));
+        // Minimized (160×28 as Windows reports it) or tiny: NVENC's minimum.
+        assert_eq!(window_output_size(160, 28, None), (256, 144));
+        assert_eq!(window_output_size(300, 101, Some(720)), (300, 144));
+        assert_eq!(window_output_size(0, 0, Some(720)), (256, 144));
+    }
+
+    /// A window: gfxcapture unlimited at the fixed size, the window pacing
+    /// instead of ddagrab's, keyframes forced by time with IDR for every
+    /// codec, and no step scales or turns it.
+    #[test]
+    fn window_graphs() {
+        let (w, h) = window_output_size(3754, 2112, Some(1440));
+        let window = Screen {
+            width: w,
+            height: h,
+            rotation: 0,
+            window: Some(0x1A2B),
+        };
+        assert!(!window.needs_transform(Some(1440)));
+        let gpu = gpu_transform_step(window.turned(), CUDA_TRANSFORM);
+        assert_eq!(ladder(false, false, gpu), vec![Step::GpuDirect, Step::Cpu]);
+
+        let a = encoder_args(
+            Step::GpuDirect,
+            &settings(VideoCodec::Av1, Some(1440)),
+            window,
+        );
+        let expected = "-hide_banner -nostdin -loglevel warning -nostats \
+            -f lavfi -i gfxcapture=hwnd=0x1a2b:max_framerate=1000:capture_cursor=1:display_border=0:\
+            width=2560:height=1440:resize_mode=scale_aspect:scale_mode=bicubic \
+            -vf select='if(gte(floor(t*60),ld(0)),st(0,floor(t*60)+1),0)',\
+            setpts=floor(T*60)/60/TB:strip_fps=1,settb=1/60 -fps_mode vfr \
+            -c:v av1_nvenc -preset p4 -tune ull -rc cbr -b:v 20000k -maxrate 20000k \
+            -bufsize 2500k -g 120 -zerolatency 1 -delay 0 -bf 0 \
+            -force_key_frames expr:isnan(prev_forced_t)+gte(t,prev_forced_t+120/60) \
+            -forced-idr 1 -an -f flv -flvflags no_duration_filesize -flush_packets 1 pipe:1";
+        assert_eq!(joined(&a), expected);
+
+        let pace = window_pace_filter(60);
+        let st = settings(VideoCodec::H264, None);
+        let j = joined(&encoder_args(Step::Cpu, &st, window));
+        assert!(j.contains(&format!(
+            "-vf {pace},hwdownload,format=bgra,format=nv12,setparams=colorspace=bt470bg -fps_mode vfr"
+        )));
+        let j = joined(&encoder_args(Step::GpuCuda, &st, window));
+        assert!(j.contains(&format!(
+            "-vf {pace},hwdownload,format=bgra,hwupload_cuda -fps_mode vfr"
+        )));
+        for codec in VideoCodec::ALL {
+            for step in CAPTURE_STEPS {
+                let j = joined(&encoder_args(step, &settings(codec, Some(1440)), window));
+                assert!(j.contains("width=2560:height=1440:"), "{j}");
+                assert!(j.contains(" -forced-idr 1 -an"), "{j}");
+                for not in [
+                    "ddagrab",
+                    "st(1,",
+                    "scale_cuda",
+                    "scale_d3d11",
+                    ",scale=",
+                    "transpose",
+                    " -r ",
+                ] {
+                    assert!(!j.contains(not), "{not}: {j}");
+                }
+            }
+        }
+    }
+
+    /// The real FFmpeg with the window shares' keyframe expression: a
+    /// keyframe on the first frame after a 5 s pause (a still window), and
+    /// only one (`n_forced*N` would make the next few frames keyframes
+    /// too). Uses libx264; skipped without FFmpeg or libx264.
+    #[test]
+    fn ffmpeg_forces_one_keyframe_after_a_pause() {
+        let Ok(tools) = crate::tools::locate() else {
+            println!("note: skipping, ffmpeg is not available");
+            return;
+        };
+        let mut st = settings(VideoCodec::H264, None);
+        st.fps = 30;
+        st.keyframe_interval = 60;
+        let window = Screen {
+            width: 256,
+            height: 144,
+            rotation: 0,
+            window: Some(1),
+        };
+        let enc = encoder_args(Step::GpuDirect, &st, window);
+        let at = enc.iter().position(|x| x == "-force_key_frames").unwrap();
+        let mut a = s(&["-hide_banner", "-nostdin", "-loglevel", "error"]);
+        a.extend(s(&["-f", "lavfi", "-i"]));
+        // Frames for 1 s, nothing for 5 s, then frames again.
+        a.push("testsrc2=size=64x36:rate=30:duration=8,select='not(between(t,1,6))'".into());
+        a.extend(s(&["-fps_mode", "vfr", "-c:v", "libx264", "-g", "1000"]));
+        a.extend(s(&["-sc_threshold", "0", "-bf", "0"]));
+        a.extend(enc[at..at + 4].iter().cloned());
+        a.extend(s(&["-f", "framecrc", "-"]));
+        let run = crate::tools::run_short(&tools.ffmpeg, &a, std::time::Duration::from_secs(60));
+        let Some((ok, out, err)) = run else {
+            panic!("ffmpeg didn't finish: {a:?}");
+        };
+        if !ok && err.contains("libx264") {
+            println!("note: skipping, this FFmpeg has no libx264: {err}");
+            return;
+        }
+        assert!(ok, "{err}");
+        // framecrc marks every packet that isn't a keyframe with "F=0x…".
+        let keys: Vec<usize> = out
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+            .enumerate()
+            .filter(|(_, l)| !l.contains("F=0x"))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(keys, [0, 30], "{out}");
+    }
+
     /// The portrait monitor of the PC this was tested on: Windows turns it
     /// 90° and ddagrab hands over 3840×2160 frames that must be turned
     /// clockwise. The size is still worked out from the upright 2160×3840.
@@ -1096,6 +1294,7 @@ mod tests {
             width: 2160,
             height: 3840,
             rotation,
+            window: None,
         };
         let st = settings(VideoCodec::H264, Some(1440));
         assert_eq!(output_size(2160, 3840, Some(1440)), (810, 1440));
@@ -1132,6 +1331,7 @@ mod tests {
             width: 2560,
             height: 1440,
             rotation: 180,
+            window: None,
         };
         let st = settings(VideoCodec::Av1, Some(1080));
         let j = joined(&encoder_args(Step::Cpu, &st, upside_down));

@@ -1,5 +1,6 @@
-//! Video: FFmpeg captures the screen (`ddagrab`, Desktop Duplication, frames
-//! stay on the GPU) and encodes it with NVENC; mpv decodes on the GPU and
+//! Video: FFmpeg captures the screen (`ddagrab`, Desktop Duplication, or one
+//! window with `gfxcapture`; frames stay on the GPU) and encodes it with
+//! NVENC; mpv decodes on the GPU and
 //! shows it in its own window. Both are bundled programs that this crate
 //! starts as child processes and talks to through pipes:
 //!
@@ -91,6 +92,10 @@ pub struct EncoderSettings {
     /// Keyframe every N frames (default 2 s worth). A viewer that opens its
     /// window mid-stream waits at most this long for a picture.
     pub keyframe_interval: u32,
+    /// Share only this program's window instead of `monitor` (exe name, e.g.
+    /// "EscapeFromTarkov.exe"; its window as `gf_sys::list_audio_apps`
+    /// finds it). See [`Encoder`].
+    pub window_exe: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -140,6 +145,17 @@ pub enum EncoderEvent {
 /// so frames sent per second show what the capture really delivered.
 /// (Asking ddagrab for `fps` itself gave ~31 ms gaps at 60 fps and only
 /// ~72–95 fps at 120/144.)
+///
+/// One program's window (`EncoderSettings::window_exe`) is captured with
+/// gfxcapture (Windows Graphics Capture) instead: only that window's
+/// pixels, also while other windows cover it. The size is fixed at start
+/// (`args::window_output_size` of the window's inside) and gfxcapture scales
+/// the window into it, so there is no scaling step and no polling; at most
+/// `fps` frames a second, but only when the window changes, so keyframes
+/// are also forced by time. `start` fails with a plain message if the
+/// program has no window or it is minimized. While minimized, nothing is
+/// sent (the viewer keeps the last picture); when the window closes,
+/// sharing stops with a message saying so.
 ///
 /// NVENC flags aim for low latency: `-preset p4 -tune ull -rc cbr`, no
 /// B-frames, `-zerolatency 1`, `-delay 0`, `-g keyframe_interval`. Output is

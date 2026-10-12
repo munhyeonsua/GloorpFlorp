@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 
 use windows::core::{BOOL, PWSTR};
 use windows::Wdk::System::SystemServices::RtlGetVersion;
-use windows::Win32::Foundation::{CloseHandle, E_INVALIDARG, HANDLE, HWND, LPARAM, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{
+    CloseHandle, E_INVALIDARG, HANDLE, HWND, LPARAM, RECT, WAIT_OBJECT_0,
+};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_MODE_ROTATION, DXGI_MODE_ROTATION_ROTATE180, DXGI_MODE_ROTATION_ROTATE270,
@@ -28,12 +30,12 @@ use windows::Win32::System::Threading::{
     PROCESS_SYNCHRONIZE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumChildWindows, EnumWindows, GetClassNameW, GetForegroundWindow, GetWindow, GetWindowLongW,
-    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, GWL_EXSTYLE,
-    GW_OWNER, MONITORINFOF_PRIMARY, WS_EX_TOOLWINDOW,
+    EnumChildWindows, EnumWindows, GetClassNameW, GetClientRect, GetForegroundWindow, GetWindow,
+    GetWindowLongW, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
+    IsWindow, IsWindowVisible, GWL_EXSTYLE, GW_OWNER, MONITORINFOF_PRIMARY, WS_EX_TOOLWINDOW,
 };
 
-use crate::{AudioApp, GameAudioSource, Monitor, SampleCallback};
+use crate::{AudioApp, GameAudioSource, Monitor, SampleCallback, WindowState};
 
 /// Owned kernel handle, closed on drop.
 struct OwnedHandle(HANDLE);
@@ -232,10 +234,37 @@ pub(crate) fn list_audio_apps() -> Vec<AudioApp> {
             if exe.eq_ignore_ascii_case(UWP_FRAME_HOST_EXE) {
                 continue;
             }
-            apps.push(AudioApp { pid, exe, title });
+            apps.push(AudioApp {
+                pid,
+                exe,
+                title,
+                hwnd: hwnd.0 as usize as u64,
+            });
         }
     }
     apps
+}
+
+pub(crate) fn window_state(hwnd: u64) -> WindowState {
+    let hwnd = HWND(hwnd as usize as *mut _);
+    // SAFETY: plain queries on a window handle; one that is closed (or was
+    // never valid) only makes them fail.
+    unsafe {
+        if !IsWindow(Some(hwnd)).as_bool() {
+            return WindowState::Gone;
+        }
+        if IsIconic(hwnd).as_bool() {
+            return WindowState::Minimized;
+        }
+        let mut r = RECT::default();
+        match GetClientRect(hwnd, &mut r) {
+            Ok(()) => WindowState::Open {
+                width: r.right.max(0) as u32,
+                height: r.bottom.max(0) as u32,
+            },
+            Err(_) => WindowState::Gone,
+        }
+    }
 }
 
 /// Whether the process behind `process` runs elevated (as administrator).

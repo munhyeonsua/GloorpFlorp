@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use gf_proto::bitstream::{DemuxedFrame, FlvDemuxer};
 use gf_proto::{VideoCodec, VideoFrame};
+use gf_sys::WindowState;
 
 use crate::args::{self, Screen, Step};
 use crate::proc::{self, StderrTail};
@@ -40,6 +41,7 @@ pub(crate) fn screen(index: u32) -> Screen {
             width: m.width,
             height: m.height,
             rotation: m.rotation,
+            window: None,
         },
         _ => {
             log::warn!("monitor {index} not found; assuming 1920x1080");
@@ -47,8 +49,56 @@ pub(crate) fn screen(index: u32) -> Screen {
                 width: 1920,
                 height: 1080,
                 rotation: 0,
+                window: None,
             }
         }
+    }
+}
+
+/// The front-most window of the program `exe` (as the "Only one program"
+/// list finds it), at the fixed size it is shared at.
+fn window_screen(exe: &str, max_height: Option<u32>) -> anyhow::Result<Screen> {
+    let Some(app) = gf_sys::list_audio_apps()
+        .into_iter()
+        .find(|a| a.exe.eq_ignore_ascii_case(exe))
+    else {
+        anyhow::bail!(
+            "{exe} isn't running (or has no open window). Start it, then click Start sharing."
+        );
+    };
+    match gf_sys::window_state(app.hwnd) {
+        WindowState::Open { width, height } => {
+            let (width, height) = args::window_output_size(width, height, max_height);
+            log::info!("sharing {exe}'s window {:#x} \"{}\"", app.hwnd, app.title);
+            Ok(Screen {
+                width,
+                height,
+                rotation: 0,
+                window: Some(app.hwnd),
+            })
+        }
+        state => anyhow::bail!("{}", window_advice(exe, state, false).unwrap_or_default()),
+    }
+}
+
+/// What the shared window's state explains, in plain words: closed,
+/// minimized (gfxcapture sends nothing then; at start it also can't tell
+/// the size), or open but no picture came (seen as likely for a game in
+/// exclusive fullscreen; not tested with one).
+fn window_advice(exe: &str, state: WindowState, no_picture: bool) -> Option<String> {
+    match state {
+        WindowState::Gone => Some(format!(
+            "{exe}'s window was closed, so sharing stopped. Start {exe} again, then click \
+             Start sharing."
+        )),
+        WindowState::Minimized => Some(format!(
+            "{exe}'s window is minimized. Restore it, then click Start sharing."
+        )),
+        WindowState::Open { .. } if no_picture => Some(format!(
+            "No picture came from {exe}'s window. If it's a game in exclusive fullscreen, \
+             switch it to borderless windowed mode, or share the whole monitor instead."
+        )),
+        WindowState::Open { .. } => None,
     }
 }
 
@@ -216,7 +266,10 @@ impl EncoderInner {
         tools: &Tools,
         settings: &EncoderSettings,
     ) -> anyhow::Result<(EncoderInner, Receiver<EncoderEvent>)> {
-        let screen = screen(settings.monitor);
+        let screen = match &settings.window_exe {
+            Some(exe) => window_screen(exe, settings.max_height)?,
+            None => screen(settings.monitor),
+        };
         let size = args::output_size(screen.width, screen.height, settings.max_height);
         let test_source = tools::use_test_source();
         let transform = screen.needs_transform(settings.max_height);
@@ -367,16 +420,31 @@ impl Supervisor {
                     failures.push((step, lines));
                 }
                 StepResult::Died(lines) => {
-                    let msg = args::error_message(&lines, codec);
+                    // A closed window ends gfxcapture silently (exit code 0).
+                    let msg = self.with_window_advice(args::error_message(&lines, codec), false);
                     log::warn!("screen sharing stopped: {msg}");
                     self.out.control(EncoderEvent::Stopped { error: Some(msg) });
                     return;
                 }
             }
         }
-        let msg = ladder_failure_message(&failures, codec);
+        let no_picture = failures
+            .iter()
+            .any(|(_, l)| l.iter().any(|x| x.starts_with("(no picture within")));
+        let msg = self.with_window_advice(ladder_failure_message(&failures, codec), no_picture);
         log::warn!("screen sharing couldn't start: {msg}");
         self.out.control(EncoderEvent::Stopped { error: Some(msg) });
+    }
+
+    /// For a window share, puts what the window's state explains first.
+    fn with_window_advice(&self, msg: String, no_picture: bool) -> String {
+        let (Some(exe), Some(hwnd)) = (&self.settings.window_exe, self.screen.window) else {
+            return msg;
+        };
+        match window_advice(exe, gf_sys::window_state(hwnd), no_picture) {
+            Some(advice) => format!("{advice}\n\n{msg}"),
+            None => msg,
+        }
     }
 
     fn run_step(&mut self, step: Step) -> StepResult {
