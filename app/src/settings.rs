@@ -196,6 +196,11 @@ pub struct Settings {
     /// The room code last typed into Join.
     pub last_code: String,
     pub audio: AudioPrefs,
+    /// Key (Windows virtual-key code) that turns Mute on and off from
+    /// anywhere; `None` = not set.
+    pub mute_key: Option<u32>,
+    /// Same for Deafen.
+    pub deafen_key: Option<u32>,
 }
 
 impl Default for Settings {
@@ -213,6 +218,8 @@ impl Default for Settings {
             auto_open_viewer: true,
             last_code: String::new(),
             audio: AudioPrefs::default(),
+            mute_key: None,
+            deafen_key: None,
         }
     }
 }
@@ -273,6 +280,14 @@ impl Settings {
         if a.ptt_key == 0 || a.ptt_key > 0xFE {
             a.ptt_key = da.ptt_key;
         }
+        // Each key does one thing (the key buttons refuse a taken key).
+        let ptt = Some(a.ptt_key);
+        self.mute_key = self
+            .mute_key
+            .filter(|&k| gf_sys::keys::bindable(k) && Some(k) != ptt);
+        self.deafen_key = self
+            .deafen_key
+            .filter(|&k| gf_sys::keys::bindable(k) && Some(k) != ptt && Some(k) != self.mute_key);
     }
 
     /// Bitrate to share with for `codec`, in kbps.
@@ -387,6 +402,8 @@ mod tests {
         s.audio.ptt_key = 0x05;
         s.audio.game_volume = 1.5;
         s.audio.deafened = true;
+        s.mute_key = Some(0x77);
+        s.deafen_key = Some(0x04);
         s.save(&path).unwrap();
         let (loaded, warning) = Settings::load(&path);
         assert_eq!(warning, None);
@@ -457,7 +474,33 @@ mod tests {
         assert_eq!(s.audio.vad_sensitivity, 0.0);
         assert_eq!(s.audio.game_volume, d.audio.game_volume);
         assert_eq!(s.max_height, Some(1440));
+        // Files from before the mute/deafen shortcuts: not set.
+        assert_eq!((s.mute_key, s.deafen_key), (None, None));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shortcut_keys_are_valid_and_distinct() {
+        let mut s = Settings {
+            mute_key: Some(0x01), // left mouse button
+            deafen_key: Some(0x100),
+            ..Settings::default()
+        };
+        s.sanitize();
+        assert_eq!((s.mute_key, s.deafen_key), (None, None));
+
+        // A key push-to-talk or the mute shortcut already uses is cleared.
+        s.audio.ptt_key = 0x06;
+        s.mute_key = Some(0x06);
+        s.deafen_key = Some(0x77);
+        s.sanitize();
+        assert_eq!((s.mute_key, s.deafen_key), (None, Some(0x77)));
+        s.mute_key = Some(0x77);
+        s.sanitize();
+        assert_eq!((s.mute_key, s.deafen_key), (Some(0x77), None));
+        s.deafen_key = Some(0x05);
+        s.sanitize();
+        assert_eq!((s.mute_key, s.deafen_key), (Some(0x77), Some(0x05)));
     }
 
     #[test]

@@ -20,7 +20,7 @@ agents that built the crates: `.claude/handoff/phase1-agent-reports.json` (proto
 | `gf-video`: FFmpeg encoder (ddagrab → NVENC → FLV), mpv viewer | ✅ done | 37 unit + 3 integration pass |
 | `.github/workflows/build.yml`, `packaging/`, `README.md` | ✅ done | actionlint clean; packaging script run end to end with the real FFmpeg zip |
 | `gf-audio`: mic, echo cancellation, Opus, jitter, mixing, playback, game audio | ✅ done | 48 pass |
-| `app`: engine, settings, logging, egui UI, end-to-end test | ✅ done | 7 + 2 (UI) unit + 4 end-to-end pass |
+| `app`: engine, settings, logging, egui UI, end-to-end test | ✅ done | 9 + 3 (UI) unit + 5 end-to-end pass |
 | Integration (everything together, release build) | ✅ done on the owner's PC (Windows 11, MSVC): `cargo build --workspace`, `cargo test --workspace` (with and without FFmpeg/mpv), `cargo clippy --workspace --all-targets -D warnings`, `cargo fmt --all -- --check`, `cargo build --release -p gloorpflorp` → `target\release\GloorpFlorp.exe` | all pass |
 
 Most of the app has now run on the owner's PC, including a real screen
@@ -50,6 +50,7 @@ pacing fix").
    - [x] Mic → echo cancellation → voice on the real Yeti / ECHO-A (runs cleanly; how well echo is cancelled needs a real call, as no sound was played)
    - [x] Push-to-talk with F24 bound through the UI (synthesized key): first packet 3–6 ms after key-down, 15 tail packets ending ~145 ms after key-up, nothing sent while released
    - [ ] Push-to-talk while a real game has focus, and the "runs as administrator" hint with an admin game (or Task Manager) in front
+   - [ ] Mute/Deafen shortcut keys with real key presses (only unit and engine tests so far): a tap with GloorpFlorp minimized and with a game in front switches once, a held key switches once, the press that binds a key doesn't switch, a taken key is refused with the right message, Clear, and nothing with an admin game in front
    - [x] Two copies on one PC (`GLOORP_DEV_IP=127.0.0.1`, `GLOORP_FAKE_AUDIO=1`)
    - [ ] Windows Firewall prompt appears on first Host (tests only used 127.0.0.1)
    - [x] The auto-opened viewer doesn't take focus: with another window in front (3 runs: first share, no key presses, codec-change reopen) mpv opened behind it and the foreground never changed. It does come to the front after clicking Open viewer. Not checked with a real fullscreen game
@@ -503,6 +504,12 @@ From the agents' reports (also check the code's doc comments):
   yet exercised for real: push-to-talk with a real (or admin) game in
   front, the mouse pointer on the portrait monitor, the Windows Firewall
   prompt, a session over Tailscale.
+- **Mute/Deafen shortcut keys** have not been tried with real key presses
+  (see the checklist above). Known limits: pressing a shortcut key while
+  binding another key (or re-binding the same key) also switches it (the
+  refusal says so); Mouse 5, the default push-to-talk key, can't be a
+  shortcut until the push-to-talk key is changed, even in Voice activation
+  (the refusal says how).
 - **The screen saver blocks capture.** While it runs (or the PC is locked),
   Windows refuses Desktop Duplication ("Desktop duplication access denied";
   the app shows its plain "Windows refused to let GloorpFlorp capture the

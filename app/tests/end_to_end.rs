@@ -368,3 +368,18 @@ fn settings_are_saved() {
     assert_eq!(Settings::load(&path), (s, None));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Mute and deafen belong to the engine (the shortcut keys change them
+/// there): settings the window sent before it saw such a change don't undo it.
+#[test]
+fn older_settings_dont_undo_mute() {
+    init();
+    let e = engine("Muted PC");
+    e.send(Command::SetMuted(true));
+    let mut older = settings("Muted PC");
+    older.fps = 60;
+    e.send(Command::ApplySettings(Box::new(older)));
+    e.send(Command::SetDeafened(true));
+    let s = wait_for(&e, "deafen", T, |s| s.deafened);
+    assert!(s.mic_muted, "{s:#?}");
+}

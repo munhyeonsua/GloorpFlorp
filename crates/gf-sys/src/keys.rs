@@ -1,5 +1,6 @@
-//! Global key state for push-to-talk. Works while a game has focus by polling
-//! `GetAsyncKeyState` (no keyboard hooks, nothing injected into the game).
+//! Global key state for push-to-talk and the mute/deafen shortcuts. Works
+//! while a game has focus by polling `GetAsyncKeyState` (no keyboard hooks,
+//! nothing injected into the game).
 //! Key codes are Windows virtual-key codes, including mouse buttons
 //! (VK_XBUTTON1 = 0x05 "Mouse 4", VK_XBUTTON2 = 0x06 "Mouse 5").
 //! Non-Windows: nothing is ever pressed.
@@ -22,14 +23,15 @@ pub fn is_down(vk: u32) -> bool {
     }
 }
 
-/// Keys considered by [`first_pressed`]: everything except left/right mouse
-/// and the generic Shift/Ctrl/Alt codes (their left/right variants are kept).
-fn bindable(vk: u32) -> bool {
+/// Keys that can be bound (and that [`first_pressed`] reports): everything
+/// except left/right mouse and the generic Shift/Ctrl/Alt codes (their
+/// left/right variants are kept).
+pub fn bindable(vk: u32) -> bool {
     (0x03..=0xFE).contains(&vk) && !(0x10..=0x12).contains(&vk)
 }
 
 /// The first key currently held, ignoring left/right mouse buttons
-/// (used for "press a key to bind push-to-talk").
+/// (used for "press a key" when binding a key).
 pub fn first_pressed() -> Option<u32> {
     (0x03..=0xFE_u32)
         .filter(|&vk| bindable(vk))
