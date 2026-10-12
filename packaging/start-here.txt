@@ -20,7 +20,8 @@ Full guide: open "GloorpFlorp Guide.html" in this folder.
 4. One of you clicks Host and sends the code (like K7QM-2XPA-9TD) to the
    other. The other pastes the code and clicks Join.
 
-5. To show your screen: pick a monitor, then click Start sharing.
+5. To show your screen: under Share, pick a monitor (or only one program),
+   then click Start sharing.
    Your friend's screen opens in its own window. Press f or double-click
    it for fullscreen. Close it any time; reopen it with "Open viewer".
 

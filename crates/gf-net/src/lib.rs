@@ -29,8 +29,10 @@
 //! [`MAX_VIDEO_QUEUE`] frames are waiting (network slower than the encoder),
 //! all queued frames are discarded and new frames are dropped until the next
 //! keyframe, so the viewer catches up instead of falling further behind.
-//! Dropped frames are counted in [`NetStats`]. Sending `ShareStarted` or
-//! `ShareStopped` discards the queued frames (they belong to the old share).
+//! Dropped frames are counted in [`NetStats`]. [`NetTx::send_video_group`]
+//! queues a whole keyframe group at once, past that limit. Sending
+//! `ShareStarted` or `ShareStopped` discards the queued frames (they belong
+//! to the old share).
 //!
 //! UDP: one socket. The joiner sends `Ping` datagrams every 500 ms (keeps
 //! the path alive, measures RTT); the host learns the joiner's UDP address
@@ -165,6 +167,14 @@ impl NetTx {
 
     pub fn send_video(&self, frame: VideoFrame) {
         self.shared.send_video(frame)
+    }
+
+    /// Queues a whole keyframe group (a keyframe and the frames after it) in
+    /// place of the queued video, all of it even past [`MAX_VIDEO_QUEUE`]
+    /// (one by one, a longer group would be dropped). The caller bounds its
+    /// size.
+    pub fn send_video_group(&self, group: Vec<VideoFrame>) {
+        self.shared.send_video_group(group)
     }
 
     pub fn send_audio(&self, stream: AudioStream, seq: u16, ts: u32, payload: &[u8]) {

@@ -31,6 +31,7 @@ fn settings(codec: VideoCodec) -> EncoderSettings {
         max_height: Some(240),
         bitrate_kbps: 1_000,
         keyframe_interval: GOP,
+        window_exe: None,
     }
 }
 

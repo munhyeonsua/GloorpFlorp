@@ -240,6 +240,17 @@ impl Shared {
         }
     }
 
+    pub fn send_video_group(&self, group: Vec<VideoFrame>) {
+        if self.is_stopped() {
+            return;
+        }
+        let mut out = lock(&self.out);
+        if out.conn != 0 {
+            out.video.replace(group);
+            self.out_cv.notify_all();
+        }
+    }
+
     pub fn send_audio(&self, stream: AudioStream, seq: u16, ts: u32, payload: &[u8]) {
         if self.is_stopped() {
             return;

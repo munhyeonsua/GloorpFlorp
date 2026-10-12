@@ -11,7 +11,7 @@ use gf_net::{Net, NetConfig, NetEvent, NetTx, Role};
 use gf_proto::room::{is_tailscale_ipv4, RoomCode};
 use gf_proto::wire::TcpMsg;
 use gf_proto::{VideoCodec, VideoFrame};
-use gf_sys::{AudioApp, GameAudioSource, Monitor};
+use gf_sys::{AudioApp, GameAudioSource, Monitor, WindowState};
 use gf_video::{EncoderEvent, EncoderSettings, Tools, Viewer};
 
 use super::{
@@ -36,6 +36,10 @@ const GAME_DEAD_AFTER: Duration = Duration::from_secs(1);
 /// itself keeps while mpv starts).
 const PENDING_FRAMES: usize = 300;
 const PENDING_BYTES: usize = 16 << 20;
+/// My share sent no frame for this long: the picture is still (a shared
+/// window only sends frames when it changes), so a new viewer gets the
+/// latest picture instead of waiting for a keyframe that won't come.
+const STILL_SHARE: Duration = Duration::from_secs(1);
 /// How often to check whether an elevated program has focus (a few cheap
 /// system calls; only with push-to-talk).
 const ELEVATED_CHECK: Duration = Duration::from_millis(500);
@@ -235,9 +239,10 @@ fn dispose<T: Send + 'static>(what: &str, value: T) {
     }
 }
 
-/// Video that arrives while the viewer starts, from the latest keyframe on.
-/// The new viewer gets it once it runs, so it can start at the opening
-/// keyframe instead of waiting for the next one.
+/// Video from the latest keyframe on: what arrives while the viewer starts
+/// (the new viewer gets it once it runs, so it can start at the opening
+/// keyframe instead of waiting for the next one), and my share's latest
+/// picture (see `STILL_SHARE`).
 #[derive(Default)]
 struct PendingFrames {
     frames: Vec<VideoFrame>,
@@ -317,6 +322,9 @@ struct Core {
     need_keyframe: bool,
     /// The friend was told `ShareStarted` (and not yet `ShareStopped`).
     share_announced: bool,
+    /// My share's latest picture, and when the encoder last sent a frame.
+    share_latest: PendingFrames,
+    last_frame_at: Option<Instant>,
 
     viewer: Option<Viewer>,
     /// What the open viewer shows, and when it opened.
@@ -393,6 +401,8 @@ pub(super) fn run(
         share_restart_at: None,
         need_keyframe: true,
         share_announced: false,
+        share_latest: PendingFrames::default(),
+        last_frame_at: None,
         viewer: None,
         viewer_for: None,
         viewer_starting: None,
@@ -793,6 +803,7 @@ impl Core {
             max_height: s.max_height,
             bitrate_kbps: s.bitrate_kbps(codec),
             keyframe_interval: s.keyframe_interval(),
+            window_exe: s.share_app.clone(),
         })
     }
 
@@ -827,8 +838,11 @@ impl Core {
         self.enc_gen += 1;
         let gen = self.enc_gen;
         log::info!(
-            "starting to share monitor {} ({} {} kbps, {} fps, max height {:?})",
-            es.monitor,
+            "starting to share {} ({} {} kbps, {} fps, max height {:?})",
+            match &es.window_exe {
+                Some(exe) => format!("{exe}'s window"),
+                None => format!("monitor {}", es.monitor),
+            },
             es.codec.label(),
             es.bitrate_kbps,
             es.fps,
@@ -872,6 +886,8 @@ impl Core {
         }
         self.enc_settings = None;
         self.share_restart_at = None;
+        self.share_latest.clear();
+        self.last_frame_at = None;
         self.snap.my_share = ShareState::Off;
         self.snap.frames_sent = 0;
         self.snap.send_fps = 0.0;
@@ -888,8 +904,18 @@ impl Core {
         if self.enc_settings.is_none() {
             return;
         }
+        let minimized = (self.encoder.as_ref().and_then(|e| e.window()))
+            .is_some_and(|w| matches!(gf_sys::window_state(w), WindowState::Minimized));
+        let old_exe = self.enc_settings.as_ref().map(|e| &e.window_exe);
         match self.encoder_settings() {
             Ok(es) if Some(&es) == self.enc_settings.as_ref() => return,
+            // A minimized window can't start a share, but minimizing only
+            // pauses one: keep it going and restart once it's restored.
+            Ok(es) if minimized && old_exe == Some(&es.window_exe) => {
+                log::debug!("the shared window is minimized; restarting sharing once restored");
+                self.share_restart_at = Some(Instant::now() + RESTART_DELAY);
+                return;
+            }
             Ok(_) => {}
             Err(msg) => {
                 self.stop_sharing(true);
@@ -924,7 +950,11 @@ impl Core {
                 self.urgent = true;
                 self.announce_share(info);
             }
-            EncoderEvent::Frame(frame) => self.send_frame(frame),
+            EncoderEvent::Frame(frame) => {
+                self.last_frame_at = Some(Instant::now());
+                self.share_latest.push(frame.codec, frame.clone());
+                self.send_frame(frame);
+            }
             EncoderEvent::Stopped { error } => {
                 self.stop_sharing(true);
                 if let Some(e) = error {
@@ -1221,7 +1251,8 @@ impl Core {
                 self.settings.fps,
                 self.settings.codec,
                 self.settings.bitrate_mbps,
-            ) || old.keyframe_secs != self.settings.keyframe_secs;
+            ) || old.keyframe_secs != self.settings.keyframe_secs
+                || old.share_app != self.settings.share_app;
             if changed {
                 self.share_restart_at = Some(Instant::now() + RESTART_DELAY);
             }
@@ -1578,6 +1609,28 @@ impl Core {
             self.fps_sent = self.snap.frames_sent;
             self.fps_recv = self.snap.frames_received;
             self.fps_at = now;
+        }
+        // shortcut: a keyframe group past PENDING_FRAMES/PENDING_BYTES (long
+        // keyframe interval at a high frame rate or bitrate) isn't kept, so
+        // that viewer waits until the window changes; restart the encoder
+        // (an open window sends a first picture) if that turns out to matter.
+        if self.need_keyframe
+            && self.snap.peer_watching
+            && self.connected()
+            && !self.share_latest.frames.is_empty()
+            && self
+                .last_frame_at
+                .is_some_and(|t| now.duration_since(t) >= STILL_SHARE)
+        {
+            log::debug!("my share is still; sending the friend's new viewer its latest picture");
+            // As one group: frame by frame, gf-net drops a group longer than
+            // its queue (MAX_VIDEO_QUEUE), keyframe and all.
+            let group = self.share_latest.frames.clone();
+            self.snap.frames_sent += group.len() as u64;
+            self.need_keyframe = false;
+            if let Some(net) = &self.net {
+                net.tx.send_video_group(group);
+            }
         }
         if self.share_restart_at.is_some_and(|t| now >= t) {
             self.restart_sharing();

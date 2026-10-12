@@ -77,6 +77,9 @@ pub struct AudioApp {
     pub exe: String,
     /// Main window title.
     pub title: String,
+    /// That window (an HWND): the program's front-most one, or a Store
+    /// app's frame.
+    pub hwnd: u64,
 }
 
 /// Programs with a visible top-level window (excluding this app), sorted by
@@ -88,6 +91,32 @@ pub fn list_audio_apps() -> Vec<AudioApp> {
     let mut apps: Vec<AudioApp> = Vec::new();
     apps.sort_by_cached_key(|a| (a.exe.to_lowercase(), a.pid));
     apps
+}
+
+/// What a window ([`AudioApp::hwnd`]) is doing right now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowState {
+    /// Closed. Always this on non-Windows.
+    Gone,
+    Minimized,
+    /// Open, with this inside size in pixels (no title bar or frame).
+    Open {
+        width: u32,
+        height: u32,
+    },
+}
+
+/// Cheap (no message is sent to the window's program).
+pub fn window_state(hwnd: u64) -> WindowState {
+    #[cfg(windows)]
+    {
+        win::window_state(hwnd)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = hwnd;
+        WindowState::Gone
+    }
 }
 
 /// True while the focused window belongs to a program running as
@@ -397,6 +426,8 @@ mod tests {
         pids.sort_unstable();
         pids.dedup();
         assert_eq!(pids.len(), apps.len(), "one entry per program");
+        assert!(apps.iter().all(|a| a.hwnd != 0));
+        assert_eq!(window_state(0), WindowState::Gone);
         // Whatever has focus, this must answer (false here unless a test
         // runner window is elevated) without blocking.
         let _ = foreground_is_elevated();
