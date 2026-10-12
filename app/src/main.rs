@@ -9,7 +9,7 @@ use eframe::egui_wgpu::WgpuSetup;
 use eframe::{egui, wgpu};
 use gloorpflorp::settings::{self, Settings};
 
-fn main() -> anyhow::Result<()> {
+fn main() {
     gloorpflorp::logging::init(settings::app_dir().as_deref());
     let path = settings::settings_path();
     let (settings, notice) = match &path {
@@ -38,16 +38,21 @@ fn main() -> anyhow::Result<()> {
         });
     }
     let dev = dev_overrides();
-    let result = eframe::run_native(
-        "GloorpFlorp",
-        options,
-        Box::new(move |cc| {
-            Ok(Box::new(ui::GloorpApp::new(
-                cc, settings, notice, path, dev,
-            )?))
-        }),
-    );
-    if let Err(e) = &result {
+    // winit re-raises a UI-thread panic after its loop ends; catch it so a
+    // crash still reaches the close-and-exit below (the panic hook logged it).
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        eframe::run_native(
+            "GloorpFlorp",
+            options,
+            Box::new(move |cc| {
+                Ok(Box::new(ui::GloorpApp::new(
+                    cc, settings, notice, path, dev,
+                )?))
+            }),
+        )
+    }));
+    let ok = matches!(result, Ok(Ok(())));
+    if let Ok(Err(e)) = &result {
         log::error!("the window couldn't be shown: {e}");
         let e = e.to_string();
         show_error(&format!(
@@ -56,8 +61,14 @@ fn main() -> anyhow::Result<()> {
             e.trim().trim_end_matches('.')
         ));
     }
+    // Children first, then end at once: a normal exit stops our threads
+    // mid-call and then runs shutdown code in the loaded libraries (graphics
+    // driver, audio), which can hang and keep this process (and so any mpv
+    // or FFmpeg) alive. The engine already saved the settings, and the log
+    // file isn't buffered.
+    gf_sys::close_children();
     log::info!("GloorpFlorp closed");
-    result.map_err(|e| anyhow::anyhow!("GloorpFlorp's window couldn't be shown: {e}"))
+    gf_sys::exit_now(if ok { 0 } else { 1 })
 }
 
 /// A message box: without a window (and, in release builds, without a

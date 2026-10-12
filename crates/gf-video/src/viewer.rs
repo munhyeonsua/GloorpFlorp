@@ -271,13 +271,12 @@ fn spawn_child(
         .stderr(Stdio::piped());
     // Harmless for GUI programs; stops a console window flashing up otherwise.
     gf_sys::hide_console_window(&mut cmd);
-    let mut child = cmd.spawn().map_err(|e| {
+    let mut child = gf_sys::spawn_bound(&mut cmd).map_err(|e| {
         anyhow::anyhow!(
             "Couldn't open the viewer window ({e}). Extract the whole GloorpFlorp zip \
              again, then restart GloorpFlorp."
         )
     })?;
-    gf_sys::bind_child_to_app_lifetime(&child);
     let output = [
         StderrTail::spawn(name, child.stdout.take()),
         StderrTail::spawn(name, child.stderr.take()),

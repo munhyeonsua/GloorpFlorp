@@ -20,12 +20,12 @@ use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITORINFO};
 use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows::Win32::System::SystemInformation::OSVERSIONINFOW;
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
+    GetCurrentProcess, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW, TerminateProcess,
     WaitForSingleObject, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
     PROCESS_SYNCHRONIZE,
 };
@@ -566,11 +566,27 @@ pub(crate) fn bind_child_to_app_lifetime(child: &std::process::Child) {
     // SAFETY: both handles are valid for the duration of the call; the child
     // handle stays owned by `child`.
     if let Err(e) = unsafe { AssignProcessToJobObject(HANDLE(job as *mut _), process) } {
+        // shortcut: such a child is only stopped by its owner (Viewer,
+        // Encoder), not by `close_children`; keep a list of them if this
+        // warning ever shows up in a log.
         log::warn!(
             "couldn't tie child process {} to the app's lifetime: {e}",
             child.id()
         );
     }
+}
+
+pub(crate) fn close_children() {
+    let Some(job) = app_job() else { return };
+    // SAFETY: the job handle is valid for the life of the process.
+    if let Err(e) = unsafe { TerminateJobObject(HANDLE(job as *mut _), 1) } {
+        log::warn!("couldn't end the app's child processes: {e}");
+    }
+}
+
+pub(crate) fn exit_now(code: i32) {
+    // SAFETY: ends this process; on success the call doesn't return.
+    let _ = unsafe { TerminateProcess(GetCurrentProcess(), code as u32) };
 }
 
 #[cfg(test)]

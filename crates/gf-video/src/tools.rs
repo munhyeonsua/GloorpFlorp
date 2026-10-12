@@ -82,14 +82,13 @@ pub(crate) fn run_short(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     gf_sys::hide_console_window(&mut cmd);
-    let mut child = match cmd.spawn() {
+    let mut child = match gf_sys::spawn_bound(&mut cmd) {
         Ok(c) => c,
         Err(e) => {
             log::warn!("couldn't run {}: {e}", program.display());
             return None;
         }
     };
-    gf_sys::bind_child_to_app_lifetime(&child);
     let read_all = |r: Option<Box<dyn Read + Send>>| {
         std::thread::spawn(move || {
             let mut buf = Vec::new();

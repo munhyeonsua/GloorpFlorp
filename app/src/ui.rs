@@ -1553,6 +1553,17 @@ impl eframe::App for GloorpApp {
         }
         log::info!("window closed; shutting down");
         self.engine.shutdown(Duration::from_secs(3));
+        // Even if the engine got stuck, no mpv or FFmpeg outlives the window.
+        gf_sys::close_children();
+        // main ends the process right after the window is gone; this covers
+        // the window's own teardown hanging.
+        let _ = std::thread::Builder::new()
+            .name("exit-watchdog".into())
+            .spawn(|| {
+                std::thread::sleep(Duration::from_secs(5));
+                log::warn!("closing took over 5 s; ending GloorpFlorp now");
+                gf_sys::exit_now(1);
+            });
     }
 }
 

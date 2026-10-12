@@ -556,9 +556,10 @@ impl Core {
         self.save_now();
         self.close_net();
         // Stopped here, not on helper threads: the process may exit right after.
+        // The viewer first: its window is what the user sees.
         self.enc_rx = never();
-        self.encoder = None;
         self.viewer = None;
+        self.encoder = None;
         // The audio thread ends once it has no more jobs; whichever of us
         // drops the audio engine last stops it (game audio included).
         self.audio_jobs = None;

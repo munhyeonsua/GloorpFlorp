@@ -30,8 +30,7 @@ fn main() {
         cmd.args(["/c", "exit"]);
     }
     gf_sys::hide_console_window(&mut cmd);
-    if let Ok(mut child) = cmd.spawn() {
-        gf_sys::bind_child_to_app_lifetime(&child);
+    if let Ok(mut child) = gf_sys::spawn_bound(&mut cmd) {
         let _ = child.wait();
         println!("child process bound to job object and exited");
     }
