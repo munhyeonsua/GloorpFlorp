@@ -71,7 +71,8 @@ impl Tools {
 /// test encode for each codec (a few seconds total, call off the UI thread).
 /// Non-Windows: the software encoders available in the local FFmpeg.
 ///
-/// Each probe encodes 3 frames of 640×360 black and is killed after 8 s.
+/// Each probe encodes 3 frames of 640×360 black on a D3D11 device (no CUDA)
+/// and is killed after 8 s.
 pub fn probe_encoders(tools: &Tools) -> Vec<VideoCodec> {
     tools::probe_encoders(tools)
 }
@@ -122,7 +123,8 @@ pub enum EncoderEvent {
 ///    step fails where step 2 then works, later starts in the same run of
 ///    the app go straight to step 2.
 /// 2. Safe fallback: `hwdownload` to system memory, CPU scale/turn/convert
-///    (BT.601, tagged), then NVENC.
+///    (BT.601, tagged), then NVENC on a D3D11 device of its own (no CUDA
+///    needed).
 ///
 /// A monitor that Windows shows turned (`gf_sys::Monitor::rotation`) is
 /// captured unturned by Desktop Duplication; the picture is turned upright,

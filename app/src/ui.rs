@@ -348,7 +348,9 @@ impl GloorpApp {
 
             let label = ui.label("Resolution").on_hover_text(
                 "Your screen is scaled down to this height if it is bigger. \
-                 Lower needs less upload speed.",
+                 Lower needs less upload speed. Scaling uses about 250 MB more \
+                 graphics card memory and slows games a little more than sending \
+                 your screen at its own size.",
             );
             let native = monitor.as_ref().map(|m| (m.width, m.height));
             let height_label = |h: Option<u32>| match (h, native) {
@@ -666,6 +668,10 @@ impl GloorpApp {
                             "The viewer window is open. Press f or double-click it for fullscreen.",
                         )
                         .weak(),
+                    )
+                    .on_hover_text(
+                        "Close it while you play and aren't watching: that gives its graphics \
+                         card memory and time back to your game.",
                     );
                 } else if ui
                     .button("Open viewer")

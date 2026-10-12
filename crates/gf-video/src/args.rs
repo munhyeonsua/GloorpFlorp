@@ -18,7 +18,8 @@ pub(crate) enum Step {
     /// way, but not the CPU scaling and colour conversion. (D3D11 frames
     /// can't be mapped to CUDA directly: `hwmap` fails with error -40.)
     GpuCuda,
-    /// `hwdownload` to system memory, CPU scale/turn/convert, NVENC.
+    /// `hwdownload` to system memory, CPU scale/turn/convert, NVENC on
+    /// [`NVENC_D3D11_DEVICE`].
     Cpu,
     /// `testsrc2` + software encoder (non-Windows, or `GLOORP_FAKE_VIDEO=1`).
     TestSource,
@@ -256,6 +257,14 @@ pub(crate) fn pace_filter(fps: u32) -> String {
     )
 }
 
+/// A D3D11 device on the NVIDIA card for NVENC when its frames come from
+/// system memory (the CPU step, the probe). Without one NVENC makes its own
+/// CUDA context: ~180-250 MB more video memory per process on an RTX 5080,
+/// and it fails where CUDA doesn't work. `vendor_id` picks the NVIDIA card
+/// even when it isn't adapter 0 (FFmpeg opens a device on each adapter to
+/// check, ~0.1 s more than naming adapter 0).
+const NVENC_D3D11_DEVICE: [&str; 2] = ["-init_hw_device", "d3d11va=gf:,vendor_id=0x10de"];
+
 fn s(v: &[&str]) -> Vec<String> {
     v.iter().map(|x| x.to_string()).collect()
 }
@@ -318,6 +327,9 @@ pub(crate) fn encoder_args(step: Step, settings: &EncoderSettings, screen: Scree
             }
         }
     } else {
+        if step == Step::Cpu {
+            a.extend(s(&NVENC_D3D11_DEVICE));
+        }
         a.extend(s(&["-f", "lavfi", "-i"]));
         a.push(format!(
             "ddagrab=output_idx={}:framerate={CAPTURE_POLL_FPS}:draw_mouse=1",
@@ -363,13 +375,16 @@ pub(crate) fn encoder_args(step: Step, settings: &EncoderSettings, screen: Scree
     a
 }
 
-/// Tiny test encode used by `probe_encoders`.
+/// Tiny test encode used by `probe_encoders`, on [`NVENC_D3D11_DEVICE`] (not
+/// a CUDA context per probe).
 pub(crate) fn probe_args(encoder: &str) -> Vec<String> {
     s(&[
         "-hide_banner",
         "-nostdin",
         "-loglevel",
         "error",
+        NVENC_D3D11_DEVICE[0],
+        NVENC_D3D11_DEVICE[1],
         "-f",
         "lavfi",
         "-i",
@@ -1085,6 +1100,15 @@ mod tests {
         assert!(j.contains(
             "settb=1/60,hwdownload,format=bgra,format=nv12,setparams=colorspace=bt470bg -fps_mode vfr -c:v"
         ));
+        // Only the CPU step hands NVENC frames in system memory, so only it
+        // brings a D3D11 device (else NVENC makes its own CUDA context).
+        assert!(
+            j.contains("-nostats -init_hw_device d3d11va=gf:,vendor_id=0x10de -f lavfi -i ddagrab")
+        );
+        for step in [Step::GpuDirect, Step::GpuCuda] {
+            let j = joined(&encoder_args(step, &st, upright(3840, 2160)));
+            assert!(!j.contains("-init_hw_device"), "{step:?}: {j}");
+        }
     }
 
     /// The portrait monitor of the PC this was tested on: Windows turns it
@@ -1216,7 +1240,9 @@ mod tests {
             vec![VideoCodec::Av1, VideoCodec::H264]
         );
         assert!(parse_software_encoders("").is_empty());
-        assert!(joined(&probe_args("av1_nvenc")).contains("-c:v av1_nvenc -f null -"));
+        let probe = joined(&probe_args("av1_nvenc"));
+        assert!(probe.contains("-c:v av1_nvenc -f null -"));
+        assert!(probe.contains("-init_hw_device d3d11va=gf:,vendor_id=0x10de -f lavfi"));
     }
 
     #[test]

@@ -259,7 +259,7 @@ with the packaged FFmpeg N-127271, 6 s per run:
   also load their own GPU code, so they could fail where the CPU step still
   works; then the CPU step takes over.) After 1.8 s the user sees the
   "update your NVIDIA graphics driver" message (`cuInit` / `CUDA_ERROR`
-  are among its patterns).
+  are among its patterns). (Fixed since: see "GPU memory".)
 - **Capture pacing** (before the fix; see "Capture pacing fix"): at 60 fps, frames come either evenly
   (frame-gap sd ~3.2–5.5 ms) or with a ~31 ms gap and a ~3 ms gap every few
   frames (sd ~7–9 ms, p95 ~30–34 ms). Native GPU-direct shares were in the
@@ -429,6 +429,60 @@ Scripts and evidence: `scratchpad/hwpace/` (`run1.ps1`, `matrix.ps1`,
 `motion.ps1`, `results.txt`, `motion.txt`, `ev/`); raw streams were
 deleted after decoding.
 
+## GPU memory (2026-10-12)
+
+The friend's RTX 3070 Ti (8 GB) showed ~4 GB of "GPU memory" around
+GloorpFlorp while gaming. GloorpFlorp itself uses about 0.5 GB on the RTX
+5080 at the monitor's own size with the viewer open (UI 65 MB, FFmpeg
+~200 MB native 1440p HEVC in the research, mpv 185–243 MB in a 1792×1008
+window), up to ~0.9 GB when scaled (CUDA path 470–565 MB). Task
+Manager's **Details** tab overcounts: surfaces that processes share (the
+desktop image, mpv's window) count in every process that opens them, so
+here the per-process "Dedicated GPU memory" summed to 32.7 GB (dwm.exe
+19.9 GB, NVIDIA Overlay 10.9 GB) while the card held 2.3 GB. The research
+(CPU encoders, scratchpad `cpuenc/`) found NVENC slows games less than a
+CPU encoder (CPU-heavy stand-in: NVENC ×0.86 fps, x264 superfast ×0.49,
+VP8 ×0.28), so there is no CPU-encoder option.
+
+Changes, measured live on the RTX 5080 (release builds of ace1f87 and the
+change, alternating; a scratch harness around gf-video's real
+`probe_encoders`, `Encoder` and `Viewer`; per-process "GPU Process Memory"
+counters, median of 8–10 s):
+
+| What | Before | After | Cost |
+|---|---|---|---|
+| UI window: wgpu `MemoryHints::MemoryUsage` | 244 MB | 64 MB | none: window shown 522–551 → 510–538 ms after start, same picture (client area pixel-identical) |
+| CPU fallback: NVENC on a D3D11 device (`-init_hw_device d3d11va=gf:,vendor_id=0x10de`) instead of its own CUDA context, exact `Step::Cpu` arguments | 4K→1440p HEVC 455 MB (+168 shared), portrait→810×1440 AV1 403–435 (+130) | 210–242 (+94), 216–248 (+69) | first output ~0.03–0.05 s later; 60 fps, 2.1–2.6 cores either way |
+| Encoder probe, same device | 248–254 MB per FFmpeg (+97–110 shared); whole card +0.70–0.75 GB for under a second at start | 67–74 MB (+26–45); card +0.10–0.19 GB | 0.80–0.82 → 0.98–1.03 s (vendor_id: ~0.1 s of it; adapter 0 would break PCs whose first adapter isn't NVIDIA) |
+
+With CUDA hidden (`CUDA_VISIBLE_DEVICES=-1`) the old build found no encoder
+and a scaled share failed; the new one finds all three, and a scaled share
+falls back to the CPU step (started in 1.6–1.7 s, 60 fps). Native and CUDA
+shares are unchanged (4K HEVC 300 MB; CUDA 1440p 533–565, 1080p 473–536).
+
+Tried and left out:
+- **mpv `--hwdec-extra-frames=2`** (pool 14 → 10 surfaces AV1, 22 → 18
+  H.264/HEVC): −22 MB, every frame shown, same median delay, but with the
+  3D engine 82–96% busy (Vulkan stand-in game) AV1 had 21–79 frames per
+  40 s shown >25 ms apart against 1–12 (max 31–44 against 26–29 ms). Not
+  worth 22 MB.
+- **mpv `--profile=fast`**: ~60 MB less in a scaled window, but softer
+  scaling and no dithering.
+- **CUDA scaling** costs ~250 MB and some 3D engine time (8.5% against
+  4.8%); `scale_d3d11` still fails on NVIDIA. The Resolution tooltip and
+  README say the monitor's own height uses the least.
+
+To check on the 3070 Ti PC: Task Manager → Performance → the NVIDIA GPU,
+"Dedicated GPU memory" with the game running, before and after starting
+GloorpFlorp, sharing, and opening the viewer (expected ~0.5 GB in all;
+Ampere may differ). Not the Details tab (see above). The log should say
+"working NVENC encoders: [Hevc, H264]" and, at the monitor's own height,
+"via GPU (D3D11 -> NVENC)". NVIDIA Instant Replay also uses NVENC and video
+memory.
+
+Scripts and raw numbers: `scratchpad/vram-verify/` (`harness/`, `*.ps1`,
+`*.jsonl`); the research's in `scratchpad/gpumem/` and `scratchpad/cpuenc/`.
+
 ## What the finished crates need from `gf-audio` and `app`
 
 From the agents' reports (also check the code's doc comments):
@@ -519,13 +573,14 @@ From the agents' reports (also check the code's doc comments):
   delay the polling thread and bring back uneven gaps, and with the GPU busy
   drawing another window, 120/144 fps showed a few gaps up to ~18 ms.
 - **CUDA scaling/turning** (`args::CUDA_TRANSFORM`) has only run on the RTX
-  5080. Each frame goes GPU → system memory → GPU (a few % GPU, ~97 MB).
+  5080. Each frame goes GPU → system memory → GPU (a few % GPU; ~250 MB
+  more video memory than a native share, see "GPU memory").
   `scale_d3d11` (fails on NVIDIA with FFmpeg 8, error 80070057) is no longer
   tried. If CUDA doesn't work on the friend's 3070 Ti, the CUDA step exits
-  in ~0.8 s and the CPU step runs, but that also needs CUDA (NVENC with
-  system-memory frames), so only native upright shares would work there;
-  the message tells the user to update the NVIDIA driver. If
-  only the CUDA filters fail, the CPU step costs 0.4–2.1 cores.
+  in ~0.8 s and the CPU step runs (2.1–2.6 cores at 4K → 1440p). Since the
+  GPU-memory change the CPU step and the encoder probe give NVENC a D3D11
+  device, so they no longer need CUDA (checked with CUDA hidden; before,
+  the probe then found no encoder at all).
 - **Viewer focus:** in the app an auto-opened viewer stayed behind the
   window in front and didn't take focus (3 runs; earlier tests where mpv
   took the foreground had the test program itself in front). Not yet tried

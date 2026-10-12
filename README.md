@@ -187,6 +187,8 @@ Good to know:
 - Press **f** or **double-click** the picture to switch fullscreen on or off.
 - Close the window whenever you like. Your friend's PC then stops sending
   video, which saves bandwidth. Click **Open viewer** to bring it back.
+- While you play, close the viewer when you're not watching: the game gets
+  back the graphics card memory (about 200 MB) and time the viewer uses.
 - A newly opened window can stay black for a few seconds, until the next
   full picture arrives.
 
@@ -269,6 +271,10 @@ are going:
   (in tests they sent exactly 120 and 144 pictures per second), but the
   same bitrate is shared by more pictures, so each picture gets less detail.
   If you pick 120 or 144, raise the bitrate too if your upload allows.
+- **Resolution: your monitor's own height uses the least of your graphics
+  card** (on a 1440p monitor, keep 1440p). Scaling the picture down, for
+  example 1080p on a 1440p monitor, uses about 250 MB more graphics card
+  memory and slows games a little more. That matters most on 8 GB cards.
 - **Upload speed matters most.** The sharer's upload speed must be well above
   the bitrate. Test it at [speedtest.net](https://www.speedtest.net). If your
   upload is 30 Mbps, use 20 Mbps or less. With slower upload, choose 1080p
@@ -298,6 +304,7 @@ are going:
 | Everything is slow or laggy | Open Command Prompt and run `tailscale status`. If the line for your friend's PC says **relay** (instead of **direct**), your data goes through Tailscale's relay servers, which are much slower. Restart Tailscale on both PCs, turn off any other VPN and try again. Some home routers need UPnP turned on for a direct connection. Until then, use a low bitrate. |
 | The viewer window stays black | Wait a few seconds. Check that your friend is still sharing and picked the right monitor. Games in exclusive fullscreen can't always be captured: switch the game to borderless windowed. On a laptop, the shared monitor must be connected to the NVIDIA graphics card. Close the viewer and click **Open viewer**. |
 | Video is choppy or freezes now and then | Lower the bitrate (try 15 Mbps) or choose 1080p. Check `tailscale status` for **relay** (see above). Pause downloads. If **dropped frames** in the connection details keeps climbing, the network can't keep up. |
+| A game stutters or runs short of graphics card memory while GloorpFlorp runs | GloorpFlorp itself needs about 0.5 GB of graphics card memory while you share at your monitor's own size with the viewer open (up to about 0.9 GB when your screen is scaled down). Task Manager's **Details** tab shows far more: pictures that programs share are counted in each of them, so dwm.exe or NVIDIA Overlay can show many GB they don't really use. For the real amount, open Task Manager, **Performance**, your NVIDIA GPU, and compare **Dedicated GPU memory** with the game running, before and after you start sharing or open the viewer. To use less: keep **Resolution** at your monitor's own height, close the viewer when you're not watching, and turn off NVIDIA Instant Replay if you don't use it (it records with the graphics card too). |
 | An error about NVENC, the encoder or the driver when you start sharing | Update your NVIDIA driver and restart the PC; this fixes most of these. Then choose another codec (H.264) under **Codec** in "Your screen". Close other programs that record with the graphics card (OBS, NVIDIA Instant Replay) and try again. |
 | "Couldn't find FFmpeg", or the viewer never opens | GloorpFlorp can't find its `ffmpeg` or `mpv` folder. Extract the whole zip again and run `GloorpFlorp.exe` from the extracted folder. If your antivirus removed a file, restore it, then extract again. |
 | Your friend hears no game audio | Check that GloorpFlorp says "Sending game audio." (click **Start sending game audio**) and that the right program is chosen. Some games play sound from a different program than the one with the window: try **Everything except GloorpFlorp**. If you restarted the game, click **Start sending game audio** again. Ask your friend to check their game-audio volume slider and that they're not deafened. |
