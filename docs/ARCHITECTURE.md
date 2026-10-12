@@ -129,7 +129,9 @@ Defaults: AV1 20 Mbps, HEVC 25 Mbps, H.264 35 Mbps at 1440p60; adjustable
   `scale_cuda`/`transpose_cuda` → NVENC. On a live desktop (RTX 5080) it
   starts in ~0.95 s with ~0.1–0.35 CPU cores, against ~1.6 s and 0.4–2.1
   cores for CPU scaling/turning, which stays as the fallback. A GPU step
-  that failed is skipped for the rest of the app run.
+  that failed is skipped for the rest of the app run. The fallback (and the
+  encoder probe) gives NVENC a D3D11 device on the NVIDIA card, so it needs
+  no CUDA and ~200 MB less video memory than NVENC's own CUDA context.
 - **Frame pacing.** Asked for the share's own rate, ddagrab waits on the
   ~15.6 ms Windows timer, so at 60 fps there was often a ~31 ms gap every
   few frames (p95 ~30 ms, up to ~70 ms on a still screen) and 120/144 fps

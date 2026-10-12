@@ -3,7 +3,10 @@
 
 mod ui;
 
-use eframe::egui;
+use std::sync::Arc;
+
+use eframe::egui_wgpu::WgpuSetup;
+use eframe::{egui, wgpu};
 use gloorpflorp::settings::{self, Settings};
 
 fn main() -> anyhow::Result<()> {
@@ -16,7 +19,7 @@ fn main() -> anyhow::Result<()> {
             (Settings::default(), None)
         }
     };
-    let options = eframe::NativeOptions {
+    let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("GloorpFlorp")
             .with_app_id("GloorpFlorp")
@@ -24,6 +27,16 @@ fn main() -> anyhow::Result<()> {
             .with_min_inner_size([440.0, 320.0]),
         ..Default::default()
     };
+    // wgpu's default memory blocks reserve ~245 MB of video memory for this
+    // small window (~65 MB with MemoryUsage), which a game on an 8 GB card
+    // misses.
+    if let WgpuSetup::CreateNew(setup) = &mut options.wgpu_options.wgpu_setup {
+        let base = setup.device_descriptor.clone();
+        setup.device_descriptor = Arc::new(move |adapter| wgpu::DeviceDescriptor {
+            memory_hints: wgpu::MemoryHints::MemoryUsage,
+            ..base(adapter)
+        });
+    }
     let dev = dev_overrides();
     let result = eframe::run_native(
         "GloorpFlorp",
