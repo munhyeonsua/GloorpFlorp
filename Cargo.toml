@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/gf-proto", "crates/gf-net", "crates/gf-video", "crates/gf-audio", "crates/gf-sys", "app"]
+members = ["crates/gf-proto", "crates/gf-net", "crates/gf-video", "crates/gf-audio", "crates/gf-sys", "crates/gf-lobby", "app"]
 
 [workspace.package]
 version = "1.0.0"
@@ -14,6 +14,7 @@ gf-net = { path = "crates/gf-net" }
 gf-video = { path = "crates/gf-video" }
 gf-audio = { path = "crates/gf-audio" }
 gf-sys = { path = "crates/gf-sys" }
+gf-lobby = { path = "crates/gf-lobby" }
 anyhow = "1"
 thiserror = "2"
 log = "0.4"

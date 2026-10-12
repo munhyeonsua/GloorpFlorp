@@ -119,6 +119,24 @@ jobs:
         if: ${{ !cancelled() && steps.test.outcome != 'skipped' }}
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # The image docker-compose.yml builds on a home server: it must build,
+      # and the server must start in it (as its own user, writing /data).
+      - name: Lobby server Docker image
+        if: ${{ !cancelled() && steps.test.outcome != 'skipped' }}
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          docker compose -f packaging/lobby/docker-compose.yml config --quiet
+          docker build -f packaging/lobby/Dockerfile -t gloorp-lobby .
+          docker run -d --name lobby-smoke gloorp-lobby
+          for _ in $(seq 1 20); do
+            if docker logs lobby-smoke 2>&1 | grep -q "lobby on"; then break; fi
+            sleep 0.5
+          done
+          docker logs lobby-smoke 2>&1
+          docker logs lobby-smoke 2>&1 | grep -q "lobby on 0.0.0.0:47900"
+          docker rm -f lobby-smoke
+
   windows:
     name: Windows tests + package
     runs-on: windows-latest

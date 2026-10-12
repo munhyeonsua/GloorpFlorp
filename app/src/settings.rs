@@ -195,6 +195,8 @@ pub struct Settings {
     pub auto_open_viewer: bool,
     /// The room code last typed into Join.
     pub last_code: String,
+    /// The optional lobby server ("host:port"); empty = no lobby.
+    pub lobby: String,
     pub audio: AudioPrefs,
 }
 
@@ -212,6 +214,7 @@ impl Default for Settings {
             game_audio: GameAudioMode::default(),
             auto_open_viewer: true,
             last_code: String::new(),
+            lobby: String::new(),
             audio: AudioPrefs::default(),
         }
     }
@@ -263,6 +266,13 @@ impl Settings {
             self.bitrate_mbps = Some(b.clamp(MIN_BITRATE_MBPS, MAX_BITRATE_MBPS));
         }
         self.keyframe_secs = finite_or(self.keyframe_secs, 2.0).clamp(0.5, 10.0);
+        self.lobby = self
+            .lobby
+            .trim()
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(200)
+            .collect();
         let a = &mut self.audio;
         let da = AudioPrefs::default();
         a.vad_sensitivity = finite_or(a.vad_sensitivity, da.vad_sensitivity).clamp(0.0, 1.0);
@@ -380,6 +390,7 @@ mod tests {
             },
             auto_open_viewer: false,
             last_code: "K7QM-2XPA-9TD".into(),
+            lobby: "gloorp-lobby:47900".into(),
             ..Settings::default()
         };
         s.audio.input_device = Some("Headset Microphone".into());
@@ -457,6 +468,8 @@ mod tests {
         assert_eq!(s.audio.vad_sensitivity, 0.0);
         assert_eq!(s.audio.game_volume, d.audio.game_volume);
         assert_eq!(s.max_height, Some(1440));
+        // A file from before the lobby existed: no lobby.
+        assert_eq!(s.lobby, "");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

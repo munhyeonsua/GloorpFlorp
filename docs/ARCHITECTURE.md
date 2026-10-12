@@ -1,7 +1,10 @@
 # GloorpFlorp architecture
 
 Private screen sharing + voice chat for exactly two Windows PCs with NVIDIA
-GPUs, connected over Tailscale. No servers, accounts, database or analytics.
+GPUs, connected over Tailscale. No accounts, database or analytics, and no
+servers in a room: the two PCs always connect directly. The only server is an
+optional lobby the users run themselves (see [Lobby](#lobby-optional)); the
+app works the same without it.
 
 ## Goals (v1)
 
@@ -16,7 +19,8 @@ GPUs, connected over Tailscale. No servers, accounts, database or analytics.
 - Viewer: friend's screen opens in its own resizable window (fullscreen with
   `f` or double-click).
 - Rooms: the host clicks "Host", gets a code like `K7QM-2XPA-9TD`, sends it
-  to the friend, who pastes it and clicks "Join".
+  to the friend, who pastes it and clicks "Join". With the optional lobby,
+  "Invite" does the same without copying the code.
 - Connection details panel (ping, bitrates, drops, audio loss) and a
   plain-language error line.
 
@@ -52,12 +56,14 @@ crates/gf-sys     OS-specific: monitors, process loopback audio, key polling,
 crates/gf-net     the TCP+UDP session between the two PCs
 crates/gf-video   FFmpeg encoder process, mpv viewer process
 crates/gf-audio   mic → processing → Opus, game audio → Opus, jitter, mixing, playback
+crates/gf-lobby   optional lobby: protocol, the app's client, the server binary
 app               engine (wires everything) + egui UI + settings + logging
 ```
 
 Dependency direction: `app → {gf-net, gf-video, gf-audio, gf-sys} → gf-proto`
-(`gf-video` and `gf-audio` also use `gf-sys`). Crates never depend sideways
-otherwise. The public API of each crate is in its `lib.rs`; doc comments
+(`gf-video` and `gf-audio` also use `gf-sys`). `app → gf-lobby`, which uses no
+other gf crate (so its server builds alone in Docker). Crates never depend
+sideways otherwise. The public API of each crate is in its `lib.rs`; doc comments
 there are the contract.
 
 ## Data flow
@@ -155,11 +161,57 @@ Defaults: AV1 20 Mbps, HEVC 25 Mbps, H.264 35 Mbps at 1440p60; adjustable
   decoding holds 3 frames, ~47 ms). `$` in the window title is written as
   `$$` (mpv expands `${...}`). mpv's stdout and stderr both go to the log.
 
+## Lobby (optional)
+
+An always-on server on a home server in the tailnet (`packaging/lobby`:
+Docker, with the official `tailscale/tailscale` container as its network)
+that carries text chat, who is online, and invites. Rooms stay 1:1 and
+peer-to-peer: an invite carries only a room code, and the invited app joins
+exactly as if the code had been pasted. The engine and gf-net don't know the
+lobby exists.
+
+- **Protocol** (`gf_lobby`): newline-delimited JSON over TCP 47900, tagged
+  by `"t"`, with a protocol version in `Hello`/`Welcome`. The server reads
+  client lines with a 16 KB cap (longer ends the connection), ignores lines
+  that don't parse, cleans names (40 chars) and messages (1000 chars), rate
+  limits chat and invites (bursts of 5, then 1/s per connection), and takes
+  at most 64 connections. `Ping` every 20 s; 60 s of silence drops a
+  connection.
+- **Identity:** the connection's Tailscale address (Tailscale already
+  authenticates devices; no accounts or passwords) plus the name the app
+  sends. Only Tailscale addresses (100.64.0.0/10, fd7a:115c:a1e0::/48) and
+  loopback are accepted; loopback connections (development) are told apart
+  by name. This needs Tailscale's kernel networking in the container
+  (`TS_USERSPACE=false`): in userspace mode every connection would come from
+  127.0.0.1.
+- **Storage:** `members.json` (everyone who ever joined, written via a
+  temporary file; a damaged one stops the server rather than being
+  overwritten) and `chat.jsonl` (appended per message) in the data volume.
+  The last 200 messages are sent to each newcomer.
+- **Presence:** every 5 s the server asks tailscaled's LocalAPI over its Unix
+  socket (shared from the tailscale container through a volume):
+  `GET /localapi/v0/status` (`Host: local-tailscaled.sock`), mapping each
+  `Peer[*].TailscaleIPs` to `Peer[*].Online` (`Self` is the server). States:
+  *In the lobby* (app connected), *Online* (Tailscale online, app not in the
+  lobby), *Offline*. Without the socket (e.g. on Windows) only *In the
+  lobby* / *Offline*.
+- **App:** the window owns a `gf_lobby::client::Client` (its own threads,
+  reconnects after 1 s doubling to 30 s, repaints the window on events) while
+  a lobby address is set. Invites are built on the existing commands: A's
+  window sends `Command::Host`, and once the room is open (`Hosting` with a
+  code) sends `Invite{to, code}`. B's window shows Accept/Deny and asks for
+  attention (taskbar flash); Accept sends `Command::Join(code)`. Deny, or no
+  answer within 60 s, makes A's window send `Command::Leave` if the room is
+  still waiting. An invite that arrives while B isn't idle is declined
+  automatically, so a call is never interrupted.
+
 ## Ports and firewall
 
 Host uses TCP and UDP port 47800 on its Tailscale address. The first time
 the host app listens, Windows Firewall asks for permission; the user must
-click Allow. The README explains this.
+click Allow. The README explains this. The optional lobby server listens on
+TCP 47900 (in the Docker setup it is reachable only through Tailscale); the
+app only connects out to it.
 
 ## Testing strategy
 
@@ -168,6 +220,10 @@ click Allow. The README explains this.
   checking the viewer byte stream decodes cleanly, also when started from a
   later keyframe.
 - `gf-net`: loopback tests on 127.0.0.1 (host + joiner in one process).
+- `gf-lobby`: a real server and clients on 127.0.0.1 (chat, persistence
+  across a restart, invite routing, presence, malformed and oversize lines,
+  rate limit), plus parsing a canned tailscaled status. CI's Linux job builds
+  the Docker image and starts the server in it.
 - `gf-video`: non-Windows dev mode uses `testsrc2` + software encoders, so the
   encoder process + splitter can be tested on Linux.
 - `gf-audio`: unit tests for the pure parts (resampling glue, gating, Opus
