@@ -265,7 +265,7 @@ If you have an always-on PC or home server in your Tailscale network, you can
 run a small **lobby** on it. Everyone who uses it gets:
 
 - a **text chat** that is kept (new messages and the last 200 when you open
-  GloorpFlorp),
+  GloorpFlorp, each with how long ago it was sent),
 - a **member list** that shows who has GloorpFlorp open (**In the lobby**,
   green), whose PC is on in Tailscale (**Online**, yellow) and who is
   **Offline**,
@@ -317,11 +317,13 @@ somewhere else.
 - **Invite:** click **Invite** next to a friend who is in the lobby.
   GloorpFlorp opens a room and sends them the code. If they accept, they
   join as if they had pasted the code. If they deny, or don't answer within
-  a minute, your room is closed again. The one who invites hosts the room,
-  so with two Tailscale accounts the person whose PC is shared invites.
+  a minute, your room is closed again. If you close the room (or it closes)
+  before they answer, the invite disappears on their side too. The one who
+  invites hosts the room, so with two Tailscale accounts the person whose PC
+  is shared invites.
 - **Getting invited:** a blue box at the top asks you to **Accept** or
-  **Deny**, and the taskbar button flashes. If you're already in a room,
-  the invite is declined for you.
+  **Deny**, and the taskbar button flashes (also while GloorpFlorp is
+  minimized). If you're already in a room, the invite is declined for you.
 
 ## Recommended settings and tips
 

@@ -174,9 +174,11 @@ lobby exists.
   by `"t"`, with a protocol version in `Hello`/`Welcome`. The server reads
   client lines with a 16 KB cap (longer ends the connection), ignores lines
   that don't parse, cleans names (40 chars) and messages (1000 chars), rate
-  limits chat and invites (bursts of 5, then 1/s per connection), and takes
-  at most 64 connections. `Ping` every 20 s; 60 s of silence drops a
-  connection.
+  limits chat and invites (bursts of 5, then 1/s per connection), takes one
+  `Hello` per connection (each replays the history) and at most 64
+  connections. `Ping` every 20 s; 60 s of silence drops a connection. The
+  hub thread writes to every socket itself (5 s write timeout), so a client
+  that stops reading stalls the others until it is dropped.
 - **Identity:** the connection's Tailscale address (Tailscale already
   authenticates devices; no accounts or passwords) plus the name the app
   sends. Only Tailscale addresses (100.64.0.0/10, fd7a:115c:a1e0::/48) and
@@ -186,8 +188,9 @@ lobby exists.
   127.0.0.1.
 - **Storage:** `members.json` (everyone who ever joined, written via a
   temporary file; a damaged one stops the server rather than being
-  overwritten) and `chat.jsonl` (appended per message) in the data volume.
-  The last 200 messages are sent to each newcomer.
+  overwritten) and `chat.jsonl` (appended per message, with the server's
+  time) in the data volume. The last 200 messages are sent to each
+  newcomer.
 - **Presence:** every 5 s the server asks tailscaled's LocalAPI over its Unix
   socket (shared from the tailscale container through a volume):
   `GET /localapi/v0/status` (`Host: local-tailscaled.sock`), mapping each
@@ -203,7 +206,14 @@ lobby exists.
   attention (taskbar flash); Accept sends `Command::Join(code)`. Deny, or no
   answer within 60 s, makes A's window send `Command::Leave` if the room is
   still waiting. An invite that arrives while B isn't idle is declined
-  automatically, so a call is never interrupted.
+  automatically, so a call is never interrupted. Replies carry the room
+  code, so each belongs to one invite. If A's room closes or changes before
+  B answers, A sends `Cancel` and B's box goes away. An invite the server
+  can't deliver (B left, or the rate limit) comes back as `InviteFailed`
+  and closes A's room at once; while the lobby is disconnected the member
+  list is empty, so nobody can be invited. The window does all this in
+  `App::logic`, which eframe also runs while the window is minimized
+  (`App::ui` doesn't run then).
 
 ## Ports and firewall
 

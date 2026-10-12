@@ -105,6 +105,7 @@ fn chat_invites_presence_and_bad_input() {
     );
     b.send(ToServer::Reply {
         to: alice.clone(),
+        code: "K7QM-2XPA-9TD".into(),
         accept: false,
     });
     let ev = a.events.recv_timeout(WAIT).unwrap();
@@ -112,17 +113,43 @@ fn chat_invites_presence_and_bad_input() {
         ev,
         ToClient::Replied {
             from: bob.clone(),
+            code: "K7QM-2XPA-9TD".into(),
             accept: false
         }
     );
+    a.send(ToServer::Cancel {
+        to: bob.clone(),
+        code: "K7QM-2XPA-9TD".into(),
+    });
+    let ev = b.events.recv_timeout(WAIT).unwrap();
+    assert_eq!(
+        ev,
+        ToClient::Cancelled {
+            from: alice.clone(),
+            code: "K7QM-2XPA-9TD".into()
+        }
+    );
+    // An invite nobody can get comes back, so the room doesn't wait.
+    a.send(ToServer::Invite {
+        to: "100.64.0.9".into(),
+        code: "AAAA-BBBB-CCC".into(),
+    });
+    let ev = a.events.recv_timeout(WAIT).unwrap();
+    assert!(
+        matches!(&ev, ToClient::InviteFailed { to, code, .. }
+            if to == "100.64.0.9" && code == "AAAA-BBBB-CCC"),
+        "{ev:?}"
+    );
     assert!(a.events.try_recv().is_err() && b.events.try_recv().is_err());
 
-    // A line that doesn't parse is skipped; an oversize line ends only that
-    // connection.
+    // A line that doesn't parse is skipped, and so is a second Hello; an
+    // oversize line ends only that connection.
     let mut raw = TcpStream::connect(addr).unwrap();
     raw.write_all(b"{\"t\":\"chat\",\"text\":\"before hello\"}\n")
         .unwrap();
     raw.write_all(b"{\"t\":\"hello\",\"v\":1,\"name\":\"Mallory\"}\nnot json\n{\"t\":\"nope\"}\n")
+        .unwrap();
+    raw.write_all(b"{\"t\":\"hello\",\"v\":1,\"name\":\"Again\"}\n")
         .unwrap();
     raw.write_all(b"{\"t\":\"chat\",\"text\":\"after garbage\"}\n")
         .unwrap();
@@ -130,6 +157,7 @@ fn chat_invites_presence_and_bad_input() {
         has_chat(s, "Mallory", "after garbage")
     });
     assert!(!sa.chat.iter().any(|c| c.text == "before hello"));
+    assert_eq!(state_of(&sa, "Again"), None);
     // The server may close (or reset) the connection before all of it is sent.
     let _ = raw.write_all(&vec![b'x'; MAX_CLIENT_LINE + 10]);
     raw.set_read_timeout(Some(WAIT)).unwrap();
@@ -159,6 +187,7 @@ fn chat_invites_presence_and_bad_input() {
     });
     let texts: Vec<&str> = sc.chat.iter().map(|c: &ChatLine| c.text.as_str()).collect();
     assert_eq!(texts, ["hi Bob", "after garbage", "still here"]);
+    assert!(sc.chat.iter().all(|c| c.at > 0), "{:?}", sc.chat);
     for name in ["Alice", "Bob", "Mallory"] {
         assert_eq!(state_of(&sc, name), Some(Presence::Offline), "{name}");
     }

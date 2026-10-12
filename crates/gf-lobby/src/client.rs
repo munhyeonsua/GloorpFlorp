@@ -38,7 +38,7 @@ pub struct State {
 pub struct Client {
     tx: Sender<ToServer>,
     state: Arc<Mutex<State>>,
-    /// `Invited`, `Replied` and `Error` from the server, for the window.
+    /// Invites, answers and problems from the server, for the window.
     pub events: Receiver<ToClient>,
 }
 
@@ -96,6 +96,9 @@ fn run(
             if std::mem::take(&mut s.connected) {
                 wait = Duration::from_secs(1);
             }
+            // Who is around isn't known any more (nobody can be invited);
+            // the chat stays readable.
+            s.members.clear();
             log::info!("lobby: {problem}");
             s.problem = Some(problem);
         }

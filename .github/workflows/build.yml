@@ -120,7 +120,8 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       # The image docker-compose.yml builds on a home server: it must build,
-      # and the server must start in it (as its own user, writing /data).
+      # the server must start in it, and its user must be able to write /data
+      # (the files appear only after the first hello, so check the folder).
       - name: Lobby server Docker image
         if: ${{ !cancelled() && steps.test.outcome != 'skipped' }}
         timeout-minutes: 15
@@ -135,6 +136,7 @@ jobs:
           done
           docker logs lobby-smoke 2>&1
           docker logs lobby-smoke 2>&1 | grep -q "lobby on 0.0.0.0:47900"
+          docker exec lobby-smoke test -w /data
           docker rm -f lobby-smoke
 
   windows:

@@ -21,6 +21,7 @@ agents that built the crates: `.claude/handoff/phase1-agent-reports.json` (proto
 | `.github/workflows/build.yml`, `packaging/`, `README.md` | ✅ done | actionlint clean; packaging script run end to end with the real FFmpeg zip |
 | `gf-audio`: mic, echo cancellation, Opus, jitter, mixing, playback, game audio | ✅ done | 48 pass |
 | `app`: engine, settings, logging, egui UI, end-to-end test | ✅ done | 7 + 2 (UI) unit + 4 end-to-end pass |
+| `gf-lobby` (optional lobby: protocol, the app's client, the `gloorp-lobby` server, `packaging/lobby` Docker files) and the app's Lobby panel | ✅ code done; Docker, real presence and the panel's look unverified (see "Known risks") | 3 unit + 2 integration (real server and clients on 127.0.0.1) + 2 UI unit pass; invites answered while the app is minimized (checked with the real app) |
 | Integration (everything together, release build) | ✅ done on the owner's PC (Windows 11, MSVC): `cargo build --workspace`, `cargo test --workspace` (with and without FFmpeg/mpv), `cargo clippy --workspace --all-targets -D warnings`, `cargo fmt --all -- --check`, `cargo build --release -p gloorpflorp` → `target\release\GloorpFlorp.exe` | all pass |
 
 Most of the app has now run on the owner's PC, including a real screen
@@ -64,6 +65,7 @@ pacing fix").
    the source archives: four, or five when the FFmpeg inside mpv is a
    different commit from ffmpeg.exe's (`licenses/SOURCES.txt` says which).
 6. **First session with the friend.** The friend's 3070 Ti PC needs an up-to-date NVIDIA driver (FFmpeg master needs a recent NVENC API). Judge delay and echo by ear (nothing audible was played in the tests), and keep both PCs' log files. 60 fps is the default; 120/144 now send exactly that rate, but spread the same bitrate over more frames, and the pacing fix's CPU cost (~1 core) is only measured on the 9800X3D, so check Task Manager on the 3070 Ti PC.
+7. **Lobby (optional), first real run.** On the home server: `TS_AUTHKEY=… docker compose up -d --build` in `packaging/lobby`, then check that the members show **Online**/**Offline** as the PCs come and go (tailscaled's LocalAPI), look over the Lobby panel, and send an invite between the two PCs (also to a minimized GloorpFlorp).
 
 ## Decisions made after ARCHITECTURE.md was written
 
@@ -548,6 +550,19 @@ From the agents' reports (also check the code's doc comments):
   Windows never activates capture, `start()` gives up after 10 s and leaves
   a stuck thread (logged).
 - `list_monitors` only lists adapter 0's outputs (what ddagrab uses).
+- **Lobby: not run outside this PC's tests.** The Dockerfile and
+  docker-compose.yml have never been built or started here (no Docker on
+  this PC). CI's Linux job builds the image, starts the server and checks
+  that its user can write `/data`, but never runs compose or the tailscale
+  container. Presence from tailscaled's LocalAPI has never read a real
+  tailscaled: the parser is only tested on a canned status shaped like
+  `tailscale status --json`. Nobody has looked at the Lobby panel yet.
+  Checked here: the server with real clients on
+  127.0.0.1 (tests), and the real app answering, replacing and dropping
+  invites while minimized (`scratchpad/lobby-fix/minimized.ps1`). Known
+  limit: the server's hub writes to every socket itself, so a member that
+  stops reading stalls chat for everyone for up to 5 s before it is dropped
+  (a `shortcut:` in `server.rs`).
 - **FFmpeg 8.0 or newer is required** for sharing the screen: the pacing
   filter uses `setpts=…:strip_fps=1`, an option FFmpeg 8.0 added (absent at
   n6.1.1, n7.0, n7.1). The zip ships BtbN's master build, so the app is

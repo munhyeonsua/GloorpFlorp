@@ -20,8 +20,8 @@ use crossbeam_channel::Sender;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    encode, read_line, ChatLine, Member, Presence, ToClient, ToServer, HISTORY, IDLE_TIMEOUT,
-    MAX_CLIENT_LINE, MAX_NAME, MAX_TEXT, PROTOCOL,
+    encode, read_line, unix_now, ChatLine, Member, Presence, ToClient, ToServer, HISTORY,
+    IDLE_TIMEOUT, MAX_CLIENT_LINE, MAX_NAME, MAX_TEXT, PROTOCOL,
 };
 
 pub struct Config {
@@ -40,6 +40,7 @@ const TAILNET_POLL: Duration = Duration::from_secs(5);
 const BURST: f32 = 5.0;
 /// Room codes are 13 characters; leave room for spaces.
 const MAX_CODE: usize = 40;
+const TOO_FAST: &str = "You're sending messages too fast. Wait a moment.";
 
 enum Ev {
     Open {
@@ -288,18 +289,26 @@ impl Hub {
             return;
         };
         match (msg, conn.member.clone()) {
-            (ToServer::Hello { v, name }, _) => self.hello(id, v, &name),
             (ToServer::Ping, _) => self.send(id, &ToClient::Pong),
+            (ToServer::Hello { v, name }, None) => self.hello(id, v, &name),
+            // Once per connection: each one replays the whole history.
+            (ToServer::Hello { .. }, Some(_)) => {}
             // Everything else needs a Hello first.
             (_, None) => {}
             (ToServer::Chat { text }, Some(me)) => {
                 let text = clean(&text, MAX_TEXT);
-                if text.is_empty() || !self.allow(id) {
+                if text.is_empty() {
+                    return;
+                }
+                if !self.allow(id) {
+                    let text = TOO_FAST.into();
+                    self.send(id, &ToClient::Error { text });
                     return;
                 }
                 let line = ChatLine {
                     name: self.members[&me].name.clone(),
                     from: me,
+                    at: unix_now(),
                     text,
                 };
                 self.append_chat(&line);
@@ -310,24 +319,38 @@ impl Hub {
                 self.broadcast(&ToClient::Chat(line));
             }
             (ToServer::Invite { to, code }, Some(me)) => {
-                if !self.allow(id) {
-                    return;
-                }
+                let code = clean(&code, MAX_CODE);
                 let invite = ToClient::Invited {
                     name: self.members[&me].name.clone(),
                     from: me,
-                    code: clean(&code, MAX_CODE),
+                    code: code.clone(),
                 };
-                if !self.send_to_member(&to, &invite) {
-                    let text = "They aren't in the lobby any more.".into();
-                    self.send(id, &ToClient::Error { text });
-                }
+                // The inviter's room waits for an answer, so say why none
+                // will come.
+                let text = if !self.allow(id) {
+                    TOO_FAST
+                } else if !self.send_to_member(&to, &invite) {
+                    "They aren't in the lobby any more."
+                } else {
+                    return;
+                };
+                let text = text.into();
+                self.send(id, &ToClient::InviteFailed { to, code, text });
             }
-            // shortcut: a reply isn't checked against a sent invite, so any
-            // member could close someone's waiting room; track invites if the
-            // lobby is ever shared with people you don't trust.
-            (ToServer::Reply { to, accept }, Some(me)) => {
-                self.send_to_member(&to, &ToClient::Replied { from: me, accept });
+            // Not checked against sent invites: the apps match the room
+            // code, which only the two of them know.
+            (ToServer::Reply { to, code, accept }, Some(me)) => {
+                let code = clean(&code, MAX_CODE);
+                let replied = ToClient::Replied {
+                    from: me,
+                    code,
+                    accept,
+                };
+                self.send_to_member(&to, &replied);
+            }
+            (ToServer::Cancel { to, code }, Some(me)) => {
+                let code = clean(&code, MAX_CODE);
+                self.send_to_member(&to, &ToClient::Cancelled { from: me, code });
             }
         }
     }
@@ -385,8 +408,6 @@ impl Hub {
         c.tokens = (c.tokens + refill).min(BURST);
         c.refilled = now;
         if c.tokens < 1.0 {
-            let text = "You're sending messages too fast. Wait a moment.".into();
-            self.send(id, &ToClient::Error { text });
             return false;
         }
         c.tokens -= 1.0;
@@ -433,6 +454,10 @@ impl Hub {
         self.write(id, &encode(msg));
     }
 
+    // shortcut: the hub writes to each socket itself, so a connection that
+    // stops reading holds everyone up for up to WRITE_TIMEOUT before it is
+    // dropped; give each connection its own writer thread and bounded queue
+    // if the lobby is ever shared beyond friends' devices.
     fn write(&mut self, id: u64, line: &[u8]) {
         let Some(c) = self.conns.get_mut(&id) else {
             return;

@@ -11,7 +11,7 @@ use eframe::egui::{
     self, Align, Color32, ComboBox, Grid, Layout, ProgressBar, RichText, Slider, TextEdit, Ui,
 };
 use gf_lobby::client::{Client, State as LobbyState};
-use gf_lobby::{Presence, ToClient, ToServer, MAX_TEXT};
+use gf_lobby::{unix_now, Presence, ToClient, ToServer, MAX_TEXT};
 use gf_proto::VideoCodec;
 use gloorpflorp::engine::{
     Command, Engine, EngineOptions, Phase, ShareState, Snapshot, NO_ENCODER,
@@ -407,13 +407,23 @@ impl GloorpApp {
             let age = now.duration_since(o.since);
             match invite_step(&self.snap.phase, o.code.as_deref(), age) {
                 InviteStep::Wait => {}
-                InviteStep::Send(code) => {
+                InviteStep::Send(code) if self.lobby_state.connected => {
                     lobby.send(ToServer::Invite {
                         to: o.to.clone(),
                         code: code.clone(),
                     });
                     o.code = Some(code);
                     o.since = now;
+                }
+                // It would be dropped, and the room would wait for nothing.
+                InviteStep::Send(_) => {
+                    note = Some(format!(
+                        "Lost the connection to the lobby, so {} wasn't invited and the room \
+                         was closed.",
+                        o.name
+                    ));
+                    self.commands.push(Command::Leave);
+                    done = true;
                 }
                 InviteStep::TimedOut => {
                     note = Some(format!("{} didn't answer, so the room was closed.", o.name));
@@ -424,12 +434,23 @@ impl GloorpApp {
             }
         }
         if done {
-            self.outgoing = None;
+            // Ended without an answer: take it back, so their box doesn't
+            // offer a room that is gone (once they joined they have no box).
+            if let Some(Outgoing {
+                to,
+                code: Some(code),
+                ..
+            }) = self.outgoing.take()
+            {
+                lobby.send(ToServer::Cancel { to, code });
+            }
         }
         for ev in lobby.events.try_iter() {
             match ev {
                 ToClient::Invited { from, name, code } => {
-                    if self.snap.phase == Phase::Idle && self.incoming.is_none() {
+                    // A newer invite from the same friend replaces theirs.
+                    let free = self.incoming.as_ref().is_none_or(|i| i.from == from);
+                    if self.snap.phase == Phase::Idle && free {
                         ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
                             egui::UserAttentionType::Informational,
                         ));
@@ -443,18 +464,37 @@ impl GloorpApp {
                         // Busy: don't interrupt a call.
                         lobby.send(ToServer::Reply {
                             to: from,
+                            code,
                             accept: false,
                         });
                     }
                 }
-                ToClient::Replied { from, accept } => {
-                    if let Some(o) = self.outgoing.take_if(|o| o.to == from) {
+                ToClient::Replied { from, code, accept } => {
+                    let mine = |o: &mut Outgoing| o.to == from && o.code.as_ref() == Some(&code);
+                    if let Some(o) = self.outgoing.take_if(mine) {
                         if !accept {
                             note = Some(format!("{} declined.", o.name));
                             if matches!(self.snap.phase, Phase::Hosting { .. }) {
                                 self.commands.push(Command::Leave);
                             }
                         }
+                    }
+                }
+                ToClient::InviteFailed { to, code, text } => {
+                    let mine = |o: &mut Outgoing| o.to == to && o.code.as_ref() == Some(&code);
+                    if let Some(o) = self.outgoing.take_if(mine) {
+                        note = Some(format!(
+                            "{} wasn't invited, so the room was closed. {text}",
+                            o.name
+                        ));
+                        if matches!(self.snap.phase, Phase::Hosting { .. }) {
+                            self.commands.push(Command::Leave);
+                        }
+                    }
+                }
+                ToClient::Cancelled { from, code } => {
+                    if let Some(i) = self.incoming.take_if(|i| i.from == from && i.code == code) {
+                        note = Some(format!("{} closed the room.", i.name));
                     }
                 }
                 ToClient::Error { text } => note = Some(text),
@@ -507,6 +547,7 @@ impl GloorpApp {
             if let Some(lobby) = &self.lobby {
                 lobby.send(ToServer::Reply {
                     to: inv.from,
+                    code: inv.code.clone(),
                     accept,
                 });
             }
@@ -630,8 +671,12 @@ impl GloorpApp {
                 if s.chat.is_empty() {
                     ui.label(RichText::new("No messages yet.").weak());
                 }
+                let now = unix_now();
                 for c in &s.chat {
                     ui.horizontal_wrapped(|ui| {
+                        if c.at > 0 {
+                            ui.label(RichText::new(ago(c.at, now)).weak());
+                        }
                         ui.label(RichText::new(format!("{}:", shorten(&c.name, 24))).strong());
                         ui.label(&c.text);
                     });
@@ -1341,10 +1386,30 @@ impl GloorpApp {
 }
 
 impl eframe::App for GloorpApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    // Runs before every `ui`, and also while the window is minimized (when
+    // `ui` doesn't), so invites are shown (taskbar flash), answered and timed
+    // out there too.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.snap = self.engine.snapshot();
+        self.poll_lobby(ctx);
+        for c in self.commands.drain(..) {
+            self.engine.send(c);
+        }
+        let busy = self.binding.is_some();
+        let live = !matches!(self.snap.phase, Phase::Idle)
+            || !matches!(self.snap.my_share, ShareState::Off);
+        let every = if busy {
+            Duration::from_millis(50)
+        } else if live {
+            Duration::from_millis(100)
+        } else {
+            Duration::from_millis(250)
+        };
+        ctx.request_repaint_after(every);
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_key_binding(ui.ctx());
-        self.poll_lobby(&ui.ctx().clone());
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical()
                 .auto_shrink(false)
@@ -1376,17 +1441,6 @@ impl eframe::App for GloorpApp {
         for c in self.commands.drain(..) {
             self.engine.send(c);
         }
-        let busy = self.binding.is_some();
-        let live = !matches!(self.snap.phase, Phase::Idle)
-            || !matches!(self.snap.my_share, ShareState::Off);
-        let every = if busy {
-            Duration::from_millis(50)
-        } else if live {
-            Duration::from_millis(100)
-        } else {
-            Duration::from_millis(250)
-        };
-        ui.ctx().request_repaint_after(every);
     }
 
     fn on_exit(&mut self) {
@@ -1529,6 +1583,16 @@ fn shorten(s: &str, max: usize) -> String {
     }
 }
 
+/// How long before `now` the Unix time `at` was, in short.
+fn ago(at: u64, now: u64) -> String {
+    match now.saturating_sub(at) {
+        s if s < 60 => "just now".into(),
+        s if s < 3600 => format!("{} min ago", s / 60),
+        s if s < 86400 => format!("{} h ago", s / 3600),
+        s => format!("{} d ago", s / 86400),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1634,6 +1698,17 @@ mod tests {
             invite_step(&hosting("NEW", true), sent, s(5)),
             InviteStep::Done
         );
+    }
+
+    #[test]
+    fn chat_ages() {
+        let t = 1_790_000_000;
+        assert_eq!(ago(t, t + 59), "just now");
+        assert_eq!(ago(t, t + 5 * 60 + 1), "5 min ago");
+        assert_eq!(ago(t, t + 3 * 3600), "3 h ago");
+        assert_eq!(ago(t, t + 2 * 86400 + 5), "2 d ago");
+        // The server's clock may be a little ahead.
+        assert_eq!(ago(t + 5, t), "just now");
     }
 
     #[test]

@@ -10,6 +10,11 @@
 //! connection; a line that doesn't parse is ignored (a newer version may send
 //! kinds this one doesn't know).
 //!
+//! Invites: `Invite` reaches the member as `Invited`; they answer with
+//! `Reply` (`Replied`), or the inviter takes it back with `Cancel`
+//! (`Cancelled`). All carry the room code, so an answer belongs to exactly one
+//! invite. An invite that can't be delivered comes back as `InviteFailed`.
+//!
 //! Members are identified by their connection's Tailscale address (Tailscale
 //! already authenticates every device) plus the name they send. Connections
 //! from the server's own machine (loopback, development only) are told apart
@@ -22,7 +27,7 @@ pub mod client;
 pub mod server;
 
 use std::io::{self, BufRead, Read};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -58,10 +63,17 @@ pub enum ToServer {
         to: String,
         code: String,
     },
-    /// Answer member `to`'s invite.
+    /// Answer member `to`'s invite to room `code`.
     Reply {
         to: String,
+        code: String,
         accept: bool,
+    },
+    /// Take back my invite to member `to` (my room closed before they
+    /// answered).
+    Cancel {
+        to: String,
+        code: String,
     },
     Ping,
 }
@@ -86,7 +98,19 @@ pub enum ToClient {
     },
     Replied {
         from: String,
+        code: String,
         accept: bool,
+    },
+    /// `from` took back their invite to room `code`.
+    Cancelled {
+        from: String,
+        code: String,
+    },
+    /// My invite to `to` didn't go out; `text` says why in plain words.
+    InviteFailed {
+        to: String,
+        code: String,
+        text: String,
     },
     /// A problem in plain words (wrong version, sending too fast, ...).
     Error {
@@ -118,7 +142,17 @@ pub struct ChatLine {
     /// Member id.
     pub from: String,
     pub name: String,
+    /// When the server got it, in Unix seconds (0: not known).
+    #[serde(default)]
+    pub at: u64,
     pub text: String,
+}
+
+/// Now, in Unix seconds.
+pub fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// `msg` as one line.
@@ -170,11 +204,17 @@ mod tests {
         let line = encode(&ToClient::Chat(ChatLine {
             from: "100.64.0.1".into(),
             name: "A".into(),
+            at: 1_790_000_000,
             text: "hi".into(),
         }));
         assert_eq!(
             String::from_utf8(line).unwrap(),
-            "{\"t\":\"chat\",\"from\":\"100.64.0.1\",\"name\":\"A\",\"text\":\"hi\"}\n"
+            "{\"t\":\"chat\",\"from\":\"100.64.0.1\",\"name\":\"A\",\"at\":1790000000,\"text\":\"hi\"}\n"
         );
+        // Saved before messages had a time.
+        let old: ChatLine =
+            serde_json::from_str("{\"from\":\"100.64.0.1\",\"name\":\"A\",\"text\":\"hi\"}")
+                .unwrap();
+        assert_eq!(old.at, 0);
     }
 }
