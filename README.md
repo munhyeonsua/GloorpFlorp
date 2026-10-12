@@ -239,8 +239,10 @@ Also:
   it on or off, also while the game is in focus or GloorpFlorp is minimized
   (unless the game runs as administrator, like push-to-talk). **Clear**
   removes the shortcut. The game still receives the key too, so pick one you
-  don't use in the game. A key can only do one thing: your push-to-talk key
-  (even while push-to-talk is off) or the other shortcut's key isn't taken.
+  don't use in the game. Each key can do only one thing, so you can't pick
+  your push-to-talk key (even while push-to-talk is off) or the other
+  shortcut's key. To use the push-to-talk key here, choose Push-to-talk,
+  change its key, then switch back.
 - **Volume**: separate sliders for your friend's voice and your friend's game
   audio.
 - **Microphone and speakers**: choose them under "Voice". "System default"

@@ -908,18 +908,11 @@ impl GloorpApp {
             Some(ESC) => self.binding = None,
             Some(vk) if b.armed => {
                 let s = &mut self.settings;
-                let name = gf_sys::keys::name(vk);
-                // shortcut: the push-to-talk key counts as taken even while
-                // push-to-talk is off (it's kept for when it's back on); free
-                // it then if people want that key for Mute or Deafen.
-                let taken = BindTarget::ALL
-                    .into_iter()
-                    .find(|&t| t != b.target && t.key(s) == Some(vk));
-                if let Some(other) = taken {
-                    b.refused = Some(format!("{name} is already the {} key.", other.label()));
+                if let Some(why) = refusal(s, b.target, vk) {
+                    b.refused = Some(why);
                     return;
                 }
-                log::info!("{} key set to {name}", b.target.label());
+                log::info!("{} key set to {}", b.target.label(), gf_sys::keys::name(vk));
                 match b.target {
                     BindTarget::PushToTalk => s.audio.ptt_key = vk,
                     BindTarget::Mute => s.mute_key = Some(vk),
@@ -1125,6 +1118,31 @@ fn key_button(
     let r = ui.button("Clear").on_hover_text("Remove this shortcut.");
     set_accessible_name(&r, &format!("Clear the {} key", target.label()));
     r.clicked()
+}
+
+/// Why `vk` can't be `target`'s key (another binding has it), or `None`.
+fn refusal(s: &Settings, target: BindTarget, vk: u32) -> Option<String> {
+    let other = BindTarget::ALL
+        .into_iter()
+        .find(|&t| t != target && t.key(s) == Some(vk))?;
+    let (name, label) = (gf_sys::keys::name(vk), other.label());
+    Some(match other {
+        // shortcut: the push-to-talk key counts as taken even while
+        // push-to-talk is off (it's kept for when it's back on); free it
+        // then if people want that key for Mute or Deafen.
+        BindTarget::PushToTalk if s.audio.voice_mode != VoiceModeChoice::PushToTalk => format!(
+            "{name} is your push-to-talk key. To use it here, choose Push-to-talk and change \
+             that key first."
+        ),
+        BindTarget::PushToTalk => format!("{name} is already the {label} key."),
+        // shortcut: the shortcut keys still work while a key is being bound
+        // (the engine's key thread doesn't know), so that press switched it
+        // (also when re-binding the same key); tell the engine to pause them
+        // while binding if people mind.
+        _ => format!(
+            "{name} is already the {label} key, so that press also switched {label} on or off."
+        ),
+    })
 }
 
 /// A small filled circle (the default fonts have no "●").
@@ -1356,5 +1374,33 @@ mod tests {
         });
         frame(&ctx, vec![set], |ui| show(ui, &mut text));
         assert_eq!(text, "Friend B, ", "set, and cut to the box's limit");
+    }
+
+    #[test]
+    fn a_key_does_one_thing() {
+        // Defaults: Voice activation, push-to-talk key Mouse 5.
+        let mut s = Settings {
+            mute_key: Some(0x77),
+            ..Settings::default()
+        };
+        assert_eq!(
+            refusal(&s, BindTarget::Mute, 0x77),
+            None,
+            "its own key again"
+        );
+        assert_eq!(refusal(&s, BindTarget::Deafen, 0x78), None);
+        assert!(refusal(&s, BindTarget::Deafen, 0x77)
+            .unwrap()
+            .ends_with("is already the Mute key, so that press also switched Mute on or off."));
+        assert!(refusal(&s, BindTarget::PushToTalk, 0x77).is_some());
+        // The push-to-talk key, with its button hidden: say how to free it.
+        assert!(refusal(&s, BindTarget::Mute, 0x06)
+            .unwrap()
+            .contains("choose Push-to-talk and change that key"));
+        s.audio.voice_mode = VoiceModeChoice::PushToTalk;
+        assert_eq!(
+            refusal(&s, BindTarget::Deafen, 0x06).unwrap(),
+            "Mouse 5 is already the Push-to-talk key."
+        );
     }
 }

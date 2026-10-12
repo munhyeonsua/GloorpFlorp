@@ -45,6 +45,8 @@ const ELEVATED_HINT_HOLD: Duration = Duration::from_secs(10);
 /// How often the mute and deafen shortcut keys are looked at: a quick tap
 /// (~30 ms) must not fit between two looks. One cheap system call per key.
 const HOTKEY_POLL: Duration = Duration::from_millis(10);
+// Even if one look is late.
+const _: () = assert!(HOTKEY_POLL.as_millis() * 2 < 30);
 
 const TAILSCALE_MISSING: &str = "Tailscale isn't running or isn't signed in on this PC. Open Tailscale, sign in, then click Host again.";
 const NO_AUDIO: &str = "Sound isn't working in GloorpFlorp right now, so game audio can't be sent. Restart GloorpFlorp, then try again.";
@@ -1717,7 +1719,5 @@ mod tests {
             .filter(|&i| press_edge(&mut held, looks[i]))
             .collect();
         assert_eq!(presses, [3, 7]);
-        // A 30 ms tap can't slip between two looks, even if one is late.
-        assert!(HOTKEY_POLL * 2 < Duration::from_millis(30));
     }
 }
