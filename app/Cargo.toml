@@ -22,6 +22,7 @@ gf-net.workspace = true
 gf-video.workspace = true
 gf-audio.workspace = true
 gf-sys.workspace = true
+gf-lobby.workspace = true
 anyhow.workspace = true
 log.workspace = true
 crossbeam-channel.workspace = true

@@ -1,5 +1,7 @@
 //! The window (egui). It only reads the engine's `Snapshot` and sends
-//! `Command`s, so it never waits for the network, FFmpeg or audio.
+//! `Command`s, so it never waits for the network, FFmpeg or audio. The
+//! optional lobby works the same way through `gf_lobby::client` (its own
+//! threads); lobby invites are built on the room commands here.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -8,6 +10,8 @@ use std::time::{Duration, Instant};
 use eframe::egui::{
     self, Align, Color32, ComboBox, Grid, Layout, ProgressBar, RichText, Slider, TextEdit, Ui,
 };
+use gf_lobby::client::{Client, State as LobbyState};
+use gf_lobby::{unix_now, Presence, ToClient, ToServer, MAX_TEXT};
 use gf_proto::VideoCodec;
 use gf_sys::AudioApp;
 use gloorpflorp::engine::{
@@ -24,6 +28,12 @@ const ORANGE: Color32 = Color32::from_rgb(240, 140, 60);
 const GREY: Color32 = Color32::from_rgb(150, 150, 150);
 const RED_BG: Color32 = Color32::from_rgb(120, 30, 30);
 const INFO: Color32 = Color32::from_rgb(140, 180, 230);
+const INVITE_BG: Color32 = Color32::from_rgb(30, 60, 110);
+
+/// An unanswered invite is dropped (and the inviter's room closed) after this.
+const INVITE_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a lobby note ("Bob declined.") stays.
+const NOTE_TIME: Duration = Duration::from_secs(15);
 
 const PTT_BLOCKED: &str = "The program in front runs as administrator, so Windows hides your \
                            push-to-talk key from GloorpFlorp. Run GloorpFlorp as administrator \
@@ -71,6 +81,56 @@ struct KeyBinding {
     refused: Option<String>,
 }
 
+/// An invite sent through the lobby (or to send once my room is open).
+struct Outgoing {
+    to: String,
+    name: String,
+    /// The room code it was sent with.
+    code: Option<String>,
+    since: Instant,
+}
+
+/// An invite waiting for my answer.
+struct Incoming {
+    from: String,
+    name: String,
+    code: String,
+    since: Instant,
+}
+
+#[derive(Debug, PartialEq)]
+enum InviteStep {
+    /// The room is opening, or the invite waits for the answer.
+    Wait,
+    /// The room is open: send the invite with this code.
+    Send(String),
+    /// No answer in time: close the room.
+    TimedOut,
+    /// They joined, or the room closed, changed or didn't open.
+    Done,
+}
+
+/// What my invite needs, given the room's phase, the code it was sent with
+/// and how long ago it was clicked (or sent).
+fn invite_step(phase: &Phase, sent: Option<&str>, age: Duration) -> InviteStep {
+    match (phase, sent) {
+        (Phase::Hosting { code, waiting }, None) if *waiting && !code.is_empty() => {
+            InviteStep::Send(code.clone())
+        }
+        (Phase::Hosting { code, .. }, Some(sent)) if code == sent => {
+            if age > INVITE_TIMEOUT {
+                InviteStep::TimedOut
+            } else {
+                InviteStep::Wait
+            }
+        }
+        (Phase::Hosting { .. }, None) => InviteStep::Wait,
+        // The engine hasn't seen the Host command yet.
+        (Phase::Idle, None) if age < Duration::from_secs(1) => InviteStep::Wait,
+        _ => InviteStep::Done,
+    }
+}
+
 pub struct GloorpApp {
     engine: Engine,
     snap: Snapshot,
@@ -88,6 +148,15 @@ pub struct GloorpApp {
     /// The name used when "Your name" is left empty (this PC's name).
     default_name: String,
     commands: Vec<Command>,
+    /// The lobby connection (none without a lobby address), and the address
+    /// and name it was started with.
+    lobby: Option<Client>,
+    lobby_for: (String, String),
+    lobby_state: LobbyState,
+    chat_input: String,
+    outgoing: Option<Outgoing>,
+    incoming: Option<Incoming>,
+    lobby_note: Option<(String, Instant)>,
 }
 
 impl GloorpApp {
@@ -126,6 +195,13 @@ impl GloorpApp {
             settings,
             default_name: default_name(),
             commands: Vec::new(),
+            lobby: None,
+            lobby_for: Default::default(),
+            lobby_state: Default::default(),
+            chat_input: String::new(),
+            outgoing: None,
+            incoming: None,
+            lobby_note: None,
         })
     }
 
@@ -335,6 +411,349 @@ impl GloorpApp {
                     self.cmd(Command::Leave);
                 }
             }
+        }
+    }
+
+    // ------------------------------------------------------------ lobby
+
+    /// Keeps the lobby connection in line with the settings, sends my invite
+    /// once my room is open, and handles invites and answers.
+    fn poll_lobby(&mut self, ctx: &egui::Context) {
+        let addr = self.settings.lobby.trim().to_string();
+        let name = match self.settings.name.trim() {
+            "" => self.default_name.clone(),
+            n => n.to_string(),
+        };
+        // Not while typing, so it doesn't reconnect at every key.
+        if (&addr, &name) != (&self.lobby_for.0, &self.lobby_for.1) && !ctx.text_edit_focused() {
+            let repaint = ctx.clone();
+            self.lobby = (!addr.is_empty())
+                .then(|| Client::start(&addr, &name, Arc::new(move || repaint.request_repaint())));
+            self.lobby_for = (addr, name);
+            self.lobby_state = LobbyState::default();
+            self.outgoing = None;
+            self.incoming = None;
+        }
+        let Some(lobby) = &self.lobby else { return };
+        self.lobby_state = lobby.state();
+        let now = Instant::now();
+        let mut note = None;
+        let mut done = false;
+        if let Some(o) = &mut self.outgoing {
+            let age = now.duration_since(o.since);
+            match invite_step(&self.snap.phase, o.code.as_deref(), age) {
+                InviteStep::Wait => {}
+                InviteStep::Send(code) if self.lobby_state.connected => {
+                    lobby.send(ToServer::Invite {
+                        to: o.to.clone(),
+                        code: code.clone(),
+                    });
+                    o.code = Some(code);
+                    o.since = now;
+                }
+                // It would be dropped, and the room would wait for nothing.
+                InviteStep::Send(_) => {
+                    note = Some(format!(
+                        "Lost the connection to the lobby, so {} wasn't invited and the room \
+                         was closed.",
+                        o.name
+                    ));
+                    self.commands.push(Command::Leave);
+                    done = true;
+                }
+                InviteStep::TimedOut => {
+                    note = Some(format!("{} didn't answer, so the room was closed.", o.name));
+                    self.commands.push(Command::Leave);
+                    done = true;
+                }
+                InviteStep::Done => done = true,
+            }
+        }
+        if done {
+            // Ended without an answer: take it back, so their box doesn't
+            // offer a room that is gone (once they joined they have no box).
+            if let Some(Outgoing {
+                to,
+                code: Some(code),
+                ..
+            }) = self.outgoing.take()
+            {
+                lobby.send(ToServer::Cancel { to, code });
+            }
+        }
+        for ev in lobby.events.try_iter() {
+            match ev {
+                ToClient::Invited { from, name, code } => {
+                    // A newer invite from the same friend replaces theirs.
+                    let free = self.incoming.as_ref().is_none_or(|i| i.from == from);
+                    if self.snap.phase == Phase::Idle && free {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                            egui::UserAttentionType::Informational,
+                        ));
+                        self.incoming = Some(Incoming {
+                            from,
+                            name,
+                            code,
+                            since: now,
+                        });
+                    } else {
+                        // Busy: don't interrupt a call.
+                        lobby.send(ToServer::Reply {
+                            to: from,
+                            code,
+                            accept: false,
+                        });
+                    }
+                }
+                ToClient::Replied { from, code, accept } => {
+                    let mine = |o: &mut Outgoing| o.to == from && o.code.as_ref() == Some(&code);
+                    if let Some(o) = self.outgoing.take_if(mine) {
+                        if !accept {
+                            note = Some(format!("{} declined.", o.name));
+                            if matches!(self.snap.phase, Phase::Hosting { .. }) {
+                                self.commands.push(Command::Leave);
+                            }
+                        }
+                    }
+                }
+                ToClient::InviteFailed { to, code, text } => {
+                    let mine = |o: &mut Outgoing| o.to == to && o.code.as_ref() == Some(&code);
+                    if let Some(o) = self.outgoing.take_if(mine) {
+                        note = Some(format!(
+                            "{} wasn't invited, so the room was closed. {text}",
+                            o.name
+                        ));
+                        if matches!(self.snap.phase, Phase::Hosting { .. }) {
+                            self.commands.push(Command::Leave);
+                        }
+                    }
+                }
+                ToClient::Cancelled { from, code } => {
+                    if let Some(i) = self.incoming.take_if(|i| i.from == from && i.code == code) {
+                        note = Some(format!("{} closed the room.", i.name));
+                    }
+                }
+                ToClient::Error { text } => note = Some(text),
+                _ => {}
+            }
+        }
+        self.incoming
+            .take_if(|i| now.duration_since(i.since) > INVITE_TIMEOUT);
+        if let Some(n) = note {
+            self.lobby_note = Some((n, now));
+        }
+    }
+
+    fn invite_prompt(&mut self, ui: &mut Ui) {
+        let Some(inv) = &self.incoming else { return };
+        let mut answer = None;
+        egui::Frame::new()
+            .fill(INVITE_BG)
+            .inner_margin(8)
+            .corner_radius(4)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(
+                    RichText::new(format!("{} invites you to a room.", inv.name))
+                        .color(Color32::WHITE)
+                        .size(16.0)
+                        .strong(),
+                );
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("Accept")
+                        .on_hover_text(
+                            "Join their room now. Leaves your own room, if you have one.",
+                        )
+                        .clicked()
+                    {
+                        answer = Some(true);
+                    }
+                    if ui
+                        .button("Deny")
+                        .on_hover_text("Tell them you can't right now.")
+                        .clicked()
+                    {
+                        answer = Some(false);
+                    }
+                });
+            });
+        let Some(accept) = answer else { return };
+        if let Some(inv) = self.incoming.take() {
+            if let Some(lobby) = &self.lobby {
+                lobby.send(ToServer::Reply {
+                    to: inv.from,
+                    code: inv.code.clone(),
+                    accept,
+                });
+            }
+            if accept {
+                self.cmd(Command::Join(inv.code));
+            }
+        }
+    }
+
+    fn lobby(&mut self, ui: &mut Ui) {
+        egui::CollapsingHeader::new(RichText::new("Lobby").heading())
+            .default_open(!self.settings.lobby.trim().is_empty())
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let label = ui.label("Lobby server:");
+                    let r = ui
+                        .add(
+                            TextEdit::singleline(&mut self.settings.lobby)
+                                .hint_text("gloorp-lobby:47900")
+                                .desired_width(200.0)
+                                .char_limit(200),
+                        )
+                        .labelled_by(label.id)
+                        .on_hover_text(
+                            "Optional: the address of your own GloorpFlorp lobby server in your \
+                             Tailscale network, for chat, seeing who is online, and invites. \
+                             Leave it empty if you don't have one.",
+                        );
+                    accept_set_value(&r, &mut self.settings.lobby, 200);
+                });
+                if self.lobby.is_some() {
+                    self.lobby_contents(ui);
+                }
+            });
+    }
+
+    fn lobby_contents(&mut self, ui: &mut Ui) {
+        let s = &self.lobby_state;
+        ui.horizontal(|ui| {
+            let (text, color) = if s.connected {
+                ("Connected to the lobby", GREEN)
+            } else {
+                ("Connecting to the lobby…", YELLOW)
+            };
+            dot(ui, color, 12.0);
+            ui.label(RichText::new(text).color(color));
+        });
+        if let Some(p) = s.problem.as_ref().filter(|_| !s.connected) {
+            ui.label(RichText::new(p).color(ORANGE));
+        }
+        let can_invite = self.snap.phase == Phase::Idle && self.outgoing.is_none();
+        let mut invite = None;
+        Grid::new("lobby-members")
+            .num_columns(3)
+            .spacing([10.0, 4.0])
+            .show(ui, |ui| {
+                for m in &s.members {
+                    let (color, state, tip) = match m.state {
+                        Presence::Lobby => (
+                            GREEN,
+                            "In the lobby",
+                            "GloorpFlorp is open and connected to the lobby.",
+                        ),
+                        Presence::Online => (
+                            YELLOW,
+                            "Online",
+                            "Their PC is on in Tailscale, but GloorpFlorp isn't in the lobby.",
+                        ),
+                        Presence::Offline => (
+                            GREY,
+                            "Offline",
+                            "Their PC is off or not connected to Tailscale.",
+                        ),
+                    };
+                    ui.horizontal(|ui| {
+                        dot(ui, color, 12.0);
+                        ui.label(shorten(&m.name, 24));
+                    });
+                    ui.label(RichText::new(state).color(color))
+                        .on_hover_text(tip);
+                    if m.id == s.me {
+                        ui.label(RichText::new("(you)").weak());
+                    } else if m.state == Presence::Lobby {
+                        let busy = if self.outgoing.is_some() {
+                            "Wait for the answer to your invite first."
+                        } else {
+                            "Leave your room first."
+                        };
+                        let r = ui
+                            .add_enabled(can_invite, egui::Button::new("Invite"))
+                            .on_hover_text(format!("Open a room and ask {} to join it.", m.name))
+                            .on_disabled_hover_text(busy);
+                        if r.clicked() {
+                            invite = Some(m.clone());
+                        }
+                    } else {
+                        ui.label("");
+                    }
+                    ui.end_row();
+                }
+            });
+        if let Some(o) = &self.outgoing {
+            let text = match o.code {
+                None => format!("Opening a room for {}…", o.name),
+                Some(_) => format!("Waiting for {} to answer…", o.name),
+            };
+            ui.label(RichText::new(text).color(YELLOW));
+        }
+        if let Some((note, at)) = &self.lobby_note {
+            if at.elapsed() < NOTE_TIME {
+                ui.label(RichText::new(note).color(INFO));
+            }
+        }
+
+        egui::ScrollArea::vertical()
+            .id_salt("lobby-chat")
+            .max_height(160.0)
+            .stick_to_bottom(true)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                if s.chat.is_empty() {
+                    ui.label(RichText::new("No messages yet.").weak());
+                }
+                let now = unix_now();
+                for c in &s.chat {
+                    ui.horizontal_wrapped(|ui| {
+                        if c.at > 0 {
+                            ui.label(RichText::new(ago(c.at, now)).weak());
+                        }
+                        ui.label(RichText::new(format!("{}:", shorten(&c.name, 24))).strong());
+                        ui.label(&c.text);
+                    });
+                }
+            });
+        let mut send = None;
+        ui.horizontal(|ui| {
+            let edit = ui.add(
+                TextEdit::singleline(&mut self.chat_input)
+                    .hint_text("Message")
+                    .desired_width(260.0)
+                    .char_limit(MAX_TEXT),
+            );
+            set_accessible_name(&edit, "Chat message");
+            accept_set_value(&edit, &mut self.chat_input, MAX_TEXT);
+            let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let can_send = s.connected && !self.chat_input.trim().is_empty();
+            let clicked = ui
+                .add_enabled(can_send, egui::Button::new("Send"))
+                .on_hover_text("Send to everyone in the lobby. Enter sends too.")
+                .on_disabled_hover_text("Type a message first (and wait until you're connected).")
+                .clicked();
+            if can_send && (clicked || enter) {
+                send = Some(std::mem::take(&mut self.chat_input));
+                if enter {
+                    edit.request_focus();
+                }
+            }
+        });
+        if let (Some(text), Some(lobby)) = (send, &self.lobby) {
+            lobby.send(ToServer::Chat { text });
+        }
+        if let Some(m) = invite {
+            self.lobby_note = None;
+            self.outgoing = Some(Outgoing {
+                to: m.id,
+                name: m.name,
+                code: None,
+                since: Instant::now(),
+            });
+            self.cmd(Command::Host);
         }
     }
 
@@ -1064,12 +1483,33 @@ impl GloorpApp {
 }
 
 impl eframe::App for GloorpApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    // Runs before every `ui`, and also while the window is minimized (when
+    // `ui` doesn't), so invites are shown (taskbar flash), answered and timed
+    // out there too.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.snap = self.engine.snapshot();
         // Mute and deafen belong to the engine (the shortcut keys change
         // them there); the checkboxes send SetMuted / SetDeafened.
         self.settings.audio.mic_muted = self.snap.mic_muted;
         self.settings.audio.deafened = self.snap.deafened;
+        self.poll_lobby(ctx);
+        for c in self.commands.drain(..) {
+            self.engine.send(c);
+        }
+        let busy = self.binding.is_some();
+        let live = !matches!(self.snap.phase, Phase::Idle)
+            || !matches!(self.snap.my_share, ShareState::Off);
+        let every = if busy {
+            Duration::from_millis(50)
+        } else if live {
+            Duration::from_millis(100)
+        } else {
+            Duration::from_millis(250)
+        };
+        ctx.request_repaint_after(every);
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_key_binding(ui.ctx());
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical()
@@ -1077,8 +1517,11 @@ impl eframe::App for GloorpApp {
                 .show(ui, |ui| {
                     self.status_line(ui);
                     self.banners(ui);
+                    self.invite_prompt(ui);
                     ui.separator();
                     self.room(ui);
+                    ui.separator();
+                    self.lobby(ui);
                     ui.separator();
                     self.my_screen(ui);
                     ui.separator();
@@ -1101,17 +1544,6 @@ impl eframe::App for GloorpApp {
         for c in self.commands.drain(..) {
             self.engine.send(c);
         }
-        let busy = self.binding.is_some();
-        let live = !matches!(self.snap.phase, Phase::Idle)
-            || !matches!(self.snap.my_share, ShareState::Off);
-        let every = if busy {
-            Duration::from_millis(50)
-        } else if live {
-            Duration::from_millis(100)
-        } else {
-            Duration::from_millis(250)
-        };
-        ui.ctx().request_repaint_after(every);
     }
 
     fn on_exit(&mut self) {
@@ -1340,6 +1772,16 @@ fn shorten(s: &str, max: usize) -> String {
     }
 }
 
+/// How long before `now` the Unix time `at` was, in short.
+fn ago(at: u64, now: u64) -> String {
+    match now.saturating_sub(at) {
+        s if s < 60 => "just now".into(),
+        s if s < 3600 => format!("{} min ago", s / 60),
+        s if s < 86400 => format!("{} h ago", s / 3600),
+        s => format!("{} d ago", s / 86400),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1407,6 +1849,55 @@ mod tests {
         );
         assert_eq!(names_of(&nodes, Role::ComboBox), ["Microphone"]);
         assert_eq!(names_of(&nodes, Role::Button), ["Hide this message"]);
+    }
+
+    #[test]
+    fn invite_follows_the_room() {
+        let hosting = |code: &str, waiting| Phase::Hosting {
+            code: code.into(),
+            waiting,
+        };
+        let s = Duration::from_secs;
+        // Clicked: the engine hasn't started hosting yet, then the room opens.
+        assert_eq!(invite_step(&Phase::Idle, None, s(0)), InviteStep::Wait);
+        assert_eq!(
+            invite_step(&hosting("", false), None, s(3)),
+            InviteStep::Wait
+        );
+        assert_eq!(
+            invite_step(&hosting("K7QM", true), None, s(3)),
+            InviteStep::Send("K7QM".into())
+        );
+        // Sent: waits for the answer, up to the timeout.
+        let sent = Some("K7QM");
+        assert_eq!(
+            invite_step(&hosting("K7QM", true), sent, s(59)),
+            InviteStep::Wait
+        );
+        assert_eq!(
+            invite_step(&hosting("K7QM", true), sent, s(61)),
+            InviteStep::TimedOut
+        );
+        // They joined; the room closed, didn't open, or got a new code.
+        let joined = Phase::Connected { peer: "B".into() };
+        assert_eq!(invite_step(&joined, sent, s(5)), InviteStep::Done);
+        assert_eq!(invite_step(&Phase::Idle, sent, s(5)), InviteStep::Done);
+        assert_eq!(invite_step(&Phase::Idle, None, s(2)), InviteStep::Done);
+        assert_eq!(
+            invite_step(&hosting("NEW", true), sent, s(5)),
+            InviteStep::Done
+        );
+    }
+
+    #[test]
+    fn chat_ages() {
+        let t = 1_790_000_000;
+        assert_eq!(ago(t, t + 59), "just now");
+        assert_eq!(ago(t, t + 5 * 60 + 1), "5 min ago");
+        assert_eq!(ago(t, t + 3 * 3600), "3 h ago");
+        assert_eq!(ago(t, t + 2 * 86400 + 5), "2 d ago");
+        // The server's clock may be a little ahead.
+        assert_eq!(ago(t + 5, t), "just now");
     }
 
     #[test]

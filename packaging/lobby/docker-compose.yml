@@ -1,0 +1,50 @@
+# The GloorpFlorp lobby with its own Tailscale device. In this folder:
+#   TS_AUTHKEY=tskey-auth-... docker compose up -d --build
+# Then set the app's lobby address to gloorp-lobby:47900 (see the README's
+# "Lobby (optional)" section).
+
+services:
+  tailscale:
+    image: tailscale/tailscale:stable
+    hostname: gloorp-lobby
+    environment:
+      # Only needed the first time (the login is kept in tailscale-state).
+      TS_AUTHKEY: ${TS_AUTHKEY:-}
+      TS_HOSTNAME: gloorp-lobby
+      TS_STATE_DIR: /var/lib/tailscale
+      # Where the lobby asks tailscaled who is online.
+      TS_SOCKET: /var/run/tailscale/tailscaled.sock
+      # Kernel networking, so the lobby sees each member's Tailscale address
+      # (in userspace mode every connection would come from 127.0.0.1).
+      TS_USERSPACE: "false"
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+      - tailscale-socket:/var/run/tailscale
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - net_admin
+    restart: unless-stopped
+
+  lobby:
+    build:
+      context: ../..
+      dockerfile: packaging/lobby/Dockerfile
+    # Shares the tailscale container's network, so it is reachable only
+    # through Tailscale (no ports are published on the server).
+    network_mode: service:tailscale
+    depends_on:
+      - tailscale
+    environment:
+      LOBBY_TAILSCALE_SOCKET: /var/run/tailscale/tailscaled.sock
+    volumes:
+      - lobby-data:/data
+      - tailscale-socket:/var/run/tailscale
+    # Passes `docker stop` on to the server.
+    init: true
+    restart: unless-stopped
+
+volumes:
+  tailscale-state:
+  tailscale-socket:
+  lobby-data:

@@ -15,6 +15,7 @@ GloorpFlorp connects your two PCs directly through
 [What you need](#what-you-need) ·
 [Getting the app](#getting-the-app) ·
 [How to use it](#how-to-use-it) ·
+[Lobby (optional)](#lobby-optional) ·
 [Tips](#recommended-settings-and-tips) ·
 [Troubleshooting](#troubleshooting) ·
 [Limitations](#limitations) ·
@@ -38,8 +39,9 @@ The rest of this guide explains each step.
 
 - **No servers, no accounts, no analytics.** GloorpFlorp has no website to
   log in to, sends no usage data and doesn't check for updates. It only ever
-  connects to your friend's PC. (You do need a free Tailscale account, but
-  that's Tailscale's, not GloorpFlorp's.)
+  connects to your friend's PC, and to your own [lobby](#lobby-optional) if
+  you set one up. (You do need a free Tailscale account, but that's
+  Tailscale's, not GloorpFlorp's.)
 - **Direct and encrypted.** Your video, game sound and voice go straight from
   one PC to the other inside your Tailscale network, which encrypts
   everything. If Tailscale can't link your PCs directly, it passes the
@@ -288,6 +290,72 @@ are going:
 - **Audio loss**: missing audio packets. A few percent is fine; small gaps
   are filled in.
 
+## Lobby (optional)
+
+If you have an always-on PC or home server in your Tailscale network, you can
+run a small **lobby** on it. Everyone who uses it gets:
+
+- a **text chat** that is kept (new messages and the last 200 when you open
+  GloorpFlorp, each with how long ago it was sent),
+- a **member list** that shows who has GloorpFlorp open (**In the lobby**,
+  green), whose PC is on in Tailscale (**Online**, yellow) and who is
+  **Offline**,
+- **Invite** buttons instead of copying room codes: your friend gets a
+  "... invites you to a room" message with **Accept** and **Deny**.
+
+Rooms don't change: they are still just the two of you, directly between
+your PCs. The lobby only carries the chat, who is around and the invites.
+Without a lobby address GloorpFlorp works exactly as before.
+
+### Run the lobby server
+
+You need Docker on a Linux PC or home server that is always on.
+
+1. In the [Tailscale admin console](https://login.tailscale.com/admin/settings/keys),
+   create an auth key.
+2. On the server, get the source code and start the lobby (the image is
+   built from the source):
+
+   ```
+   git clone https://github.com/munhyeonsua/GloorpFlorp
+   cd GloorpFlorp/packaging/lobby
+   TS_AUTHKEY=tskey-auth-... docker compose up -d --build
+   ```
+
+   This starts two containers: Tailscale (the lobby's own device in your
+   Tailscale network, named `gloorp-lobby`) and the lobby itself, which can
+   only be reached through Tailscale. The auth key is only needed the first
+   time. (Without one, `docker compose logs tailscale` shows a link to sign
+   in instead.)
+3. If your friends use their own Tailscale accounts, share the
+   `gloorp-lobby` device with them, like your PC (see
+   [above](#if-you-use-two-different-tailscale-accounts)).
+
+Everyone who connects becomes a member; a device is recognized by its
+Tailscale address. The chat and the member list are kept in a Docker volume,
+so they survive restarts and updates. To update, run `git pull` and the
+`docker compose up -d --build` line again. To start over, run
+`docker compose down` and `docker volume rm lobby_lobby-data`.
+
+### Use it in the app
+
+Open **Lobby** (below **Room**) and enter the lobby's address:
+`gloorp-lobby:47900` (or the server's Tailscale address, like
+`100.101.102.103:47900`). It connects when you press Enter or click
+somewhere else.
+
+- **Chat:** type in the message box and press Enter or click **Send**.
+- **Invite:** click **Invite** next to a friend who is in the lobby.
+  GloorpFlorp opens a room and sends them the code. If they accept, they
+  join as if they had pasted the code. If they deny, or don't answer within
+  a minute, your room is closed again. If you close the room (or it closes)
+  before they answer, the invite disappears on their side too. The one who
+  invites hosts the room, so with two Tailscale accounts the person whose PC
+  is shared invites.
+- **Getting invited:** a blue box at the top asks you to **Accept** or
+  **Deny**, and the taskbar button flashes (also while GloorpFlorp is
+  minimized). If you're already in a room, the invite is declined for you.
+
 ## Recommended settings and tips
 
 - **Codec: leave it on Auto.** An RTX 40 or 50 series card (like the RTX 5080)
@@ -407,8 +475,9 @@ explains the design, the data flow and the reasons behind the big decisions.
 | `crates/gf-net` | The TCP + UDP connection between the two PCs |
 | `crates/gf-video` | Runs FFmpeg (screen capture + NVENC) and mpv (viewer window) |
 | `crates/gf-audio` | Microphone processing, Opus, jitter buffers, mixing, playback |
+| `crates/gf-lobby` | The optional lobby: its protocol, the app's client, and the server (`gloorp-lobby`) |
 | `app` | The engine that wires everything together, the window (egui), settings, logging |
-| `packaging` | Assembles the Windows zip (used by CI) |
+| `packaging` | Assembles the Windows zip (used by CI); `packaging/lobby` has the lobby server's Docker files |
 
 **Build from source** on Windows: install [Rust](https://rustup.rs), Visual
 Studio Build Tools with "Desktop development with C++", and
@@ -446,9 +515,21 @@ For two copies on one PC, start both with `GLOORP_DEV_IP=127.0.0.1`; one
 clicks Host, the other pastes the code and clicks Join. (If the host used
 `GLOORP_DEV_PORT`, give the joining copy the same port.)
 
+**Lobby server:** `cargo run -p gf-lobby --bin gloorp-lobby` runs one on
+this PC; set the app's lobby address to `127.0.0.1:47900`. It accepts only
+Tailscale addresses and this PC itself, and tells copies on this PC apart by
+name (give each copy its own). It is set with environment variables:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `LOBBY_LISTEN` | `0.0.0.0:47900` | Address and port to listen on. |
+| `LOBBY_DATA` | `lobby-data` (`/data` in Docker) | Folder for `members.json` and `chat.jsonl`. |
+| `LOBBY_TAILSCALE_SOCKET` | `/var/run/tailscale/tailscaled.sock` | tailscaled's socket, to show who is online (Linux only). |
+
 **CI:** [.github/workflows/build.yml](.github/workflows/build.yml) runs tests
 and clippy on Linux (with BtbN's Linux build from the same dated FFmpeg
-release the Windows zip ships), and tests, the release build and packaging
+release the Windows zip ships) plus the lobby server's Docker image, and
+tests, the release build and packaging
 ([packaging/package-windows.ps1](packaging/package-windows.ps1)) on Windows.
 To release, set `version` in `Cargo.toml` (shown in `VERSIONS.txt` and the
 log), then push a tag that starts with `v` and matches it (for example
