@@ -313,13 +313,15 @@ You need Docker on a Linux PC or home server that is always on.
 
 1. In the [Tailscale admin console](https://login.tailscale.com/admin/settings/keys),
    create an auth key.
-2. On the server, get the source code and start the lobby (the image is
-   built from the source):
+2. On the server, download `docker-compose.yml` from the
+   [latest release](https://github.com/munhyeonsua/GloorpFlorp/releases/latest)
+   into a folder of its own, and start the lobby there (Docker downloads the
+   ready-made image, for normal PCs and ARM boards like a Raspberry Pi):
 
    ```
-   git clone https://github.com/munhyeonsua/GloorpFlorp
-   cd GloorpFlorp/packaging/lobby
-   TS_AUTHKEY=tskey-auth-... docker compose up -d --build
+   mkdir gloorp-lobby && cd gloorp-lobby
+   curl -LO https://github.com/munhyeonsua/GloorpFlorp/releases/latest/download/docker-compose.yml
+   TS_AUTHKEY=tskey-auth-... docker compose up -d
    ```
 
    This starts two containers: Tailscale (the lobby's own device in your
@@ -333,9 +335,9 @@ You need Docker on a Linux PC or home server that is always on.
 
 Everyone who connects becomes a member; a device is recognized by its
 Tailscale address. The chat and the member list are kept in a Docker volume,
-so they survive restarts and updates. To update, run `git pull` and the
-`docker compose up -d --build` line again. To start over, run
-`docker compose down` and `docker volume rm lobby_lobby-data`.
+so they survive restarts and updates. To update, run
+`docker compose pull && docker compose up -d` in that folder. To start over,
+run `docker compose down` and `docker volume rm gloorp-lobby_lobby-data`.
 
 ### Use it in the app
 
@@ -528,7 +530,8 @@ name (give each copy its own). It is set with environment variables:
 
 **CI:** [.github/workflows/build.yml](.github/workflows/build.yml) runs tests
 and clippy on Linux (with BtbN's Linux build from the same dated FFmpeg
-release the Windows zip ships) plus the lobby server's Docker image, and
+release the Windows zip ships) plus the lobby server's Docker image (on a
+release tag it is also published to `ghcr.io/munhyeonsua/gloorp-lobby`), and
 tests, the release build and packaging
 ([packaging/package-windows.ps1](packaging/package-windows.ps1)) on Windows.
 To release, set `version` in `Cargo.toml` (shown in `VERSIONS.txt` and the

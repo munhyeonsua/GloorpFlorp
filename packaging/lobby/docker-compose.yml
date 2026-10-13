@@ -1,7 +1,8 @@
-# The GloorpFlorp lobby with its own Tailscale device. In this folder:
-#   TS_AUTHKEY=tskey-auth-... docker compose up -d --build
+# The GloorpFlorp lobby with its own Tailscale device. In the folder with
+# this file:
+#   TS_AUTHKEY=tskey-auth-... docker compose up -d
 # Then set the app's lobby address to gloorp-lobby:47900 (see the README's
-# "Lobby (optional)" section).
+# "Lobby (optional)" section). Update: docker compose pull && docker compose up -d
 
 services:
   tailscale:
@@ -27,9 +28,8 @@ services:
     restart: unless-stopped
 
   lobby:
-    build:
-      context: ../..
-      dockerfile: packaging/lobby/Dockerfile
+    # Built by CI from packaging/lobby/Dockerfile for each release.
+    image: ghcr.io/munhyeonsua/gloorp-lobby:latest
     # Shares the tailscale container's network, so it is reachable only
     # through Tailscale (no ports are published on the server).
     network_mode: service:tailscale

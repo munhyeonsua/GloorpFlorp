@@ -66,7 +66,7 @@ pacing fix").
    the source archives: four, or five when the FFmpeg inside mpv is a
    different commit from ffmpeg.exe's (`licenses/SOURCES.txt` says which).
 6. **First session with the friend.** The friend's 3070 Ti PC needs an up-to-date NVIDIA driver (FFmpeg master needs a recent NVENC API). Judge delay and echo by ear (nothing audible was played in the tests), and keep both PCs' log files. 60 fps is the default; 120/144 now send exactly that rate, but spread the same bitrate over more frames, and the pacing fix's CPU cost (~1 core) is only measured on the 9800X3D, so check Task Manager on the 3070 Ti PC.
-7. **Lobby (optional), first real run.** On the home server: `TS_AUTHKEY=… docker compose up -d --build` in `packaging/lobby`, then check that the members show **Online**/**Offline** as the PCs come and go (tailscaled's LocalAPI), look over the Lobby panel, and send an invite between the two PCs (also to a minimized GloorpFlorp).
+7. **Lobby (optional), first real run.** On the home server: download the release's `docker-compose.yml` and run `TS_AUTHKEY=… docker compose up -d` next to it (the image is `ghcr.io/munhyeonsua/gloorp-lobby`, published by CI's `lobby-image` job for each tag; the first time, make that package public in its GitHub package settings), then check that the members show **Online**/**Offline** as the PCs come and go (tailscaled's LocalAPI), look over the Lobby panel, and send an invite between the two PCs (also to a minimized GloorpFlorp).
 
 ## Decisions made after ARCHITECTURE.md was written
 

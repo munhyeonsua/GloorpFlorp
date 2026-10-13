@@ -1406,7 +1406,7 @@ dependencies = [
 
 [[package]]
 name = "gf-audio"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "anyhow",
  "cpal",
@@ -1423,7 +1423,7 @@ dependencies = [
 
 [[package]]
 name = "gf-lobby"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "crossbeam-channel",
  "log",
@@ -1434,7 +1434,7 @@ dependencies = [
 
 [[package]]
 name = "gf-net"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -1445,7 +1445,7 @@ dependencies = [
 
 [[package]]
 name = "gf-proto"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "postcard",
  "rand",
@@ -1456,7 +1456,7 @@ dependencies = [
 
 [[package]]
 name = "gf-sys"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "anyhow",
  "if-addrs",
@@ -1467,7 +1467,7 @@ dependencies = [
 
 [[package]]
 name = "gf-video"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -1505,7 +1505,7 @@ dependencies = [
 
 [[package]]
 name = "gloorpflorp"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "anyhow",
  "crossbeam-channel",

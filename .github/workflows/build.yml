@@ -262,15 +262,54 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # The lobby server image that packaging/lobby/docker-compose.yml pulls,
+  # for x86 servers and ARM boards (e.g. a Raspberry Pi), tagged with the
+  # version and "latest".
+  lobby-image:
+    name: Publish lobby image
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux-tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: packaging/lobby/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/munhyeonsua/gloorp-lobby:${{ github.ref_name }}
+            ghcr.io/munhyeonsua/gloorp-lobby:latest
+
   release:
     name: Publish release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [linux-tests, windows]
+    needs: [linux-tests, windows, lobby-image]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: write
     steps:
+      # Only for packaging/lobby/docker-compose.yml, attached to the release.
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: packaging/lobby
+
       - name: Download the package
         uses: actions/download-artifact@v4
         with:
@@ -352,11 +391,14 @@ jobs:
         with:
           files: |
             GloorpFlorp-windows-x64.zip
+            packaging/lobby/docker-compose.yml
             sources/*.tar.gz
           fail_on_unmatched_files: true
           generate_release_notes: true
           body: |
             **To install:** download `GloorpFlorp-windows-x64.zip` below, right-click it, choose *Extract All*, then open `START HERE.txt` in the extracted `GloorpFlorp` folder. No GitHub account needed.
             You and your friend need the same version.
+
+            **Lobby server (optional):** download `docker-compose.yml` below to an always-on Linux PC or home server with Docker and run `TS_AUTHKEY=tskey-auth-... docker compose up -d` next to it. See the README's "Lobby (optional)" section.
 
             **Licenses:** GloorpFlorp's own code is under the MIT license. The zip also contains FFmpeg and mpv, which are under the GNU GPL. Source code for the included FFmpeg and mpv builds, and the build scripts that made them, is attached below (the `*-source-*` and `*-build-scripts-*` files). mpv has its own copy of FFmpeg built in; when that is a different version, its source is the `ffmpeg-source-for-mpv-*` file. `THIRD-PARTY-NOTICES.txt` and `VERSIONS.txt` in the zip have the details.
