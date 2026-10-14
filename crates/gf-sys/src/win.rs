@@ -69,13 +69,10 @@ pub(crate) fn list_monitors() -> windows::core::Result<Vec<Monitor>> {
             };
             let primary = GetMonitorInfoW(desc.Monitor, &mut info).as_bool()
                 && info.dwFlags & MONITORINFOF_PRIMARY != 0;
-            monitors.push(Monitor::new(
-                i,
-                width,
-                height,
-                primary,
-                rotation_degrees(desc.Rotation),
-            ));
+            monitors.push(Monitor {
+                hmonitor: desc.Monitor.0 as u64,
+                ..Monitor::new(i, width, height, primary, rotation_degrees(desc.Rotation))
+            });
         }
         log::debug!("monitors: {monitors:?}");
         Ok(monitors)

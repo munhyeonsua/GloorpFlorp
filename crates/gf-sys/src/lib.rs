@@ -35,6 +35,9 @@ pub struct Monitor {
     /// Duplication delivers frames unturned: for 90 and 270 they are
     /// `height`×`width` and must be rotated by this much to look right.
     pub rotation: u32,
+    /// The monitor's `HMONITOR`, for Windows Graphics Capture (FFmpeg's
+    /// `gfxcapture=hmonitor=`); 0 where unknown.
+    pub hmonitor: u64,
 }
 
 impl Monitor {
@@ -47,6 +50,7 @@ impl Monitor {
             height,
             primary,
             rotation,
+            hmonitor: 0,
         }
     }
 }

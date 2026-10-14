@@ -6,7 +6,7 @@ use std::sync::{Mutex, MutexGuard};
 use crate::level::AtomicF32;
 use crate::mixer::{sanitize_volume, MixParams};
 use crate::playout::Incoming;
-use crate::{AudioSettings, VoiceMode};
+use crate::{AudioSettings, NoiseLevel, VoiceMode};
 
 /// Locks a mutex, carrying on if another thread panicked while holding it.
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -17,7 +17,8 @@ pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Processing {
     pub echo_cancel: bool,
-    pub noise_suppress: bool,
+    /// `None`: off.
+    pub noise_suppress: Option<NoiseLevel>,
     pub auto_gain: bool,
 }
 
@@ -31,6 +32,7 @@ pub(crate) struct Live {
     deafened: AtomicBool,
     echo_cancel: AtomicBool,
     noise_suppress: AtomicBool,
+    noise_level: AtomicU8,
     auto_gain: AtomicBool,
     voice_volume: AtomicF32,
     game_volume: AtomicF32,
@@ -48,6 +50,7 @@ impl Live {
             deafened: AtomicBool::new(false),
             echo_cancel: AtomicBool::new(false),
             noise_suppress: AtomicBool::new(false),
+            noise_level: AtomicU8::new(0),
             auto_gain: AtomicBool::new(false),
             voice_volume: AtomicF32::default(),
             game_volume: AtomicF32::default(),
@@ -71,6 +74,7 @@ impl Live {
         self.deafened.store(s.deafened, Relaxed);
         self.echo_cancel.store(s.echo_cancel, Relaxed);
         self.noise_suppress.store(s.noise_suppress, Relaxed);
+        self.noise_level.store(s.noise_level as u8, Relaxed);
         self.auto_gain.store(s.auto_gain, Relaxed);
         self.voice_volume.store(sanitize_volume(s.voice_volume));
         self.game_volume.store(sanitize_volume(s.game_volume));
@@ -101,7 +105,14 @@ impl Live {
     pub fn processing(&self) -> Processing {
         Processing {
             echo_cancel: self.echo_cancel.load(Relaxed),
-            noise_suppress: self.noise_suppress.load(Relaxed),
+            noise_suppress: self.noise_suppress.load(Relaxed).then(|| {
+                match self.noise_level.load(Relaxed) {
+                    0 => NoiseLevel::Low,
+                    1 => NoiseLevel::Moderate,
+                    2 => NoiseLevel::High,
+                    _ => NoiseLevel::VeryHigh,
+                }
+            }),
             auto_gain: self.auto_gain.load(Relaxed),
         }
     }
@@ -178,6 +189,7 @@ mod tests {
     fn live_settings_round_trip() {
         let mut s = AudioSettings {
             voice_mode: VoiceMode::PushToTalk,
+            noise_level: NoiseLevel::VeryHigh,
             ptt_key: 0x56,
             vad_sensitivity: 0.25,
             mic_muted: true,
@@ -197,7 +209,7 @@ mod tests {
             live.processing(),
             Processing {
                 echo_cancel: false,
-                noise_suppress: true,
+                noise_suppress: Some(NoiseLevel::VeryHigh),
                 auto_gain: true
             }
         );

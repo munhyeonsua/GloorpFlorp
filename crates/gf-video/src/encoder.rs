@@ -31,6 +31,10 @@ const META_BYTES: usize = 4096;
 /// worked: later shares in this run of the app go straight to the CPU.
 static GPU_TRANSFORM_FAILED: AtomicBool = AtomicBool::new(false);
 
+/// Set once [`Step::Wgc`] failed where a ddagrab step then worked: later
+/// monitor shares in this run of the app go straight to ddagrab.
+static WGC_FAILED: AtomicBool = AtomicBool::new(false);
+
 /// The monitor `index`, or an upright 1920×1080 if it can't be found.
 pub(crate) fn screen(index: u32) -> Screen {
     match gf_sys::list_monitors()
@@ -42,6 +46,7 @@ pub(crate) fn screen(index: u32) -> Screen {
             height: m.height,
             rotation: m.rotation,
             window: None,
+            monitor: Some(m.hmonitor).filter(|&h| h != 0),
         },
         _ => {
             log::warn!("monitor {index} not found; assuming 1920x1080");
@@ -50,6 +55,7 @@ pub(crate) fn screen(index: u32) -> Screen {
                 height: 1080,
                 rotation: 0,
                 window: None,
+                monitor: None,
             }
         }
     }
@@ -75,6 +81,7 @@ fn window_screen(exe: &str, max_height: Option<u32>) -> anyhow::Result<Screen> {
                 height,
                 rotation: 0,
                 window: Some(app.hwnd),
+                monitor: None,
             })
         }
         state => anyhow::bail!("{}", window_advice(exe, state, false).unwrap_or_default()),
@@ -281,7 +288,8 @@ impl EncoderInner {
         } else {
             args::gpu_transform_step(screen.turned(), args::CUDA_TRANSFORM)
         };
-        let steps = args::ladder(test_source, transform, gpu_transform);
+        let wgc = screen.monitor.is_some() && !WGC_FAILED.load(Ordering::Relaxed);
+        let steps = args::ladder(test_source, wgc, transform, gpu_transform);
         let (internal_tx, internal_rx) = crossbeam_channel::unbounded();
         let (tx, rx) = crossbeam_channel::bounded(EVENT_QUEUE);
 
@@ -309,6 +317,7 @@ impl EncoderInner {
             },
             transform,
             gpu_transform_failed: false,
+            wgc_failed: false,
         };
         let supervisor = std::thread::Builder::new()
             .name("encoder".into())
@@ -369,6 +378,8 @@ struct Supervisor {
     transform: bool,
     /// The GPU scaling/turning step failed to start in this ladder.
     gpu_transform_failed: bool,
+    /// [`Step::Wgc`] failed to start in this ladder.
+    wgc_failed: bool,
 }
 
 enum StepResult {
@@ -417,7 +428,9 @@ impl Supervisor {
                         step.label(),
                         lines.last().map(String::as_str).unwrap_or("(no output)")
                     );
-                    self.gpu_transform_failed |= self.transform && step != Step::Cpu;
+                    self.gpu_transform_failed |=
+                        self.transform && matches!(step, Step::GpuDirect | Step::GpuCuda);
+                    self.wgc_failed |= step == Step::Wgc;
                     failures.push((step, lines));
                 }
                 StepResult::Died(lines) => {
@@ -488,6 +501,9 @@ impl Supervisor {
                         started = true;
                         if self.gpu_transform_failed && step == Step::Cpu {
                             GPU_TRANSFORM_FAILED.store(true, Ordering::Relaxed);
+                        }
+                        if self.wgc_failed {
+                            WGC_FAILED.store(true, Ordering::Relaxed);
                         }
                         log::info!(
                             "screen sharing started: {} {}x{} @ {} fps via {}",

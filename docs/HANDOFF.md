@@ -646,6 +646,67 @@ the watchdog after 5.4 s. The same hooks on ace1f87 with the engine and the
 exit stuck gave the friend's report: the main window closed, mpv stayed in
 Alt+Tab, and GloorpFlorp.exe, FFmpeg and mpv kept running.
 
+## Game stutter while sharing (owner's report, 2026-10-14)
+
+The owner's game (a CPU-heavy one, SPT/Tarkov-style, "stalzonew.exe")
+stuttered while sharing on 2026-10-13. Their log of that session (v1.1.0,
+hosting, Aaron watching): monitor 0 shared at native 4K, 144 fps, AV1 20
+Mbps through ddagrab for ~25 min; the capture died once when the game
+changed display mode (`AcquireNextFrame failed: 887a0026`); then they
+lowered it to 1080p 30 fps, which moved it onto the CUDA step (every frame
+through system memory). That log had been hidden by an earlier test's
+backup/restore of `%APPDATA%\GloorpFlorp` while the app ran; a copy is in
+`dist\session-2026-10-13-log.txt` (git-ignored: it has the friend's name
+and addresses). A build with this fix (the v1.1.1 package with the new
+exe) is in `dist\GloorpFlorp-stutter-fix`; the friend needs no update for
+it (no protocol change). The new control was checked in that exe through
+UI Automation: "Noise suppression strength" combo box, saved as
+`"noise_level": "High"`, logged as "noise suppression High".
+
+Measured on the RTX 5080 / 9800X3D (Elden Ring idling on monitor 0 as the
+picture): a GPU-bound stand-in game (wgpu, borderless fullscreen) never
+hitched with any capture (−12 to −18% fps evenly, also with a 1000 Hz
+pointer), but a CPU/cache-bound stand-in (`burn.exe` from the CPU-encoder
+research: 8 threads, dependent reads over 8 MB each) lost a lot. Medians of
+4 interleaved runs, its frames/s (not sharing ~1923):
+
+| Share | ddagrab (before) | gfxcapture (now) |
+|---|---|---|
+| 4K native 144 fps (their first setting) | ~1533 (−20%) | ~1730 (−10%) |
+| 1080p 30 fps (their second setting; CUDA step before) | ~1259 (−35%) | ~1847 (−4%) |
+| 1440p 60 fps (the defaults; 2 runs) | 1205–1256 (−34%), p99 frame 2× | 1851–1888 (−1%), p99 unchanged |
+
+FFmpeg's own CPU: 1.3–1.4 cores (ddagrab's 1 ms polling plus the CUDA
+step's copies) → 0.06–0.07. Video memory at 4K → 1440p: ~550 MB → ~200 MB.
+The ddagrab path's 4K copies (one per game frame and per pointer move, at
+~1000 polls a second) and the CUDA step's round trip through system memory
+are the likely cause; a cache-heavy game on an X3D CPU feels it most.
+
+**Fix:** a monitor share now first captures the monitor with gfxcapture
+(Windows Graphics Capture), exactly like a window share:
+`gfxcapture=hmonitor=0x…` (`gf_sys::Monitor::hmonitor`, from the DXGI
+output), scaled by gfxcapture to the output size, `window_pace_filter`,
+keyframes forced by time, straight into NVENC (`args::Step::Wgc`). The old
+ddagrab ladder stays behind it as the fallback; if gfxcapture fails where
+ddagrab then works, later monitor shares in that app run skip it
+(`WGC_FAILED`). Checked live through the real `Encoder`: monitor 0 at
+1440p and native, the portrait monitor upright at 810×1440 (Windows
+Graphics Capture delivers it upright, so nothing turns it), each started
+in ~0.8 s, keyframes every 2 s, 60.0 fps on moving content. A still screen
+now sends nothing (like a window), so the engine's still-share replay
+covers monitors too. A 60 fps game on a 144/240 Hz desktop sometimes lands
+two frames in one slot: a few 25–34 ms gaps per 10 s, where ddagrab sent a
+copy of the old frame instead (same picture on screen).
+
+Not verified: a real game in exclusive fullscreen (expect Windows Graphics
+Capture to keep running where ddagrab lost access; untested), an HDR
+monitor, Windows 10, the friend's PC. Worth telling the owner: 144 fps at
+native 4K is still the heaviest setting; 1440p 60 is the lightest.
+
+Also added on request: **Noise suppression strength** under "Voice"
+(Light / Medium / Strong (default) / Strongest = WebRTC's Low / Moderate /
+High / VeryHigh), setting `audio.noise_level` (missing = High).
+
 ## What the finished crates need from `gf-audio` and `app`
 
 From the agents' reports (also check the code's doc comments):

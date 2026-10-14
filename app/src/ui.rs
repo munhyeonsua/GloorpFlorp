@@ -18,8 +18,8 @@ use gloorpflorp::engine::{
     Command, Engine, EngineOptions, Phase, ShareState, Snapshot, NO_ENCODER,
 };
 use gloorpflorp::settings::{
-    default_bitrate_mbps, default_name, CodecChoice, GameAudioMode, Settings, VoiceModeChoice,
-    FPS_CHOICES, HEIGHT_CHOICES, MAX_BITRATE_MBPS, MIN_BITRATE_MBPS,
+    default_bitrate_mbps, default_name, CodecChoice, GameAudioMode, NoiseLevelChoice, Settings,
+    VoiceModeChoice, FPS_CHOICES, HEIGHT_CHOICES, MAX_BITRATE_MBPS, MIN_BITRATE_MBPS,
 };
 
 const GREEN: Color32 = Color32::from_rgb(90, 200, 110);
@@ -1347,6 +1347,24 @@ impl GloorpApp {
                 ui.checkbox(&mut a.auto_gain, "Automatic mic volume")
                     .on_hover_text("Keeps your voice at an even volume. Leave it on.");
             });
+            if a.noise_suppress {
+                ui.horizontal(|ui| {
+                    let label = ui.label("Noise suppression strength");
+                    ComboBox::from_id_salt("noise_level")
+                        .selected_text(a.noise_level.label())
+                        .show_ui(ui, |ui| {
+                            for l in NoiseLevelChoice::ALL {
+                                ui.selectable_value(&mut a.noise_level, l, l.label());
+                            }
+                        })
+                        .response
+                        .labelled_by(label.id)
+                        .on_hover_text(
+                            "Stronger removes more background noise (fans, hum, a loud \
+                             PC). If your voice sounds muffled or cuts out, make it lighter.",
+                        );
+                });
+            }
             if let Some(e) = &snap.audio.error {
                 ui.label(RichText::new(e).color(ORANGE));
             }

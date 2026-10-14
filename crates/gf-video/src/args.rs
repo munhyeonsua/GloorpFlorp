@@ -9,6 +9,16 @@ use crate::EncoderSettings;
 /// hardware steps in order; dev/test mode uses the test pattern.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Step {
+    /// The whole monitor through gfxcapture (Windows Graphics Capture), like
+    /// a window: Windows hands over a frame only when the picture changes,
+    /// upright, and gfxcapture scales it on the GPU, straight into NVENC.
+    /// The ddagrab steps below poll ~1000 times a second (a CPU core) and a
+    /// scaled share copies every frame through system memory: next to a
+    /// CPU-bound stand-in game on the RTX 5080 / 9800X3D test PC that cost
+    /// it 20-40% of its frame rate and raised its p99 frame time ~50%; this
+    /// step cost nothing measurable there, ~1-5% less of a GPU-bound one,
+    /// and ~350 MB less video memory at 4K -> 1440p.
+    Wgc,
     /// ddagrab's D3D11 frames straight into NVENC; `scale_d3d11` if scaling
     /// (it can't turn). With FFmpeg 8 on NVIDIA cards `scale_d3d11` fails to
     /// create its output frames (error 80070057).
@@ -28,6 +38,7 @@ pub(crate) enum Step {
 impl Step {
     pub(crate) fn label(self) -> &'static str {
         match self {
+            Step::Wgc => "GPU (Windows Graphics Capture -> NVENC)",
             Step::GpuDirect => "GPU (D3D11 -> NVENC)",
             Step::GpuCuda => "GPU (CUDA scaling)",
             Step::Cpu => "CPU fallback (hwdownload)",
@@ -56,17 +67,28 @@ pub(crate) fn gpu_transform_step(turn: bool, cuda: bool) -> Option<Step> {
     }
 }
 
-/// The start-up ladder for one session. `transform`: the picture needs
+/// The start-up ladder for one session. `wgc`: try [`Step::Wgc`] first, with
+/// the ddagrab steps as the fallback. `transform`: the picture needs
 /// scaling or turning, with `gpu_transform` as the GPU way to try first
 /// (`None`: none, or it already failed in this run of the app).
-pub(crate) fn ladder(test_source: bool, transform: bool, gpu_transform: Option<Step>) -> Vec<Step> {
+pub(crate) fn ladder(
+    test_source: bool,
+    wgc: bool,
+    transform: bool,
+    gpu_transform: Option<Step>,
+) -> Vec<Step> {
     if test_source {
-        vec![Step::TestSource]
-    } else if !transform {
+        return vec![Step::TestSource];
+    }
+    let ddagrab = if !transform {
         vec![Step::GpuDirect, Step::Cpu]
     } else {
         gpu_transform.into_iter().chain([Step::Cpu]).collect()
-    }
+    };
+    wgc.then_some(Step::Wgc)
+        .into_iter()
+        .chain(ddagrab)
+        .collect()
 }
 
 /// The monitor (or window) as the encoder sees it.
@@ -80,6 +102,8 @@ pub(crate) struct Screen {
     pub rotation: u32,
     /// Capture only this window (an HWND) with gfxcapture, not the monitor.
     pub window: Option<u64>,
+    /// The monitor's HMONITOR for [`Step::Wgc`] (`None`: ddagrab only).
+    pub monitor: Option<u64>,
 }
 
 impl Screen {
@@ -148,7 +172,8 @@ fn capture_filters(step: Step, screen: Screen, out: (u32, u32)) -> Option<String
             f.extend(turn_filter(screen.rotation, false).map(String::from));
             f.push("setparams=colorspace=bt470bg".into());
         }
-        Step::GpuDirect | Step::TestSource => {}
+        // gfxcapture already delivers the output size, upright.
+        Step::GpuDirect | Step::TestSource | Step::Wgc => {}
     }
     (!f.is_empty()).then(|| f.join(","))
 }
@@ -377,16 +402,24 @@ pub(crate) fn encoder_args(step: Step, settings: &EncoderSettings, screen: Scree
             a.extend(s(&NVENC_D3D11_DEVICE));
         }
         a.extend(s(&["-f", "lavfi", "-i"]));
+        // Windows hands over a frame only when the window (or monitor)
+        // changes (no polling), and gfxcapture scales it to the fixed size
+        // itself (keeping its shape) with no yellow border drawn around it.
+        let gfxcapture = |target: String| {
+            format!(
+                "gfxcapture={target}:max_framerate={WINDOW_CAPTURE_FPS}:\
+                 capture_cursor=1:display_border=0:width={w}:height={h}:\
+                 resize_mode=scale_aspect:scale_mode=bicubic"
+            )
+        };
         let pace = match screen.window {
-            // Windows hands over a frame only when the window changes (no
-            // polling), and gfxcapture scales it to the fixed size itself
-            // (keeping its shape) with no yellow border drawn around it.
             Some(hwnd) => {
-                a.push(format!(
-                    "gfxcapture=hwnd={hwnd:#x}:max_framerate={WINDOW_CAPTURE_FPS}:\
-                     capture_cursor=1:display_border=0:width={w}:height={h}:\
-                     resize_mode=scale_aspect:scale_mode=bicubic"
-                ));
+                a.push(gfxcapture(format!("hwnd={hwnd:#x}")));
+                window_pace_filter(fps)
+            }
+            None if step == Step::Wgc => {
+                let hmonitor = screen.monitor.unwrap_or(0);
+                a.push(gfxcapture(format!("hmonitor={hmonitor:#x}")));
                 window_pace_filter(fps)
             }
             None => {
@@ -421,8 +454,9 @@ pub(crate) fn encoder_args(step: Step, settings: &EncoderSettings, screen: Scree
         a.push(gop.to_string());
         // -bf is a generic codec option, so it is safe for av1_nvenc too.
         a.extend(s(&["-zerolatency", "1", "-delay", "0", "-bf", "0"]));
-        if screen.window.is_some() {
-            // A still or minimized window sends no frames, so `-g` (counted
+        let gfx = screen.window.is_some() || step == Step::Wgc;
+        if gfx {
+            // A still screen or minimized window sends no frames, so `-g` (counted
             // in frames) can stretch the keyframe gap: also force one on the
             // first frame a keyframe interval after the last forced one. (Not
             // `n_forced*N`: after a pause that makes every frame a keyframe
@@ -433,7 +467,7 @@ pub(crate) fn encoder_args(step: Step, settings: &EncoderSettings, screen: Scree
             ));
         }
         // av1_nvenc ignores forced keyframes without it.
-        if settings.codec != VideoCodec::Av1 || screen.window.is_some() {
+        if settings.codec != VideoCodec::Av1 || gfx {
             a.extend(s(&["-forced-idr", "1"]));
         }
     }
@@ -709,22 +743,29 @@ mod tests {
             height,
             rotation: 0,
             window: None,
+            monitor: None,
         }
     }
 
     #[test]
     fn ladders() {
-        assert_eq!(ladder(true, true, None), vec![Step::TestSource]);
+        assert_eq!(ladder(true, false, true, None), vec![Step::TestSource]);
         let direct = Some(Step::GpuDirect);
-        assert_eq!(ladder(false, false, None), vec![Step::GpuDirect, Step::Cpu]);
         assert_eq!(
-            ladder(false, true, direct),
+            ladder(false, false, false, None),
+            vec![Step::GpuDirect, Step::Cpu]
+        );
+        assert_eq!(
+            ladder(false, false, true, direct),
             vec![Step::GpuDirect, Step::Cpu]
         );
         let cuda = Some(Step::GpuCuda);
-        assert_eq!(ladder(false, true, cuda), vec![Step::GpuCuda, Step::Cpu]);
+        assert_eq!(
+            ladder(false, false, true, cuda),
+            vec![Step::GpuCuda, Step::Cpu]
+        );
         // No GPU way (left), or it failed before: straight to the CPU.
-        assert_eq!(ladder(false, true, None), vec![Step::Cpu]);
+        assert_eq!(ladder(false, false, true, None), vec![Step::Cpu]);
 
         // scale_d3d11 can scale but not turn; CUDA does both.
         assert_eq!(gpu_transform_step(false, false), direct);
@@ -741,13 +782,14 @@ mod tests {
         let shipped = |screen: Screen, max_height| {
             let transform = screen.needs_transform(max_height);
             let gpu = gpu_transform_step(screen.turned(), CUDA_TRANSFORM);
-            ladder(false, transform, gpu)
+            ladder(false, false, transform, gpu)
         };
         let portrait = Screen {
             width: 2160,
             height: 3840,
             rotation: 90,
             window: None,
+            monitor: None,
         };
         let cuda_then_cpu = vec![Step::GpuCuda, Step::Cpu];
         assert_eq!(shipped(upright(3840, 2160), Some(1440)), cuda_then_cpu);
@@ -796,6 +838,7 @@ mod tests {
                 height: 3840,
                 rotation,
                 window: None,
+                monitor: None,
             };
             assert!(s.needs_transform(None), "{rotation}");
         }
@@ -919,6 +962,7 @@ mod tests {
             height: 3840,
             rotation: 90,
             window: None,
+            monitor: None,
         };
         let screens = [
             (upright(2560, 1440), None),
@@ -1216,10 +1260,14 @@ mod tests {
             height: h,
             rotation: 0,
             window: Some(0x1A2B),
+            monitor: None,
         };
         assert!(!window.needs_transform(Some(1440)));
         let gpu = gpu_transform_step(window.turned(), CUDA_TRANSFORM);
-        assert_eq!(ladder(false, false, gpu), vec![Step::GpuDirect, Step::Cpu]);
+        assert_eq!(
+            ladder(false, false, false, gpu),
+            vec![Step::GpuDirect, Step::Cpu]
+        );
 
         let a = encoder_args(
             Step::GpuDirect,
@@ -1267,6 +1315,76 @@ mod tests {
         }
     }
 
+    /// A monitor share tries gfxcapture first (scaled by it, upright, with
+    /// window-style pacing and keyframes), then the old ddagrab ladder.
+    #[test]
+    fn monitor_wgc_graphs() {
+        let monitor = Screen {
+            monitor: Some(0x10001),
+            ..upright(3840, 2160)
+        };
+        let cuda = gpu_transform_step(false, CUDA_TRANSFORM);
+        assert_eq!(
+            ladder(false, true, true, cuda),
+            vec![Step::Wgc, Step::GpuCuda, Step::Cpu]
+        );
+        assert_eq!(
+            ladder(false, true, false, None),
+            vec![Step::Wgc, Step::GpuDirect, Step::Cpu]
+        );
+        assert_eq!(ladder(true, true, true, cuda), vec![Step::TestSource]);
+
+        let a = encoder_args(Step::Wgc, &settings(VideoCodec::Av1, Some(1440)), monitor);
+        let expected = "-hide_banner -nostdin -loglevel warning -nostats \
+            -f lavfi -i gfxcapture=hmonitor=0x10001:max_framerate=1000:capture_cursor=1:display_border=0:\
+            width=2560:height=1440:resize_mode=scale_aspect:scale_mode=bicubic \
+            -vf select='if(gte(floor(t*60),ld(0)),st(0,floor(t*60)+1),0)',\
+            setpts=floor(T*60)/60/TB:strip_fps=1,settb=1/60 -fps_mode vfr \
+            -c:v av1_nvenc -preset p4 -tune ull -rc cbr -b:v 20000k -maxrate 20000k \
+            -bufsize 2500k -g 120 -zerolatency 1 -delay 0 -bf 0 \
+            -force_key_frames expr:isnan(prev_forced_t)+gte(t,prev_forced_t+120/60) \
+            -forced-idr 1 -an -f flv -flvflags no_duration_filesize -flush_packets 1 pipe:1";
+        assert_eq!(joined(&a), expected);
+
+        // The turned monitor: Windows Graphics Capture delivers it upright
+        // (checked on the test PC's 2160x3840 monitor), so nothing turns it.
+        let portrait = Screen {
+            width: 2160,
+            height: 3840,
+            rotation: 90,
+            window: None,
+            monitor: Some(0x20002),
+        };
+        for codec in VideoCodec::ALL {
+            for max_height in [Some(1440), None] {
+                let j = joined(&encoder_args(
+                    Step::Wgc,
+                    &settings(codec, max_height),
+                    portrait,
+                ));
+                let size = if max_height.is_some() {
+                    "810:height=1440"
+                } else {
+                    "2160:height=3840"
+                };
+                assert!(j.contains("hmonitor=0x20002:"), "{j}");
+                assert!(j.contains(&format!("width={size}:")), "{j}");
+                assert!(j.contains(" -forced-idr 1 -an"), "{j}");
+                for not in ["ddagrab", "hwdownload", "scale_cuda", "transpose", " -r "] {
+                    assert!(!j.contains(not), "{not}: {j}");
+                }
+            }
+        }
+        // The ddagrab fallback is unchanged by the HMONITOR.
+        let st = settings(VideoCodec::Av1, Some(1440));
+        let mut plain = monitor;
+        plain.monitor = None;
+        assert_eq!(
+            encoder_args(Step::GpuCuda, &st, monitor),
+            encoder_args(Step::GpuCuda, &st, plain)
+        );
+    }
+
     /// The real FFmpeg with the window shares' keyframe expression: a
     /// keyframe on the first frame after a 5 s pause (a still window), and
     /// only one (`n_forced*N` would make the next few frames keyframes
@@ -1285,6 +1403,7 @@ mod tests {
             height: 144,
             rotation: 0,
             window: Some(1),
+            monitor: None,
         };
         let enc = encoder_args(Step::GpuDirect, &st, window);
         let at = enc.iter().position(|x| x == "-force_key_frames").unwrap();
@@ -1326,6 +1445,7 @@ mod tests {
             height: 3840,
             rotation,
             window: None,
+            monitor: None,
         };
         let st = settings(VideoCodec::H264, Some(1440));
         assert_eq!(output_size(2160, 3840, Some(1440)), (810, 1440));
@@ -1363,6 +1483,7 @@ mod tests {
             height: 1440,
             rotation: 180,
             window: None,
+            monitor: None,
         };
         let st = settings(VideoCodec::Av1, Some(1080));
         let j = joined(&encoder_args(Step::Cpu, &st, upside_down));

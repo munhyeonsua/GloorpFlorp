@@ -272,6 +272,9 @@ Also:
   GloorpFlorp uses the system default until it's back.
 - **Noise suppression, echo cancellation and automatic mic volume** are on by
   default. Leave them on unless you have a reason not to.
+- **Noise suppression strength**: Light, Medium, Strong (the default) or
+  Strongest. Stronger removes more fan and PC noise; if your voice sounds
+  muffled or cuts out, make it lighter.
 
 Push-to-talk and the shortcut keys work by asking Windows whether the key is
 being held. GloorpFlorp doesn't hook into your keyboard or touch the game in

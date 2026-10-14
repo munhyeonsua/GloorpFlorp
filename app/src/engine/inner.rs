@@ -36,8 +36,8 @@ const GAME_DEAD_AFTER: Duration = Duration::from_secs(1);
 /// itself keeps while mpv starts).
 const PENDING_FRAMES: usize = 300;
 const PENDING_BYTES: usize = 16 << 20;
-/// My share sent no frame for this long: the picture is still (a shared
-/// window only sends frames when it changes), so a new viewer gets the
+/// My share sent no frame for this long: the picture is still (gfxcapture,
+/// for a window or a monitor, only sends frames when it changes), so a new viewer gets the
 /// latest picture instead of waiting for a keyframe that won't come.
 const STILL_SHARE: Duration = Duration::from_secs(1);
 /// How often to check whether an elevated program has focus (a few cheap

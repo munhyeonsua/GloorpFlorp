@@ -1,11 +1,12 @@
-//! Video: FFmpeg captures the screen (`ddagrab`, Desktop Duplication, or one
-//! window with `gfxcapture`; frames stay on the GPU) and encodes it with
+//! Video: FFmpeg captures the screen or one window (`gfxcapture`, Windows
+//! Graphics Capture; `ddagrab`, Desktop Duplication, as the monitor
+//! fallback; frames stay on the GPU) and encodes it with
 //! NVENC; mpv decodes on the GPU and
 //! shows it in its own window. Both are bundled programs that this crate
 //! starts as child processes and talks to through pipes:
 //!
 //! ```text
-//! sharer:  ffmpeg (ddagrab -> *_nvenc -> FLV) --stdout--> FlvDemuxer --> VideoFrame
+//! sharer:  ffmpeg (gfxcapture -> *_nvenc -> FLV) --stdout--> FlvDemuxer --> VideoFrame
 //! viewer:  VideoFrame --> writer thread --stdin--> mpv (raw stream, hw decode, low-latency)
 //! ```
 //!
@@ -120,6 +121,13 @@ pub enum EncoderEvent {
 ///
 /// Start-up tries a short ladder of FFmpeg command lines, moving to the next
 /// if FFmpeg exits or produces no frame within a few seconds:
+/// 0. A monitor is first captured like a window (below): gfxcapture with
+///    the monitor's HMONITOR, scaled by it and upright, straight into
+///    NVENC (`args::Step::Wgc`). No polling and no copies through system
+///    memory: next to a CPU-bound stand-in game the ddagrab steps cost it
+///    20-40% of its frame rate (1.3 FFmpeg cores), this ~1% (0.07 cores).
+///    If it fails where a ddagrab step then works, later monitor shares in
+///    the same run of the app start at step 1.
 /// 1. GPU: at native size on an upright monitor, ddagrab (D3D11) straight
 ///    into NVENC. When the picture is scaled or turned, the CUDA way
 ///    instead: `hwdownload`, `hwupload_cuda`, then `scale_cuda` /
@@ -131,8 +139,9 @@ pub enum EncoderEvent {
 ///    (BT.601, tagged), then NVENC on a D3D11 device of its own (no CUDA
 ///    needed).
 ///
-/// A monitor that Windows shows turned (`gf_sys::Monitor::rotation`) is
-/// captured unturned by Desktop Duplication; the picture is turned upright,
+/// A monitor that Windows shows turned (`gf_sys::Monitor::rotation`) comes
+/// upright from gfxcapture, but unturned from Desktop Duplication, where the
+/// picture is turned upright,
 /// so the stream size is still [`output_size`] of [`monitor_size`].
 ///
 /// Frame pacing: ddagrab is asked for 1001 fps (`args::CAPTURE_POLL_FPS`),

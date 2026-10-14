@@ -86,6 +86,21 @@ pub enum VoiceMode {
     AlwaysOn,
 }
 
+/// How hard noise suppression works (WebRTC's levels): stronger removes
+/// more background noise but can make a voice sound a little muffled.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NoiseLevel {
+    /// ~6 dB less noise.
+    Low,
+    /// ~12 dB.
+    Moderate,
+    /// ~18 dB.
+    #[default]
+    High,
+    /// ~21 dB.
+    VeryHigh,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct AudioSettings {
     /// Device names from [`list_input_devices`]; `None` = system default.
@@ -101,6 +116,7 @@ pub struct AudioSettings {
     pub deafened: bool,
     pub echo_cancel: bool,
     pub noise_suppress: bool,
+    pub noise_level: NoiseLevel,
     pub auto_gain: bool,
     /// 0.0..=2.0, 1.0 = unchanged.
     pub voice_volume: f32,
@@ -121,6 +137,7 @@ impl Default for AudioSettings {
             deafened: false,
             echo_cancel: true,
             noise_suppress: true,
+            noise_level: NoiseLevel::High,
             auto_gain: true,
             voice_volume: 1.0,
             game_volume: 1.0,

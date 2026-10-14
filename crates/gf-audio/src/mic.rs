@@ -18,7 +18,7 @@ use crate::gate::{KeyFn, VoiceGate};
 use crate::level::{rms_dbfs, LevelMeter};
 use crate::resample::Resampler;
 use crate::shared::{Processing, Shared};
-use crate::PacketSink;
+use crate::{NoiseLevel, PacketSink};
 
 /// Rough playback-to-capture delay: the output queue (~30 ms) plus typical
 /// device buffers. Only a starting hint; AEC3 measures the real delay itself.
@@ -59,7 +59,8 @@ impl MicProcessor {
         log::info!(
             "voice processing: echo cancellation {}, noise suppression {}, auto gain {}",
             on_off(p.echo_cancel),
-            on_off(p.noise_suppress),
+            p.noise_suppress
+                .map_or("off".to_string(), |l| format!("{l:?}")),
             on_off(p.auto_gain)
         );
         self.current = Some(p);
@@ -107,8 +108,13 @@ fn build_apm(p: Processing) -> AudioProcessing {
         },
         high_pass_filter: Some(HighPassFilter::default()),
         echo_canceller: p.echo_cancel.then(EchoCanceller::default),
-        noise_suppression: p.noise_suppress.then(|| NoiseSuppression {
-            level: NoiseSuppressionLevel::High,
+        noise_suppression: p.noise_suppress.map(|level| NoiseSuppression {
+            level: match level {
+                NoiseLevel::Low => NoiseSuppressionLevel::Low,
+                NoiseLevel::Moderate => NoiseSuppressionLevel::Moderate,
+                NoiseLevel::High => NoiseSuppressionLevel::High,
+                NoiseLevel::VeryHigh => NoiseSuppressionLevel::VeryHigh,
+            },
             ..Default::default()
         }),
         gain_controller2: p.auto_gain.then(|| GainController2 {
@@ -362,7 +368,7 @@ mod tests {
             let mut p = MicProcessor::new();
             p.configure(Processing {
                 echo_cancel,
-                noise_suppress: false,
+                noise_suppress: None,
                 auto_gain: false,
             });
             let (mut echo_in, mut echo_out) = (Vec::new(), Vec::new());
@@ -392,6 +398,41 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn stronger_noise_levels_remove_more_noise() {
+        let kept: Vec<f32> = [
+            NoiseLevel::Low,
+            NoiseLevel::Moderate,
+            NoiseLevel::High,
+            NoiseLevel::VeryHigh,
+        ]
+        .into_iter()
+        .map(|level| {
+            let mut p = MicProcessor::new();
+            p.configure(Processing {
+                echo_cancel: false,
+                noise_suppress: Some(level),
+                auto_gain: false,
+            });
+            let mut seed = 1;
+            let (mut input, mut output) = (Vec::new(), Vec::new());
+            for _ in 0..200 {
+                let mut frame: Vec<f32> = (0..AUDIO_FRAME_SAMPLES)
+                    .map(|_| 0.01 * noise(&mut seed))
+                    .collect();
+                input.push(rms(&frame));
+                p.process(&mut frame);
+                output.push(rms(&frame));
+            }
+            mean(&output[100..]) / mean(&input[100..])
+        })
+        .collect();
+        assert!(
+            kept.windows(2).all(|w| w[0] > w[1]),
+            "noise kept per level: {kept:?}"
+        );
     }
 
     #[test]
@@ -445,7 +486,7 @@ mod tests {
             p.processor.current,
             Some(Processing {
                 echo_cancel: true,
-                noise_suppress: true,
+                noise_suppress: Some(NoiseLevel::High),
                 auto_gain: true
             })
         );

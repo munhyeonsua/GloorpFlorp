@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use gf_audio::{AudioSettings, VoiceMode};
+use gf_audio::{AudioSettings, NoiseLevel, VoiceMode};
 use gf_proto::VideoCodec;
 use serde::{Deserialize, Serialize};
 
@@ -105,6 +105,55 @@ impl From<VoiceModeChoice> for VoiceMode {
     }
 }
 
+/// Serializable mirror of [`gf_audio::NoiseLevel`].
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoiseLevelChoice {
+    Low,
+    Moderate,
+    High,
+    VeryHigh,
+}
+
+impl NoiseLevelChoice {
+    pub const ALL: [NoiseLevelChoice; 4] = [
+        NoiseLevelChoice::Low,
+        NoiseLevelChoice::Moderate,
+        NoiseLevelChoice::High,
+        NoiseLevelChoice::VeryHigh,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            NoiseLevelChoice::Low => "Light",
+            NoiseLevelChoice::Moderate => "Medium",
+            NoiseLevelChoice::High => "Strong (default)",
+            NoiseLevelChoice::VeryHigh => "Strongest",
+        }
+    }
+}
+
+impl From<NoiseLevel> for NoiseLevelChoice {
+    fn from(l: NoiseLevel) -> Self {
+        match l {
+            NoiseLevel::Low => NoiseLevelChoice::Low,
+            NoiseLevel::Moderate => NoiseLevelChoice::Moderate,
+            NoiseLevel::High => NoiseLevelChoice::High,
+            NoiseLevel::VeryHigh => NoiseLevelChoice::VeryHigh,
+        }
+    }
+}
+
+impl From<NoiseLevelChoice> for NoiseLevel {
+    fn from(l: NoiseLevelChoice) -> Self {
+        match l {
+            NoiseLevelChoice::Low => NoiseLevel::Low,
+            NoiseLevelChoice::Moderate => NoiseLevel::Moderate,
+            NoiseLevelChoice::High => NoiseLevel::High,
+            NoiseLevelChoice::VeryHigh => NoiseLevel::VeryHigh,
+        }
+    }
+}
+
 /// Serializable mirror of [`gf_audio::AudioSettings`] (field for field).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
@@ -118,6 +167,7 @@ pub struct AudioPrefs {
     pub deafened: bool,
     pub echo_cancel: bool,
     pub noise_suppress: bool,
+    pub noise_level: NoiseLevelChoice,
     pub auto_gain: bool,
     pub voice_volume: f32,
     pub game_volume: f32,
@@ -143,6 +193,7 @@ impl From<&AudioSettings> for AudioPrefs {
             deafened: a.deafened,
             echo_cancel: a.echo_cancel,
             noise_suppress: a.noise_suppress,
+            noise_level: a.noise_level.into(),
             auto_gain: a.auto_gain,
             voice_volume: a.voice_volume,
             game_volume: a.game_volume,
@@ -164,6 +215,7 @@ impl From<&AudioPrefs> for AudioSettings {
             deafened: a.deafened,
             echo_cancel: a.echo_cancel,
             noise_suppress: a.noise_suppress,
+            noise_level: a.noise_level.into(),
             auto_gain: a.auto_gain,
             voice_volume: a.voice_volume,
             game_volume: a.game_volume,
