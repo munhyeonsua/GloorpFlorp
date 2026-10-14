@@ -12,6 +12,15 @@ agents that built the crates: `.claude/handoff/phase1-agent-reports.json` (proto
 
 ## Status
 
+**Released: v1.1.1 (2026-10-13).** [v1.1.0](https://github.com/munhyeonsua/GloorpFlorp/releases/tag/v1.1.0)
+added Mute/Deafen shortcut keys, sharing one program's window, lower GPU
+memory, the optional lobby and a clean exit (closing never leaves mpv or
+FFmpeg running). [v1.1.1](https://github.com/munhyeonsua/GloorpFlorp/releases/tag/v1.1.1)
+only changes how the lobby is installed: CI publishes the image
+`ghcr.io/munhyeonsua/gloorp-lobby` (amd64 + arm64, public) and attaches
+`docker-compose.yml` to the release; the app is the same as 1.1.0. Both
+PCs need the same version.
+
 | Part | State | Tests (owner's PC, FFmpeg + mpv on PATH) |
 |---|---|---|
 | `gf-proto`: room codes, wire format, FLV demuxer + viewer writer, jitter buffer | ✅ done | 58 unit + 7 FFmpeg stream tests pass |
@@ -21,7 +30,7 @@ agents that built the crates: `.claude/handoff/phase1-agent-reports.json` (proto
 | `.github/workflows/build.yml`, `packaging/`, `README.md` | ✅ done | actionlint clean; packaging script run end to end with the real FFmpeg zip |
 | `gf-audio`: mic, echo cancellation, Opus, jitter, mixing, playback, game audio | ✅ done | 48 pass |
 | `app`: engine, settings, logging, egui UI, end-to-end test | ✅ done | 9 + 3 (UI) unit + 5 end-to-end pass |
-| `gf-lobby` (optional lobby: protocol, the app's client, the `gloorp-lobby` server, `packaging/lobby` Docker files) and the app's Lobby panel | ✅ code done; Docker, real presence and the panel's look unverified (see "Known risks") | 3 unit + 2 integration (real server and clients on 127.0.0.1) + 2 UI unit pass; invites answered while the app is minimized (checked with the real app) |
+| `gf-lobby` (optional lobby: protocol, the app's client, the `gloorp-lobby` server, `packaging/lobby` Docker files) and the app's Lobby panel | ✅ code done; image published and pulls anonymously; real presence and the panel's look unverified (see "Known risks") | 3 unit + 2 integration (real server and clients on 127.0.0.1) + 2 UI unit pass; invites answered while the app is minimized (checked with the real app) |
 | Integration (everything together, release build) | ✅ done on the owner's PC (Windows 11, MSVC): `cargo build --workspace`, `cargo test --workspace` (with and without FFmpeg/mpv), `cargo clippy --workspace --all-targets -D warnings`, `cargo fmt --all -- --check`, `cargo build --release -p gloorpflorp` → `target\release\GloorpFlorp.exe` | all pass |
 
 Most of the app has now run on the owner's PC, including a real screen
@@ -29,9 +38,9 @@ share between two copies of the app: see "Hardware test results", "Live-desktop
 checks" and "Live app checks" below. Not yet: push-to-talk and viewer focus
 with a real game in front, the mouse pointer on the portrait monitor, the
 Firewall prompt, and a session between the two PCs. `dist\GloorpFlorp` holds
-a packaged copy (BtbN FFmpeg N-127271, shinchiro mpv 0.41) with the latest
-`GloorpFlorp.exe` (CUDA scaling on, capture pacing fix in: see "Capture
-pacing fix").
+a packaged copy (BtbN FFmpeg N-127271, shinchiro mpv 0.41) with an older
+v1.0 `GloorpFlorp.exe` (91150b2); for v1.1.x use the release zip or rebuild
+with `packaging/package-windows.ps1`.
 
 ## Next steps
 
@@ -51,13 +60,13 @@ pacing fix").
    - [x] Mic → echo cancellation → voice on the real Yeti / ECHO-A (runs cleanly; how well echo is cancelled needs a real call, as no sound was played)
    - [x] Push-to-talk with F24 bound through the UI (synthesized key): first packet 3–6 ms after key-down, 15 tail packets ending ~145 ms after key-up, nothing sent while released
    - [ ] Push-to-talk while a real game has focus, and the "runs as administrator" hint with an admin game (or Task Manager) in front
-   - [ ] Mute/Deafen shortcut keys with real key presses (only unit and engine tests so far): a tap with GloorpFlorp minimized and with a game in front switches once, a held key switches once, the press that binds a key doesn't switch, a taken key is refused with the right message, Clear, and nothing with an admin game in front
+   - [x] Mute/Deafen shortcut keys with real key presses (2026-10-13, v1.1.0 release build, `scratchpad/hotkeys/live.ps1`): 20 of 20 30 ms taps switched once each with GloorpFlorp minimized and another program in front, a 600 ms hold switched once, the binding press didn't switch, the window followed the key, Clear stopped the key, all saved on exit. Not checked: a real game in front, and an admin game (expected: nothing, like push-to-talk)
    - [x] Two copies on one PC (`GLOORP_DEV_IP=127.0.0.1`, `GLOORP_FAKE_AUDIO=1`)
    - [ ] Windows Firewall prompt appears on first Host (tests only used 127.0.0.1)
    - [x] The auto-opened viewer doesn't take focus: with another window in front (3 runs: first share, no key presses, codec-change reopen) mpv opened behind it and the foreground never changed. It does come to the front after clicking Open viewer. Not checked with a real fullscreen game
    - [x] Next-session checks prepared by the fixers (portrait direction, `CUDA_TRANSFORM = true`, pacing, H.264 bitrate): done, see "Live-desktop checks". Still open: the mouse pointer on the portrait monitor. The pacing experiment is now shipped (the owner's choice: smooth, ~1 more CPU core; see "Capture pacing fix"). Scripts: `scratchpad/hwlive/capture/` (harness, `run.ps1`, `pointer.ps1`, `pace-experiment.diff`) and `scratchpad/hwlive/app/` (two-copy app checks). (Scratchpads are under `%TEMP%\claude\…`; they may be gone.)
-4. **Push without `[skip ci]`** so GitHub builds the zip. Check both jobs go green.
-5. **Release v1.0.0.** Prepared: MIT `LICENSE`, version 1.0.0 in
+4. ~~**Push without `[skip ci]`**~~ Done; CI is green on every release commit.
+5. ~~**Release v1.0.0.**~~ Done, then v1.1.0 and v1.1.1 (see "Status"). Originally prepared: MIT `LICENSE`, version 1.0.0 in
    `Cargo.toml`, exact FFmpeg/mpv source links in the package and source
    archives attached by the release job (see "How to release" below). Done
    by tagging `v1.0.0` once CI is green on the release commit; the friend
@@ -65,8 +74,9 @@ pacing fix").
    GitHub account needed). Check the published release lists the zip and
    the source archives: four, or five when the FFmpeg inside mpv is a
    different commit from ffmpeg.exe's (`licenses/SOURCES.txt` says which).
-6. **First session with the friend.** The friend's 3070 Ti PC needs an up-to-date NVIDIA driver (FFmpeg master needs a recent NVENC API). Judge delay and echo by ear (nothing audible was played in the tests), and keep both PCs' log files. 60 fps is the default; 120/144 now send exactly that rate, but spread the same bitrate over more frames, and the pacing fix's CPU cost (~1 core) is only measured on the 9800X3D, so check Task Manager on the 3070 Ti PC.
-7. **Lobby (optional), first real run.** On the home server: download the release's `docker-compose.yml` and run `TS_AUTHKEY=… docker compose up -d` next to it (the image is `ghcr.io/munhyeonsua/gloorp-lobby`, published by CI's `lobby-image` job for each tag; the first time, make that package public in its GitHub package settings), then check that the members show **Online**/**Offline** as the PCs come and go (tailscaled's LocalAPI), look over the Lobby panel, and send an invite between the two PCs (also to a minimized GloorpFlorp).
+6. **First session with the friend on v1.1.x.** Also confirms on the 3070 Ti: GPU memory (Task Manager, Performance, "Dedicated GPU memory" before/after sharing and the viewer; see "GPU memory"), window sharing with a real game, the shortcut keys in-game, and that closing GloorpFlorp leaves no mpv/ffmpeg (the friend's v1.0 report; never reproduced here, see "Closing the app"). If anything is left running, get `%APPDATA%\GloorpFlorp\log.txt` and `log.old.txt` from that PC. The friend's 3070 Ti PC needs an up-to-date NVIDIA driver (FFmpeg master needs a recent NVENC API). Judge delay and echo by ear (nothing audible was played in the tests), and keep both PCs' log files. 60 fps is the default; 120/144 now send exactly that rate, but spread the same bitrate over more frames, and the pacing fix's CPU cost (~1 core) is only measured on the 9800X3D, so check Task Manager on the 3070 Ti PC.
+7. **Lobby (optional), first real run.** On the home server: download the release's `docker-compose.yml` and run `TS_AUTHKEY=… docker compose up -d` next to it (the image is `ghcr.io/munhyeonsua/gloorp-lobby`, published by CI's `lobby-image` job for each tag; it is already public), then check that the members show **Online**/**Offline** as the PCs come and go (tailscaled's LocalAPI), look over the Lobby panel, and send an invite between the two PCs (also to a minimized GloorpFlorp).
+8. **GitHub's default branch** is still `claude/lucid-fermi-dew58r` (v0, old README on the repo's front page). It is an ancestor of `claude/nifty-ride-afb8qt`, so it can be fast-forwarded to the latest release, or the default branch switched in the repo settings. Waiting for the owner's OK.
 
 ## Decisions made after ARCHITECTURE.md was written
 
@@ -711,8 +721,8 @@ From the agents' reports (also check the code's doc comments):
   yet exercised for real: push-to-talk with a real (or admin) game in
   front, the mouse pointer on the portrait monitor, the Windows Firewall
   prompt, a session over Tailscale.
-- **Mute/Deafen shortcut keys** have not been tried with real key presses
-  (see the checklist above). Known limits: pressing a shortcut key while
+- **Mute/Deafen shortcut keys** have not been tried with a real game in
+  front (real key presses otherwise work; see the checklist above). Known limits: pressing a shortcut key while
   binding another key (or re-binding the same key) also switches it (the
   refusal says so); Mouse 5, the default push-to-talk key, can't be a
   shortcut until the push-to-talk key is changed, even in Voice activation
@@ -777,11 +787,11 @@ From the agents' reports (also check the code's doc comments):
   dropped it too (3 of 3 runs at 30 and 60 fps,
   `scratchpad/winshare-fix/lastframe-win.sh`); a fix needs pacing with a
   timer, which FFmpeg's filters don't have.
-- **Lobby: not run outside this PC's tests.** The Dockerfile and
-  docker-compose.yml have never been built or started here (no Docker on
-  this PC). CI's Linux job builds the image, starts the server and checks
-  that its user can write `/data`, but never runs compose or the tailscale
-  container. Presence from tailscaled's LocalAPI has never read a real
+- **Lobby: not run outside tests.** There is no Docker on this PC. CI's
+  Linux job builds the image, starts the server and checks that its user
+  can write `/data`; the `lobby-image` job publishes it for amd64 and arm64
+  on each tag (v1.1.1: both platforms present, pulls without login). Nobody
+  has run the compose file with the tailscale container yet. Presence from tailscaled's LocalAPI has never read a real
   tailscaled: the parser is only tested on a canned status shaped like
   `tailscale status --json`. Nobody has looked at the Lobby panel yet.
   Checked here: the server with real clients on
@@ -866,4 +876,7 @@ From the agents' reports (also check the code's doc comments):
    the exact releases), and publishes the zip and those four or five
    archives as a GitHub Release with
    install and license notes plus generated release notes. Anyone can
-   download it from the Releases page without a GitHub account.
+   download it from the Releases page without a GitHub account. The
+   `lobby-image` job pushes `ghcr.io/munhyeonsua/gloorp-lobby:<tag>` and
+   `:latest` first, and the release also carries
+   `packaging/lobby/docker-compose.yml`.
