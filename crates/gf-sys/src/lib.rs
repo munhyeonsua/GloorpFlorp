@@ -138,6 +138,19 @@ pub fn foreground_is_elevated() -> bool {
     }
 }
 
+/// Whether Windows Graphics Capture can leave out its yellow border (build
+/// 20348 on: Windows 11). Windows 10 draws it around whatever is captured.
+pub fn borderless_capture() -> bool {
+    #[cfg(windows)]
+    {
+        win::windows_build().is_some_and(|b| b >= 20348)
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 /// What to capture as "game audio".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GameAudioSource {

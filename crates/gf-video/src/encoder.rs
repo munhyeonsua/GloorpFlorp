@@ -288,7 +288,11 @@ impl EncoderInner {
         } else {
             args::gpu_transform_step(screen.turned(), args::CUDA_TRANSFORM)
         };
-        let wgc = screen.monitor.is_some() && !WGC_FAILED.load(Ordering::Relaxed);
+        // Windows 10 would draw a yellow border around the whole monitor for
+        // the entire share, so it keeps Desktop Duplication there.
+        let wgc = screen.monitor.is_some()
+            && gf_sys::borderless_capture()
+            && !WGC_FAILED.load(Ordering::Relaxed);
         let steps = args::ladder(test_source, wgc, transform, gpu_transform);
         let (internal_tx, internal_rx) = crossbeam_channel::unbounded();
         let (tx, rx) = crossbeam_channel::bounded(EVENT_QUEUE);

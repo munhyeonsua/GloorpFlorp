@@ -314,7 +314,7 @@ pub(crate) fn foreground_is_elevated() -> bool {
 }
 
 /// Windows build number (e.g. 19041), not affected by compatibility shims.
-fn windows_build() -> Option<u32> {
+pub(crate) fn windows_build() -> Option<u32> {
     let mut info = OSVERSIONINFOW {
         dwOSVersionInfoSize: size_of::<OSVERSIONINFOW>() as u32,
         ..Default::default()

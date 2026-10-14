@@ -12,7 +12,12 @@ agents that built the crates: `.claude/handoff/phase1-agent-reports.json` (proto
 
 ## Status
 
-**Released: v1.1.1 (2026-10-13).** [v1.1.0](https://github.com/munhyeonsua/GloorpFlorp/releases/tag/v1.1.0)
+**Released: v1.1.2 (2026-10-14):** a monitor share no longer makes a
+CPU-heavy game stutter (Windows Graphics Capture instead of ddagrab on
+Windows 11), plus a noise suppression strength setting; see "Game stutter
+while sharing". It works with a 1.1.x friend (no protocol change).
+
+**v1.1.1 (2026-10-13).** [v1.1.0](https://github.com/munhyeonsua/GloorpFlorp/releases/tag/v1.1.0)
 added Mute/Deafen shortcut keys, sharing one program's window, lower GPU
 memory, the optional lobby and a clean exit (closing never leaves mpv or
 FFmpeg running). [v1.1.1](https://github.com/munhyeonsua/GloorpFlorp/releases/tag/v1.1.1)
@@ -698,9 +703,19 @@ covers monitors too. A 60 fps game on a 144/240 Hz desktop sometimes lands
 two frames in one slot: a few 25–34 ms gaps per 10 s, where ddagrab sent a
 copy of the old frame instead (same picture on screen).
 
+Pre-release review (2 reviewers, each finding checked by a skeptic) found
+two things, both fixed in v1.1.2: Windows 10 can't hide Windows Graphics
+Capture's yellow border (gfxcapture only warns), so a monitor share there
+would have framed the sharer's monitor in yellow for the whole share; now
+`gf_sys::borderless_capture()` (build ≥ 20348) gates `Step::Wgc` and
+Windows 10 keeps ddagrab exactly as in 1.1.1. And a still monitor whose
+last keyframe group didn't fit `PendingFrames` (above ~64 Mbps) left a new
+viewer black until the picture changed; `PENDING_BYTES` is now 32 MB (80
+Mbps × 2 s ≈ 20 MB).
+
 Not verified: a real game in exclusive fullscreen (expect Windows Graphics
 Capture to keep running where ddagrab lost access; untested), an HDR
-monitor, Windows 10, the friend's PC. Worth telling the owner: 144 fps at
+monitor, Windows 10 (ddagrab there, as before), the friend's PC. Worth telling the owner: 144 fps at
 native 4K is still the heaviest setting; 1440p 60 is the lightest.
 
 Also added on request: **Noise suppression strength** under "Voice"

@@ -32,10 +32,13 @@ const REBIND_WINDOW: Duration = Duration::from_secs(5);
 const VIEWER_EARLY_CLOSE: Duration = Duration::from_secs(2);
 /// Game audio is considered dead after the capture reports a problem this long.
 const GAME_DEAD_AFTER: Duration = Duration::from_secs(1);
-/// Frames kept for a viewer that is still starting (as many as the viewer
-/// itself keeps while mpv starts).
+/// Frames kept for a viewer that is still starting (as many frames as the
+/// viewer itself keeps while mpv starts), and of my share's latest keyframe
+/// group. 32 MB holds a 2 s group at the 80 Mbps the Bitrate slider allows
+/// (~20 MB): a still monitor or window sends nothing, so a group that didn't
+/// fit would leave a new viewer black until the picture changes.
 const PENDING_FRAMES: usize = 300;
-const PENDING_BYTES: usize = 16 << 20;
+const PENDING_BYTES: usize = 32 << 20;
 /// My share sent no frame for this long: the picture is still (gfxcapture,
 /// for a window or a monitor, only sends frames when it changes), so a new viewer gets the
 /// latest picture instead of waiting for a keyframe that won't come.
@@ -1611,10 +1614,10 @@ impl Core {
             self.fps_recv = self.snap.frames_received;
             self.fps_at = now;
         }
-        // shortcut: a keyframe group past PENDING_FRAMES/PENDING_BYTES (long
-        // keyframe interval at a high frame rate or bitrate) isn't kept, so
-        // that viewer waits until the window changes; restart the encoder
-        // (an open window sends a first picture) if that turns out to matter.
+        // shortcut: a keyframe group past PENDING_FRAMES/PENDING_BYTES (only
+        // with a keyframe interval raised in settings.json) isn't kept, so
+        // that viewer waits until the window or monitor changes; restart the
+        // encoder (gfxcapture sends a first picture) if that turns out to matter.
         if self.need_keyframe
             && self.snap.peer_watching
             && self.connected()
