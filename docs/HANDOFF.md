@@ -12,6 +12,18 @@ agents that built the crates: `.claude/handoff/phase1-agent-reports.json` (proto
 
 ## Status
 
+**Unreleased (2026-10-20):** a new look (sections as cards, an accent
+colour, bigger text, the status always at the top) and pictures in the lobby
+chat (paste, drop or **Paste picture**; `gf-lobby` protocol 2, so the lobby
+server image must be updated with the app). Checked: workspace tests, clippy,
+fmt, and the window on this PC; not yet a picture sent between two PCs, and
+not pasting from a real clipboard (the owner's clipboard wasn't touched).
+How the window was checked without touching the owner's settings or running
+copy: `gloorp-lobby` on `127.0.0.1:47901`, a script that connects as a second
+member and posts a PNG, then `GloorpFlorp.exe` with `GLOORP_DATA_DIR` set to
+a scratch folder (settings with that lobby address) and `GLOORP_FAKE_AUDIO=1`,
+screenshotted with `PrintWindow` from PowerShell.
+
 **Released: v1.1.2 (2026-10-14):** a monitor share no longer makes a
 CPU-heavy game stutter (Windows Graphics Capture instead of ddagrab on
 Windows 11), plus a noise suppression strength setting; see "Game stutter
@@ -34,8 +46,8 @@ PCs need the same version.
 | `gf-video`: FFmpeg encoder (ddagrab or one window's gfxcapture → NVENC → FLV), mpv viewer | ✅ done | 40 unit + 3 integration pass |
 | `.github/workflows/build.yml`, `packaging/`, `README.md` | ✅ done | actionlint clean; packaging script run end to end with the real FFmpeg zip |
 | `gf-audio`: mic, echo cancellation, Opus, jitter, mixing, playback, game audio | ✅ done | 48 pass |
-| `app`: engine, settings, logging, egui UI, end-to-end test | ✅ done | 9 + 3 (UI) unit + 5 end-to-end pass |
-| `gf-lobby` (optional lobby: protocol, the app's client, the `gloorp-lobby` server, `packaging/lobby` Docker files) and the app's Lobby panel | ✅ code done; image published and pulls anonymously; real presence and the panel's look unverified (see "Known risks") | 3 unit + 2 integration (real server and clients on 127.0.0.1) + 2 UI unit pass; invites answered while the app is minimized (checked with the real app) |
+| `app`: engine, settings, logging, egui UI, end-to-end test | ✅ done | 9 + 4 (UI) + 2 (pictures) unit + 5 end-to-end pass |
+| `gf-lobby` (optional lobby: protocol, the app's client, the `gloorp-lobby` server, `packaging/lobby` Docker files) and the app's Lobby panel | ✅ code done; image published and pulls anonymously; real presence unverified (see "Known risks"); the panel's look checked on 2026-10-20 (see "Unreleased") | 5 unit + 2 integration (real server and clients on 127.0.0.1, with a picture) + 2 UI unit pass; invites answered while the app is minimized (checked with the real app) |
 | Integration (everything together, release build) | ✅ done on the owner's PC (Windows 11, MSVC): `cargo build --workspace`, `cargo test --workspace` (with and without FFmpeg/mpv), `cargo clippy --workspace --all-targets -D warnings`, `cargo fmt --all -- --check`, `cargo build --release -p gloorpflorp` → `target\release\GloorpFlorp.exe` | all pass |
 
 Most of the app has now run on the owner's PC, including a real screen

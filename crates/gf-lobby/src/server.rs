@@ -5,7 +5,8 @@
 //! seconds which devices are online.
 //!
 //! Files in the data folder: `members.json` (everyone who ever joined) and
-//! `chat.jsonl` (every chat message, one JSON object per line).
+//! `chat.jsonl` (the chat, one JSON object per line; pictures are big, so
+//! once it passes `REWRITE_CHAT_AT` it is cut down to the history).
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
@@ -20,8 +21,8 @@ use crossbeam_channel::Sender;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    encode, read_line, unix_now, ChatLine, Member, Presence, ToClient, ToServer, HISTORY,
-    IDLE_TIMEOUT, MAX_CLIENT_LINE, MAX_NAME, MAX_TEXT, PROTOCOL,
+    encode, forget_image, read_line, unix_now, ChatLine, Member, Presence, ToClient, ToServer,
+    HISTORY, IDLE_TIMEOUT, IMAGE_HISTORY, MAX_CLIENT_LINE, MAX_NAME, MAX_TEXT, PROTOCOL,
 };
 
 pub struct Config {
@@ -34,6 +35,9 @@ pub struct Config {
 /// Threads are cheap but not free; the lobby is for a handful of friends.
 const MAX_CONNECTIONS: usize = 64;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// chat.jsonl is rewritten from the history (at most HISTORY lines with
+/// IMAGE_HISTORY pictures) once it grows past this.
+const REWRITE_CHAT_AT: u64 = 64 << 20;
 #[cfg(unix)]
 const TAILNET_POLL: Duration = Duration::from_secs(5);
 /// Chat messages and invites: bursts of up to this many, then one a second.
@@ -55,6 +59,11 @@ enum Ev {
     Closed {
         id: u64,
     },
+    /// The newcomer's history has been written (or couldn't be).
+    Replayed {
+        id: u64,
+        ok: bool,
+    },
     /// Tailscale address -> online.
     #[cfg_attr(not(unix), allow(dead_code))]
     Tailnet(HashMap<IpAddr, bool>),
@@ -71,6 +80,9 @@ struct Conn {
     ip: IpAddr,
     /// Member id, once it said `Hello`.
     member: Option<String>,
+    /// Lines for it while a thread still writes it the history (see
+    /// `Ev::Replayed`).
+    waiting: Option<Vec<u8>>,
     tokens: f32,
     refilled: Instant,
 }
@@ -84,12 +96,17 @@ struct Hub {
     tailnet: HashMap<IpAddr, bool>,
     /// The member list everyone has.
     sent: Vec<Member>,
+    /// For the history-writing threads to report back.
+    tx: Sender<Ev>,
+    /// Size of chat.jsonl.
+    chat_bytes: u64,
 }
 
 /// Runs the lobby on `listener` until the process ends. Fails at the start if
 /// the data folder can't be read, or later if the hub thread died.
 pub fn serve(listener: TcpListener, cfg: Config) -> io::Result<()> {
-    let mut hub = Hub::load(&cfg.data_dir)?;
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let mut hub = Hub::load(&cfg.data_dir, tx.clone())?;
     log::info!(
         "lobby on {} with {} member(s) and {} message(s) of history in {}",
         listener.local_addr()?,
@@ -97,7 +114,6 @@ pub fn serve(listener: TcpListener, cfg: Config) -> io::Result<()> {
         hub.history.len(),
         cfg.data_dir.display()
     );
-    let (tx, rx) = crossbeam_channel::unbounded();
     #[cfg(unix)]
     if let Some(path) = cfg.tailscale_socket {
         let tx = tx.clone();
@@ -220,8 +236,25 @@ fn clean(s: &str, max: usize) -> String {
     s.trim().to_string()
 }
 
+/// Adds a line to the history: the last [`HISTORY`] lines, with pictures
+/// only on the newest [`IMAGE_HISTORY`] of them.
+fn remember(history: &mut VecDeque<ChatLine>, line: ChatLine) {
+    history.push_back(line);
+    if history.len() > HISTORY {
+        history.pop_front();
+    }
+    let n = history.iter().filter(|l| l.image.is_some()).count();
+    for l in history
+        .iter_mut()
+        .filter(|l| l.image.is_some())
+        .take(n.saturating_sub(IMAGE_HISTORY))
+    {
+        forget_image(l);
+    }
+}
+
 impl Hub {
-    fn load(dir: &Path) -> io::Result<Hub> {
+    fn load(dir: &Path, tx: Sender<Ev>) -> io::Result<Hub> {
         fs::create_dir_all(dir)?;
         let path = dir.join("members.json");
         let members = match fs::read(&path) {
@@ -236,31 +269,34 @@ impl Hub {
             Err(e) => return Err(e),
         };
         let mut history = VecDeque::new();
+        let mut chat_bytes = 0;
         match fs::File::open(dir.join("chat.jsonl")) {
-            // shortcut: reads (and keeps) the whole file at start; fine for
-            // years of chat between friends, rotate it if it ever gets big.
             Ok(f) => {
+                chat_bytes = f.metadata().map_or(0, |m| m.len());
                 for line in BufReader::new(f).split(b'\n') {
                     // A line cut short by a crash is skipped.
                     if let Ok(c) = serde_json::from_slice::<ChatLine>(&line?) {
-                        history.push_back(c);
-                        if history.len() > HISTORY {
-                            history.pop_front();
-                        }
+                        remember(&mut history, c);
                     }
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
-        Ok(Hub {
+        let mut hub = Hub {
             dir: dir.to_path_buf(),
             members,
             history,
             conns: HashMap::new(),
             tailnet: HashMap::new(),
             sent: Vec::new(),
-        })
+            tx,
+            chat_bytes,
+        };
+        if hub.chat_bytes > REWRITE_CHAT_AT {
+            hub.rewrite_chat();
+        }
+        Ok(hub)
     }
 
     fn handle(&mut self, ev: Ev) {
@@ -270,6 +306,7 @@ impl Hub {
                     stream,
                     ip,
                     member: None,
+                    waiting: None,
                     tokens: BURST,
                     refilled: Instant::now(),
                 };
@@ -278,6 +315,15 @@ impl Hub {
             Ev::Line { id, msg } => self.message(id, msg),
             Ev::Closed { id } => {
                 self.conns.remove(&id);
+            }
+            Ev::Replayed { id, ok } => {
+                let waiting = self.conns.get_mut(&id).and_then(|c| c.waiting.take());
+                if !ok {
+                    log::info!("connection {id}: couldn't send the history");
+                    self.close(id);
+                } else if let Some(lines) = waiting {
+                    self.write(id, &lines);
+                }
             }
             Ev::Tailnet(map) => self.tailnet = map,
         }
@@ -295,9 +341,15 @@ impl Hub {
             (ToServer::Hello { .. }, Some(_)) => {}
             // Everything else needs a Hello first.
             (_, None) => {}
-            (ToServer::Chat { text }, Some(me)) => {
+            (ToServer::Chat { text, image }, Some(me)) => {
                 let text = clean(&text, MAX_TEXT);
-                if text.is_empty() {
+                if text.is_empty() && image.is_none() {
+                    return;
+                }
+                if image.as_ref().is_some_and(|i| !i.ok()) {
+                    let text =
+                        "That picture can't be sent: only PNG or JPEG files up to 1 MB.".into();
+                    self.send(id, &ToClient::Error { text });
                     return;
                 }
                 if !self.allow(id) {
@@ -310,13 +362,11 @@ impl Hub {
                     from: me,
                     at: unix_now(),
                     text,
+                    image,
                 };
+                self.broadcast(&ToClient::Chat(line.clone()));
+                remember(&mut self.history, line.clone());
                 self.append_chat(&line);
-                self.history.push_back(line.clone());
-                if self.history.len() > HISTORY {
-                    self.history.pop_front();
-                }
-                self.broadcast(&ToClient::Chat(line));
             }
             (ToServer::Invite { to, code }, Some(me)) => {
                 let code = clean(&code, MAX_CODE);
@@ -379,20 +429,34 @@ impl Hub {
             ip.to_string()
         };
         conn.member = Some(me.clone());
+        conn.waiting = Some(Vec::new());
+        let stream = conn.stream.try_clone();
         let known = Known { ip, name };
         if self.members.get(&me) != Some(&known) {
             self.members.insert(me.clone(), known);
             self.save_members();
         }
-        self.send(
-            id,
-            &ToClient::Welcome {
-                v: PROTOCOL,
-                you: me,
-            },
-        );
-        for line in self.history.clone() {
-            self.send(id, &ToClient::Chat(line));
+        // The history can be megabytes (pictures), so a thread writes it and
+        // the hub goes on; what the newcomer should get meanwhile waits in
+        // `Conn::waiting` until `Ev::Replayed`.
+        let mut lines = encode(&ToClient::Welcome {
+            v: PROTOCOL,
+            you: me,
+        });
+        for line in &self.history {
+            lines.extend(encode(&ToClient::Chat(line.clone())));
+        }
+        let tx = self.tx.clone();
+        let started = stream.and_then(|mut stream| {
+            spawn("lobby-replay", move || {
+                let ok = stream.write_all(&lines).is_ok();
+                let _ = tx.send(Ev::Replayed { id, ok });
+            })
+        });
+        if let Err(e) = started {
+            log::info!("connection {id}: couldn't send the history ({e})");
+            self.close(id);
+            return;
         }
         // Everyone gets the list again; the newcomer needs it anyway.
         self.sent.clear();
@@ -462,6 +526,10 @@ impl Hub {
         let Some(c) = self.conns.get_mut(&id) else {
             return;
         };
+        if let Some(waiting) = &mut c.waiting {
+            waiting.extend_from_slice(line);
+            return;
+        }
         if let Err(e) = c.stream.write_all(line) {
             log::info!("dropping connection {id} ({}): {e}", c.ip);
             self.close(id);
@@ -517,15 +585,42 @@ impl Hub {
         }
     }
 
-    fn append_chat(&self, line: &ChatLine) {
+    fn append_chat(&mut self, line: &ChatLine) {
         let path = self.dir.join("chat.jsonl");
+        let bytes = encode(line);
         let result = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
-            .and_then(|mut f| f.write_all(&encode(line)));
+            .and_then(|mut f| f.write_all(&bytes));
         if let Err(e) = result {
             log::warn!("couldn't save a chat message to {}: {e}", path.display());
+        }
+        self.chat_bytes += bytes.len() as u64;
+        if self.chat_bytes > REWRITE_CHAT_AT {
+            self.rewrite_chat();
+        }
+    }
+
+    /// Replaces chat.jsonl with the history, so forgotten pictures leave the
+    /// disk too.
+    fn rewrite_chat(&mut self) {
+        let path = self.dir.join("chat.jsonl");
+        let tmp = path.with_extension("jsonl.tmp");
+        let mut bytes = Vec::new();
+        for line in &self.history {
+            bytes.extend(encode(line));
+        }
+        match fs::write(&tmp, &bytes).and_then(|()| fs::rename(&tmp, &path)) {
+            Ok(()) => {
+                log::info!(
+                    "{} cut down to the last {} message(s)",
+                    path.display(),
+                    self.history.len()
+                );
+                self.chat_bytes = bytes.len() as u64;
+            }
+            Err(e) => log::warn!("couldn't cut down {}: {e}", path.display()),
         }
     }
 }
@@ -616,6 +711,37 @@ fn parse_status(response: &[u8]) -> io::Result<HashMap<IpAddr, bool>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_file_is_cut_down_to_the_history() {
+        let dir = std::env::temp_dir().join(format!("gf-lobby-rewrite-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut hub = Hub::load(&dir, tx.clone()).unwrap();
+        let line = |i: u64| ChatLine {
+            from: "a".into(),
+            name: "A".into(),
+            at: i,
+            text: format!("m{i}"),
+            image: None,
+        };
+        for i in 0..HISTORY as u64 + 5 {
+            remember(&mut hub.history, line(i));
+            hub.append_chat(&line(i));
+        }
+        let lines = |hub: &Hub| {
+            let file = fs::read_to_string(hub.dir.join("chat.jsonl")).unwrap();
+            (file.lines().count(), file.len() as u64)
+        };
+        assert_eq!(lines(&hub).0, HISTORY + 5);
+        hub.rewrite_chat();
+        assert_eq!(lines(&hub), (HISTORY, hub.chat_bytes));
+        let again = Hub::load(&dir, tx).unwrap();
+        assert_eq!(again.history.len(), HISTORY);
+        assert_eq!(again.history[0].text, "m5");
+        assert_eq!(again.chat_bytes, hub.chat_bytes);
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn tailscale_status_parsing() {

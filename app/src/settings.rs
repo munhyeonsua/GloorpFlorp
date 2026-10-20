@@ -427,8 +427,12 @@ impl Settings {
 }
 
 /// GloorpFlorp's folder for settings and the log: %APPDATA%\GloorpFlorp on
-/// Windows, ~/.config/GloorpFlorp elsewhere.
+/// Windows, ~/.config/GloorpFlorp elsewhere. Development only:
+/// `GLOORP_DATA_DIR` moves it, so a second copy on one PC has its own.
 pub fn app_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("GLOORP_DATA_DIR") {
+        return Some(PathBuf::from(dir));
+    }
     directories::BaseDirs::new().map(|d| d.config_dir().join("GloorpFlorp"))
 }
 

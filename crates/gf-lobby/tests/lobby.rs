@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use gf_lobby::client::{Client, State};
 use gf_lobby::server::{serve, Config};
-use gf_lobby::{ChatLine, Presence, ToClient, ToServer, MAX_CLIENT_LINE};
+use gf_lobby::{Image, Presence, ToClient, ToServer, MAX_CLIENT_LINE, PROTOCOL};
 
 const WAIT: Duration = Duration::from_secs(10);
 
@@ -85,9 +85,29 @@ fn chat_invites_presence_and_bad_input() {
     // Chat reaches everyone, cleaned up.
     a.send(ToServer::Chat {
         text: " hi\nBob ".into(),
+        image: None,
     });
     wait_for(&b, "Alice's message", |s| has_chat(s, "Alice", "hi Bob"));
     wait_for(&a, "her own message", |s| has_chat(s, "Alice", "hi Bob"));
+
+    // A picture goes along; junk is refused with a note.
+    let png = Image(b"\x89PNG\r\n\x1a\nnot really".to_vec());
+    a.send(ToServer::Chat {
+        text: String::new(),
+        image: Some(png.clone()),
+    });
+    wait_for(&b, "Alice's picture", |s| {
+        s.chat.iter().any(|c| c.image.as_ref() == Some(&png))
+    });
+    a.send(ToServer::Chat {
+        text: "x".into(),
+        image: Some(Image(b"GIF89a".to_vec())),
+    });
+    let ev = a.events.recv_timeout(WAIT).unwrap();
+    assert!(
+        matches!(&ev, ToClient::Error { text } if text.contains("PNG or JPEG")),
+        "{ev:?}"
+    );
 
     // An invite and its answer go to the right person only.
     a.send(ToServer::Invite {
@@ -147,10 +167,10 @@ fn chat_invites_presence_and_bad_input() {
     let mut raw = TcpStream::connect(addr).unwrap();
     raw.write_all(b"{\"t\":\"chat\",\"text\":\"before hello\"}\n")
         .unwrap();
-    raw.write_all(b"{\"t\":\"hello\",\"v\":1,\"name\":\"Mallory\"}\nnot json\n{\"t\":\"nope\"}\n")
+    let hello = |name: &str| format!("{{\"t\":\"hello\",\"v\":{PROTOCOL},\"name\":\"{name}\"}}\n");
+    raw.write_all(format!("{}not json\n{{\"t\":\"nope\"}}\n", hello("Mallory")).as_bytes())
         .unwrap();
-    raw.write_all(b"{\"t\":\"hello\",\"v\":1,\"name\":\"Again\"}\n")
-        .unwrap();
+    raw.write_all(hello("Again").as_bytes()).unwrap();
     raw.write_all(b"{\"t\":\"chat\",\"text\":\"after garbage\"}\n")
         .unwrap();
     let sa = wait_for(&a, "Mallory's message", |s| {
@@ -173,6 +193,7 @@ fn chat_invites_presence_and_bad_input() {
     });
     a.send(ToServer::Chat {
         text: "still here".into(),
+        image: None,
     });
     wait_for(&a, "the server still works", |s| {
         has_chat(s, "Alice", "still here")
@@ -183,10 +204,11 @@ fn chat_invites_presence_and_bad_input() {
     let addr = start_server(&dir);
     let c = client(addr, "Carol");
     let sc = wait_for(&c, "the history", |s| {
-        s.chat.len() == 3 && state_of(s, "Carol") == Some(Presence::Lobby)
+        s.chat.len() == 4 && state_of(s, "Carol") == Some(Presence::Lobby)
     });
-    let texts: Vec<&str> = sc.chat.iter().map(|c: &ChatLine| c.text.as_str()).collect();
-    assert_eq!(texts, ["hi Bob", "after garbage", "still here"]);
+    let texts: Vec<&str> = sc.chat.iter().map(|c| c.text.as_str()).collect();
+    assert_eq!(texts, ["hi Bob", "", "after garbage", "still here"]);
+    assert_eq!(sc.chat[1].image.as_ref(), Some(&png), "the picture is kept");
     assert!(sc.chat.iter().all(|c| c.at > 0), "{:?}", sc.chat);
     for name in ["Alice", "Bob", "Mallory"] {
         assert_eq!(state_of(&sc, name), Some(Presence::Offline), "{name}");
@@ -196,6 +218,7 @@ fn chat_invites_presence_and_bad_input() {
     for i in 0..10 {
         c.send(ToServer::Chat {
             text: format!("spam {i}"),
+            image: None,
         });
     }
     let ev = c.events.recv_timeout(WAIT).unwrap();
@@ -204,9 +227,9 @@ fn chat_invites_presence_and_bad_input() {
         has_chat(s, "Carol", "spam 0")
     });
     assert!(
-        sc.chat.len() < 3 + 10,
+        sc.chat.len() < 4 + 10,
         "{} messages got through",
-        sc.chat.len() - 3
+        sc.chat.len() - 4
     );
     drop(c);
     let _ = std::fs::remove_dir_all(&dir);

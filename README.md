@@ -298,8 +298,8 @@ are going:
 If you have an always-on PC or home server in your Tailscale network, you can
 run a small **lobby** on it. Everyone who uses it gets:
 
-- a **text chat** that is kept (new messages and the last 200 when you open
-  GloorpFlorp, each with how long ago it was sent),
+- a **text chat** with pictures (screenshots) that is kept (new messages and
+  the last 200 when you open GloorpFlorp, each with how long ago it was sent),
 - a **member list** that shows who has GloorpFlorp open (**In the lobby**,
   green), whose PC is on in Tailscale (**Online**, yellow) and who is
   **Offline**,
@@ -350,6 +350,17 @@ Open **Lobby** (below **Room**) and enter the lobby's address:
 somewhere else.
 
 - **Chat:** type in the message box and press Enter or click **Send**.
+- **Pictures:** take a screenshot (Win+Shift+S) and press Ctrl+V in the
+  message box or click **Paste picture**, or drop a picture file (PNG, JPEG)
+  onto the window; it shows next to the message box until you send. Pictures
+  are shrunk to at most 1600 pixels and 1 MB. Click one in the chat to see
+  it larger. The lobby keeps the last 10 pictures for people who open
+  GloorpFlorp later; older messages only say "(picture)". This version of
+  GloorpFlorp needs a lobby server from the same release: an older one turns
+  the app away with a message, and the lobby (chat, members, invites) does
+  nothing until both are updated. Once the release is out, run
+  `docker compose pull` and then `docker compose up -d` on the lobby host,
+  and have your friends update GloorpFlorp too.
 - **Invite:** click **Invite** next to a friend who is in the lobby.
   GloorpFlorp opens a room and sends them the code. If they accept, they
   join as if they had pasted the code. If they deny, or don't answer within
@@ -456,7 +467,8 @@ To be honest about what GloorpFlorp is and isn't:
 
 Download the new zip, extract it and use the new folder (you can delete the
 old one). Your settings are kept, because they're stored in
-`%APPDATA%\GloorpFlorp`. Both of you need to update.
+`%APPDATA%\GloorpFlorp`. Both of you need to update, and so does the lobby
+server if you run one (see [Lobby](#lobby-optional)).
 
 ## License
 
@@ -515,6 +527,7 @@ found, and the pacing test also skips with an FFmpeg older than 8.0.
 | `GLOORP_FAKE_VIDEO=1` | On Windows too: FFmpeg's test pattern with software encoders instead of the screen and NVENC; without mpv the viewer is a hidden FFmpeg process. |
 | `GLOORP_DEV_IP=127.0.0.1` | Host and join on this address instead of Tailscale, so two copies can talk on one PC. |
 | `GLOORP_DEV_PORT=47801` | Host on and join this port instead of 47800. |
+| `GLOORP_DATA_DIR=C:\some\folder` | Keep the settings and the log there instead of `%APPDATA%\GloorpFlorp`, so a second copy has its own. |
 
 For two copies on one PC, start both with `GLOORP_DEV_IP=127.0.0.1`; one
 clicks Host, the other pastes the code and clicks Join. (If the host used

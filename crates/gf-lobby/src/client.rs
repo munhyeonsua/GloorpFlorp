@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{select, tick, Receiver, RecvTimeoutError, Sender};
 
 use crate::{
-    encode, read_line, ChatLine, Member, ToClient, ToServer, DEFAULT_PORT, HISTORY, IDLE_TIMEOUT,
-    MAX_SERVER_LINE, PING_EVERY, PROTOCOL,
+    encode, forget_image, read_line, ChatLine, Member, ToClient, ToServer, DEFAULT_PORT, HISTORY,
+    IDLE_TIMEOUT, IMAGE_HISTORY, MAX_SERVER_LINE, PING_EVERY, PROTOCOL,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -31,8 +31,9 @@ pub struct State {
     /// My member id.
     pub me: String,
     pub members: Vec<Member>,
-    /// The latest messages, oldest first (at most [`HISTORY`]).
-    pub chat: Vec<ChatLine>,
+    /// The latest messages, oldest first (at most [`HISTORY`]); shared, so
+    /// cloning the state stays cheap with pictures in it.
+    pub chat: Vec<Arc<ChatLine>>,
 }
 
 pub struct Client {
@@ -231,9 +232,19 @@ fn read_loop(
                 }
                 ToClient::Members { list } => s.members = list,
                 ToClient::Chat(line) => {
-                    s.chat.push(line);
+                    s.chat.push(Arc::new(line));
                     if s.chat.len() > HISTORY {
                         s.chat.remove(0);
+                    }
+                    // Like the server: pictures only on the newest lines.
+                    let n = s.chat.iter().filter(|l| l.image.is_some()).count();
+                    for l in s
+                        .chat
+                        .iter_mut()
+                        .filter(|l| l.image.is_some())
+                        .take(n.saturating_sub(IMAGE_HISTORY))
+                    {
+                        forget_image(Arc::make_mut(l));
                     }
                 }
                 // Turned away (e.g. wrong version); the server closes now.

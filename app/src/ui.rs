@@ -7,11 +7,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use eframe::egui::load::SizedTexture;
 use eframe::egui::{
-    self, Align, Color32, ComboBox, Grid, Layout, ProgressBar, RichText, Slider, TextEdit, Ui,
+    self, Align, Color32, ComboBox, CornerRadius, FontFamily, FontId, Frame, Grid, Layout, Margin,
+    ProgressBar, RichText, Sense, Slider, Stroke, TextEdit, TextStyle, TextureHandle, Ui,
 };
 use gf_lobby::client::{Client, State as LobbyState};
-use gf_lobby::{unix_now, Presence, ToClient, ToServer, MAX_TEXT};
+use gf_lobby::{unix_now, ChatLine, Image, Presence, ToClient, ToServer, MAX_TEXT};
+use image::DynamicImage;
+
+use crate::images;
 use gf_proto::VideoCodec;
 use gf_sys::AudioApp;
 use gloorpflorp::engine::{
@@ -26,9 +31,27 @@ const GREEN: Color32 = Color32::from_rgb(90, 200, 110);
 const YELLOW: Color32 = Color32::from_rgb(230, 190, 70);
 const ORANGE: Color32 = Color32::from_rgb(240, 140, 60);
 const GREY: Color32 = Color32::from_rgb(150, 150, 150);
-const RED_BG: Color32 = Color32::from_rgb(120, 30, 30);
+const RED_BG: Color32 = Color32::from_rgb(140, 40, 44);
 const INFO: Color32 = Color32::from_rgb(140, 180, 230);
-const INVITE_BG: Color32 = Color32::from_rgb(30, 60, 110);
+const INVITE_BG: Color32 = Color32::from_rgb(36, 62, 120);
+/// The window's own colours (see `theme`).
+const BG: Color32 = Color32::from_rgb(19, 21, 27);
+const CARD: Color32 = Color32::from_rgb(29, 32, 41);
+const CARD_BORDER: Color32 = Color32::from_rgb(46, 50, 63);
+const FIELD: Color32 = Color32::from_rgb(13, 14, 18);
+const TEXT: Color32 = Color32::from_rgb(222, 225, 232);
+const ACCENT: Color32 = Color32::from_rgb(86, 132, 255);
+const ACCENT_HOVER: Color32 = Color32::from_rgb(112, 152, 255);
+const BUTTON: Color32 = Color32::from_rgb(42, 46, 59);
+const BUTTON_HOVER: Color32 = Color32::from_rgb(54, 59, 75);
+
+/// Chat pictures kept as textures; older ones are decoded again when seen.
+const THUMBS_KEPT: usize = 30;
+
+/// The chat message box, to tell Ctrl+V in it apart (see `poll_pictures`).
+fn chat_box_id() -> egui::Id {
+    egui::Id::new("lobby-chat-input")
+}
 
 /// An unanswered invite is dropped (and the inviter's room closed) after this.
 const INVITE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -157,6 +180,14 @@ pub struct GloorpApp {
     outgoing: Option<Outgoing>,
     incoming: Option<Incoming>,
     lobby_note: Option<(String, Instant)>,
+    /// A picture pasted or dropped, waiting for Send: its file and preview.
+    attachment: Option<(Vec<u8>, TextureHandle)>,
+    /// Chat pictures as textures, oldest first (see `thumbnail`).
+    thumbs: Vec<(egui::Id, Option<TextureHandle>)>,
+    /// A chat picture shown large, with who sent it.
+    enlarged: Option<(String, TextureHandle)>,
+    /// Ctrl+V was held last frame (see `poll_pictures`).
+    paste_held: bool,
 }
 
 impl GloorpApp {
@@ -168,9 +199,7 @@ impl GloorpApp {
         dev: EngineOptions,
     ) -> anyhow::Result<GloorpApp> {
         cc.egui_ctx.set_theme(egui::Theme::Dark);
-        cc.egui_ctx.global_style_mut(|s| {
-            s.spacing.item_spacing = egui::vec2(8.0, 6.0);
-        });
+        cc.egui_ctx.global_style_mut(theme);
         let ctx = cc.egui_ctx.clone();
         let engine = Engine::start(
             settings.clone(),
@@ -202,6 +231,10 @@ impl GloorpApp {
             outgoing: None,
             incoming: None,
             lobby_note: None,
+            attachment: None,
+            thumbs: Vec::new(),
+            enlarged: None,
+            paste_held: false,
         })
     }
 
@@ -270,7 +303,6 @@ impl GloorpApp {
     // ------------------------------------------------------------ room
 
     fn room(&mut self, ui: &mut Ui) {
-        ui.heading("Room");
         ui.horizontal(|ui| {
             let label = ui.label("Your name:");
             let r = ui
@@ -289,7 +321,7 @@ impl GloorpApp {
         match self.snap.phase.clone() {
             Phase::Idle => {
                 if ui
-                    .button(RichText::new("Host").size(16.0))
+                    .add(primary("Host"))
                     .on_hover_text(
                         "Open a room on this PC and get a code to send to your friend. \
                          Needs Tailscale running and signed in.",
@@ -317,7 +349,7 @@ impl GloorpApp {
                     let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     let can_join = !self.join_code.trim().is_empty();
                     let join = ui
-                        .add_enabled(can_join, egui::Button::new("Join"))
+                        .add_enabled(can_join, primary("Join"))
                         .on_hover_text("Connect to your friend's room.")
                         .on_disabled_hover_text("Paste your friend's room code first.")
                         .clicked();
@@ -333,7 +365,14 @@ impl GloorpApp {
                     ui.spinner();
                 } else {
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(&code).monospace().size(28.0).strong());
+                        Frame::new()
+                            .fill(FIELD)
+                            .corner_radius(8)
+                            .inner_margin(Margin::symmetric(14, 8))
+                            .show(ui, |ui| {
+                                let code = RichText::new(&code).monospace().size(28.0).strong();
+                                ui.label(code.color(Color32::WHITE));
+                            });
                         let copied = self
                             .copied_at
                             .is_some_and(|t| t.elapsed() < Duration::from_secs(2));
@@ -547,10 +586,10 @@ impl GloorpApp {
     fn invite_prompt(&mut self, ui: &mut Ui) {
         let Some(inv) = &self.incoming else { return };
         let mut answer = None;
-        egui::Frame::new()
+        Frame::new()
             .fill(INVITE_BG)
-            .inner_margin(8)
-            .corner_radius(4)
+            .inner_margin(12)
+            .corner_radius(8)
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.label(
@@ -561,7 +600,7 @@ impl GloorpApp {
                 );
                 ui.horizontal(|ui| {
                     if ui
-                        .button("Accept")
+                        .add(primary("Accept"))
                         .on_hover_text(
                             "Join their room now. Leaves your own room, if you have one.",
                         )
@@ -594,7 +633,7 @@ impl GloorpApp {
     }
 
     fn lobby(&mut self, ui: &mut Ui) {
-        egui::CollapsingHeader::new(RichText::new("Lobby").heading())
+        egui::CollapsingHeader::new(section_title("Lobby"))
             .default_open(!self.settings.lobby.trim().is_empty())
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -698,52 +737,134 @@ impl GloorpApp {
             }
         }
 
-        egui::ScrollArea::vertical()
-            .id_salt("lobby-chat")
-            .max_height(160.0)
-            .stick_to_bottom(true)
-            .auto_shrink([false, true])
+        let mut enlarge = None;
+        Frame::new()
+            .fill(FIELD)
+            .corner_radius(8)
+            .inner_margin(8)
             .show(ui, |ui| {
-                if s.chat.is_empty() {
-                    ui.label(RichText::new("No messages yet.").weak());
-                }
-                let now = unix_now();
-                for c in &s.chat {
-                    ui.horizontal_wrapped(|ui| {
-                        if c.at > 0 {
-                            ui.label(RichText::new(ago(c.at, now)).weak());
+                ui.set_width(ui.available_width());
+                let (chat_height, picture_height) = if wide(ui.ctx()) {
+                    (480.0, 360.0)
+                } else {
+                    (260.0, 240.0)
+                };
+                egui::ScrollArea::vertical()
+                    .id_salt("lobby-chat")
+                    .max_height(chat_height)
+                    .stick_to_bottom(true)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        if s.chat.is_empty() {
+                            ui.label(RichText::new("No messages yet.").weak());
                         }
-                        ui.label(RichText::new(format!("{}:", shorten(&c.name, 24))).strong());
-                        ui.label(&c.text);
+                        let now = unix_now();
+                        for c in &s.chat {
+                            ui.horizontal_wrapped(|ui| {
+                                if c.at > 0 {
+                                    ui.label(RichText::new(ago(c.at, now)).weak());
+                                }
+                                let name = format!("{}:", shorten(&c.name, 24));
+                                ui.label(RichText::new(name).strong());
+                                if !c.text.is_empty() {
+                                    ui.label(&c.text);
+                                }
+                            });
+                            let Some(pic) = &c.image else { continue };
+                            match thumbnail(&mut self.thumbs, ui.ctx(), c) {
+                                Some(tex) => {
+                                    let picture =
+                                        egui::Image::from_texture(SizedTexture::from_handle(&tex))
+                                            .fit_to_original_size(1.0)
+                                            .max_size(egui::vec2(
+                                                ui.available_width(),
+                                                picture_height,
+                                            ))
+                                            .corner_radius(6)
+                                            .sense(Sense::click());
+                                    let r =
+                                        ui.add(picture).on_hover_text("Click to see it larger.");
+                                    set_accessible_name(&r, &format!("Picture from {}", c.name));
+                                    if r.clicked() {
+                                        enlarge = Some((c.name.clone(), pic.clone()));
+                                    }
+                                }
+                                None => {
+                                    ui.label(RichText::new("(picture can't be shown)").weak());
+                                }
+                            }
+                        }
                     });
-                }
             });
+        if let Some((_, tex)) = &self.attachment {
+            let mut remove = false;
+            ui.horizontal(|ui| {
+                let preview = egui::Image::from_texture(SizedTexture::from_handle(tex))
+                    .max_size(egui::vec2(140.0, 90.0))
+                    .corner_radius(6);
+                set_accessible_name(&ui.add(preview), "Picture ready to send");
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("Picture ready to send.").weak());
+                    remove = ui
+                        .button("Remove")
+                        .on_hover_text("Don't send this picture.")
+                        .clicked();
+                });
+            });
+            if remove {
+                self.attachment = None;
+            }
+        }
         let mut send = None;
+        let mut paste = false;
         ui.horizontal(|ui| {
             let edit = ui.add(
                 TextEdit::singleline(&mut self.chat_input)
+                    .id(chat_box_id())
                     .hint_text("Message")
-                    .desired_width(260.0)
+                    .desired_width((ui.available_width() - 200.0).max(120.0))
                     .char_limit(MAX_TEXT),
             );
             set_accessible_name(&edit, "Chat message");
             accept_set_value(&edit, &mut self.chat_input, MAX_TEXT);
             let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            let can_send = s.connected && !self.chat_input.trim().is_empty();
+            paste = ui
+                .button("Paste picture")
+                .on_hover_text(
+                    "Send the picture on the clipboard, e.g. a screenshot (Win+Shift+S). \
+                     Ctrl+V in the message box does the same, and you can also drop a picture \
+                     file onto this window.",
+                )
+                .clicked();
+            let can_send =
+                s.connected && (!self.chat_input.trim().is_empty() || self.attachment.is_some());
             let clicked = ui
                 .add_enabled(can_send, egui::Button::new("Send"))
                 .on_hover_text("Send to everyone in the lobby. Enter sends too.")
-                .on_disabled_hover_text("Type a message first (and wait until you're connected).")
+                .on_disabled_hover_text(
+                    "Type a message or add a picture first (and wait until you're connected).",
+                )
                 .clicked();
             if can_send && (clicked || enter) {
-                send = Some(std::mem::take(&mut self.chat_input));
+                send = Some(ToServer::Chat {
+                    text: std::mem::take(&mut self.chat_input),
+                    image: self.attachment.take().map(|(file, _)| Image(file)),
+                });
                 if enter {
                     edit.request_focus();
                 }
             }
         });
-        if let (Some(text), Some(lobby)) = (send, &self.lobby) {
-            lobby.send(ToServer::Chat { text });
+        if let (Some(msg), Some(lobby)) = (send, &self.lobby) {
+            lobby.send(msg);
+        }
+        if paste {
+            self.attach_clipboard(ui.ctx(), true);
+        }
+        if let Some((from, pic)) = enlarge {
+            self.enlarged = images::decode(&pic.0, images::RECEIVED_SIDE)
+                .ok()
+                .map(|d| (from, images::texture(ui.ctx(), "chat-picture-large", &d)));
         }
         if let Some(m) = invite {
             self.lobby_note = None;
@@ -760,7 +881,6 @@ impl GloorpApp {
     // ------------------------------------------------------------ my screen
 
     fn my_screen(&mut self, ui: &mut Ui) {
-        ui.heading("Your screen");
         let snap = &self.snap;
         let s = &mut self.settings;
         let no_encoder =
@@ -968,8 +1088,10 @@ impl GloorpApp {
         let sharing = !matches!(snap.my_share, ShareState::Off);
         ui.horizontal(|ui| {
             if sharing {
+                let stop = egui::Button::new(RichText::new("Stop sharing").size(15.0))
+                    .min_size(egui::vec2(110.0, 32.0));
                 if ui
-                    .button(RichText::new("Stop sharing").size(16.0))
+                    .add(stop)
                     .on_hover_text("Stop showing your screen to your friend.")
                     .clicked()
                 {
@@ -985,7 +1107,7 @@ impl GloorpApp {
                 let r = ui
                     .add_enabled(
                         snap.video_available && !no_encoder,
-                        egui::Button::new(RichText::new("Start sharing").size(16.0)),
+                        primary("Start sharing"),
                     )
                     .on_hover_text(
                         "Show what you chose under Share to your friend. You can start before \
@@ -1031,7 +1153,6 @@ impl GloorpApp {
     // ------------------------------------------------------------ game audio
 
     fn game_audio(&mut self, ui: &mut Ui) {
-        ui.heading("Game audio");
         ui.label("Send your PC's sound to your friend, with or without sharing your screen.");
         let snap = &self.snap;
         let s = &mut self.settings;
@@ -1142,7 +1263,6 @@ impl GloorpApp {
     // ------------------------------------------------------------ friend's screen
 
     fn friend_screen(&mut self, ui: &mut Ui) {
-        ui.heading("Friend's screen");
         let peer = self.peer();
         match self.snap.peer_share {
             Some(i) => {
@@ -1200,7 +1320,6 @@ impl GloorpApp {
     // ------------------------------------------------------------ voice
 
     fn voice(&mut self, ui: &mut Ui) {
-        ui.heading("Voice");
         let snap = &self.snap;
         let peer = self
             .snap
@@ -1404,10 +1523,110 @@ impl GloorpApp {
         }
     }
 
+    // ------------------------------------------------------------ pictures
+
+    /// Pictures dropped onto the window, and Ctrl+V in the message box
+    /// (egui passes on only text pastes, so the keys are read directly,
+    /// like push-to-talk's).
+    fn poll_pictures(&mut self, ctx: &egui::Context) {
+        if self.lobby.is_none() {
+            return;
+        }
+        let dropped = ctx.input(|i| i.raw.dropped_files.first().cloned());
+        if let Some(file) = dropped {
+            // Only read files a picture could be, not a whole video.
+            let small = std::fs::metadata(file.path()).is_ok_and(|m| m.len() <= 64 << 20);
+            let picture = if small {
+                file.bytes()
+                    .and_then(|b| images::decode(&b, images::DROPPED_SIDE))
+            } else {
+                Err("too big".into())
+            };
+            match picture {
+                Ok(img) => self.attach(ctx, img),
+                Err(_) => self.note(
+                    "That file isn't a picture GloorpFlorp can send (a PNG or JPEG up to 64 MB).",
+                ),
+            }
+        }
+        const VK_CONTROL: u32 = 0x11;
+        const VK_V: u32 = 0x56;
+        let held = gf_sys::keys::is_down(VK_CONTROL) && gf_sys::keys::is_down(VK_V);
+        let typing_here = ctx.input(|i| i.focused) && ctx.memory(|m| m.has_focus(chat_box_id()));
+        // Text on the clipboard was pasted into the box by egui; don't also
+        // attach the picture some programs put next to it.
+        let pasted_text =
+            ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Paste(_))));
+        if held && !self.paste_held && typing_here && !pasted_text {
+            self.attach_clipboard(ctx, false);
+        }
+        self.paste_held = held;
+    }
+
+    /// Attaches the picture on the clipboard. `say`: a note when there is
+    /// none (not after Ctrl+V, which may just have pasted text).
+    fn attach_clipboard(&mut self, ctx: &egui::Context, say: bool) {
+        match arboard::Clipboard::new().and_then(|mut c| c.get_image()) {
+            Ok(img) => {
+                let (w, h) = (img.width as u32, img.height as u32);
+                match image::RgbaImage::from_raw(w, h, img.bytes.into_owned()) {
+                    Some(rgba) => self.attach(ctx, DynamicImage::ImageRgba8(rgba)),
+                    None => self.note("The picture on the clipboard couldn't be read."),
+                }
+            }
+            Err(arboard::Error::ContentNotAvailable) if !say => {}
+            Err(arboard::Error::ContentNotAvailable) => self.note(
+                "There is no picture on the clipboard. Take a screenshot (Win+Shift+S) or copy \
+                 a picture first.",
+            ),
+            Err(e) => self.note(&format!("Couldn't read the clipboard ({e}).")),
+        }
+    }
+
+    /// Shrinks the picture to a file that can be sent and shows it next to
+    /// the message box.
+    fn attach(&mut self, ctx: &egui::Context, img: DynamicImage) {
+        match images::encode(&img) {
+            Some(file) => {
+                let small = images::shrink(&img, images::THUMB_SIDE);
+                let preview = images::texture(ctx, "attachment", &small);
+                self.attachment = Some((file, preview));
+            }
+            None => self.note("That picture couldn't be made small enough to send."),
+        }
+    }
+
+    fn note(&mut self, text: &str) {
+        self.lobby_note = Some((text.to_string(), Instant::now()));
+    }
+
+    /// The chat picture that was clicked, large, until a click or Esc.
+    fn picture_window(&mut self, ctx: &egui::Context) {
+        let Some((from, tex)) = &self.enlarged else {
+            return;
+        };
+        let room = ctx.content_rect().size() - egui::vec2(48.0, 48.0);
+        let modal = egui::Modal::new(egui::Id::new("picture"))
+            .frame(Frame::NONE)
+            .show(ctx, |ui| {
+                let picture = egui::Image::from_texture(SizedTexture::from_handle(tex))
+                    .max_size(room)
+                    .corner_radius(8)
+                    .sense(Sense::click());
+                let r = ui.add(picture).on_hover_text("Click to close.");
+                let name = format!("Picture from {from}, large. A click or Escape closes it.");
+                set_accessible_name(&r, &name);
+                r.clicked()
+            });
+        if modal.inner || modal.should_close() {
+            self.enlarged = None;
+        }
+    }
+
     // ------------------------------------------------------------ details
 
     fn details(&self, ui: &mut Ui) {
-        egui::CollapsingHeader::new("Connection details")
+        egui::CollapsingHeader::new(section_title("Connection details"))
             .default_open(false)
             .show(ui, |ui| {
                 let n = &self.snap.net;
@@ -1529,29 +1748,48 @@ impl eframe::App for GloorpApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_key_binding(ui.ctx());
-        egui::CentralPanel::default().show(ui, |ui| {
+        self.poll_pictures(ui.ctx());
+        let top = Frame::new()
+            .fill(CARD)
+            .inner_margin(Margin::symmetric(16, 12));
+        egui::Panel::top("status").frame(top).show(ui, |ui| {
+            self.status_line(ui);
+            self.banners(ui);
+            self.invite_prompt(ui);
+        });
+        let body = Frame::new()
+            .fill(BG)
+            .inner_margin(Margin::symmetric(12, 10));
+        egui::CentralPanel::default().frame(body).show(ui, |ui| {
             egui::ScrollArea::vertical()
                 .auto_shrink(false)
                 .show(ui, |ui| {
-                    self.status_line(ui);
-                    self.banners(ui);
-                    self.invite_prompt(ui);
-                    ui.separator();
-                    self.room(ui);
-                    ui.separator();
-                    self.lobby(ui);
-                    ui.separator();
-                    self.my_screen(ui);
-                    ui.separator();
-                    self.game_audio(ui);
-                    ui.separator();
-                    self.friend_screen(ui);
-                    ui.separator();
-                    self.voice(ui);
-                    ui.separator();
-                    self.details(ui);
+                    if wide(ui.ctx()) {
+                        // Side by side: the room and the friend on the left,
+                        // this PC on the right.
+                        ui.columns(2, |col| {
+                            card(&mut col[0], Some("Room"), |ui| self.room(ui));
+                            card(&mut col[0], None, |ui| self.lobby(ui));
+                            card(&mut col[0], Some("Friend's screen"), |ui| {
+                                self.friend_screen(ui)
+                            });
+                            card(&mut col[1], Some("Your screen"), |ui| self.my_screen(ui));
+                            card(&mut col[1], Some("Game audio"), |ui| self.game_audio(ui));
+                            card(&mut col[1], Some("Voice"), |ui| self.voice(ui));
+                            card(&mut col[1], None, |ui| self.details(ui));
+                        });
+                    } else {
+                        card(ui, Some("Room"), |ui| self.room(ui));
+                        card(ui, None, |ui| self.lobby(ui));
+                        card(ui, Some("Your screen"), |ui| self.my_screen(ui));
+                        card(ui, Some("Game audio"), |ui| self.game_audio(ui));
+                        card(ui, Some("Friend's screen"), |ui| self.friend_screen(ui));
+                        card(ui, Some("Voice"), |ui| self.voice(ui));
+                        card(ui, None, |ui| self.details(ui));
+                    }
                 });
         });
+        self.picture_window(ui.ctx());
         self.sent.audio.mic_muted = self.settings.audio.mic_muted;
         self.sent.audio.deafened = self.settings.audio.deafened;
         if self.settings != self.sent {
@@ -1649,6 +1887,130 @@ fn refusal(s: &Settings, target: BindTarget, vk: u32) -> Option<String> {
     })
 }
 
+/// The window's look: a dark blue-grey, rounded corners, slightly bigger text.
+fn theme(s: &mut egui::Style) {
+    s.spacing.item_spacing = egui::vec2(8.0, 8.0);
+    s.spacing.button_padding = egui::vec2(12.0, 5.0);
+    s.spacing.interact_size.y = 26.0;
+    for (style, size) in [
+        (TextStyle::Body, 14.0),
+        (TextStyle::Button, 14.0),
+        (TextStyle::Heading, 20.0),
+        (TextStyle::Small, 11.5),
+    ] {
+        s.text_styles
+            .insert(style, FontId::new(size, FontFamily::Proportional));
+    }
+    s.text_styles.insert(
+        TextStyle::Monospace,
+        FontId::new(13.5, FontFamily::Monospace),
+    );
+    let v = &mut s.visuals;
+    v.panel_fill = BG;
+    v.window_fill = CARD;
+    v.window_stroke = Stroke::new(1.0, CARD_BORDER);
+    v.window_corner_radius = CornerRadius::same(10);
+    v.menu_corner_radius = CornerRadius::same(8);
+    v.extreme_bg_color = FIELD;
+    v.faint_bg_color = Color32::from_rgb(35, 38, 49);
+    v.selection.bg_fill = ACCENT.gamma_multiply(0.7);
+    v.selection.stroke = Stroke::new(1.0, Color32::WHITE);
+    v.hyperlink_color = ACCENT_HOVER;
+    v.slider_trailing_fill = true;
+    let w = &mut v.widgets;
+    for x in [
+        &mut w.noninteractive,
+        &mut w.inactive,
+        &mut w.hovered,
+        &mut w.active,
+        &mut w.open,
+    ] {
+        x.corner_radius = CornerRadius::same(6);
+    }
+    w.noninteractive.fg_stroke.color = TEXT;
+    w.noninteractive.bg_stroke.color = CARD_BORDER;
+    w.inactive.bg_fill = BUTTON;
+    w.inactive.weak_bg_fill = BUTTON;
+    w.inactive.fg_stroke.color = TEXT;
+    w.hovered.bg_fill = BUTTON_HOVER;
+    w.hovered.weak_bg_fill = BUTTON_HOVER;
+    w.hovered.bg_stroke = Stroke::new(1.0, Color32::from_rgb(96, 103, 125));
+    w.hovered.fg_stroke.color = Color32::WHITE;
+    w.active.bg_fill = ACCENT;
+    w.active.weak_bg_fill = ACCENT;
+    w.active.fg_stroke.color = Color32::WHITE;
+    w.open.bg_fill = BUTTON_HOVER;
+    w.open.weak_bg_fill = BUTTON_HOVER;
+}
+
+/// Room for two columns of sections.
+fn wide(ctx: &egui::Context) -> bool {
+    ctx.content_rect().width() >= 960.0
+}
+
+/// A section of the window: a rounded box, with its title.
+fn card(ui: &mut Ui, title: Option<&str>, add: impl FnOnce(&mut Ui)) {
+    Frame::new()
+        .fill(CARD)
+        .stroke(Stroke::new(1.0, CARD_BORDER))
+        .corner_radius(10)
+        .inner_margin(14)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            // Not justified: `columns` would stretch every button to the full width.
+            ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                if let Some(title) = title {
+                    ui.label(section_title(title));
+                }
+                add(ui);
+            });
+        });
+}
+
+fn section_title(text: &str) -> RichText {
+    RichText::new(text)
+        .size(16.0)
+        .strong()
+        .color(Color32::WHITE)
+}
+
+/// The main action of a section: filled with the accent colour.
+fn primary(text: &str) -> egui::Button<'static> {
+    let text = RichText::new(text)
+        .size(15.0)
+        .strong()
+        .color(Color32::WHITE);
+    egui::Button::new(text)
+        .fill(ACCENT)
+        .min_size(egui::vec2(110.0, 32.0))
+        .corner_radius(8)
+}
+
+/// The chat picture as a small texture, decoded the first time it is seen;
+/// the newest `THUMBS_KEPT` are kept. `None`: no picture, or one that can't
+/// be decoded (remembered too, so it isn't tried every frame).
+fn thumbnail(
+    thumbs: &mut Vec<(egui::Id, Option<TextureHandle>)>,
+    ctx: &egui::Context,
+    line: &ChatLine,
+) -> Option<TextureHandle> {
+    let pic = line.image.as_ref()?;
+    // Cheap, and unique enough: the sender, the second and the file size.
+    let key = egui::Id::new((&line.from, line.at, pic.0.len()));
+    if let Some((_, tex)) = thumbs.iter().find(|(k, _)| *k == key) {
+        return tex.clone();
+    }
+    let tex = images::decode(&pic.0, images::RECEIVED_SIDE).ok().map(|d| {
+        let small = images::shrink(&d, images::THUMB_SIDE);
+        images::texture(ctx, "chat-picture", &small)
+    });
+    thumbs.push((key, tex.clone()));
+    if thumbs.len() > THUMBS_KEPT {
+        thumbs.remove(0);
+    }
+    tex
+}
+
 /// A small filled circle (the default fonts have no "●").
 fn dot(ui: &mut Ui, color: Color32, size: f32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
@@ -1659,10 +2021,10 @@ fn dot(ui: &mut Ui, color: Color32, size: f32) {
 /// A red message with an optional × button; true when it was clicked.
 fn banner(ui: &mut Ui, text: &str, close_tip: Option<&str>) -> bool {
     let mut closed = false;
-    egui::Frame::new()
+    Frame::new()
         .fill(RED_BG)
-        .inner_margin(8)
-        .corner_radius(4)
+        .inner_margin(10)
+        .corner_radius(8)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal_top(|ui| {
@@ -1927,6 +2289,36 @@ mod tests {
         assert_eq!(ago(t, t + 2 * 86400 + 5), "2 d ago");
         // The server's clock may be a little ahead.
         assert_eq!(ago(t + 5, t), "just now");
+    }
+
+    #[test]
+    fn chat_pictures_become_textures() {
+        let ctx = egui::Context::default();
+        let flat = image::RgbaImage::from_pixel(640, 400, image::Rgba([200, 30, 30, 255]));
+        let file = images::encode(&DynamicImage::ImageRgba8(flat)).unwrap();
+        let line = |image: Option<Image>| ChatLine {
+            from: "100.64.0.1".into(),
+            name: "A".into(),
+            at: 5,
+            text: String::new(),
+            image,
+        };
+        let mut thumbs = Vec::new();
+        let out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let with = line(Some(Image(file.clone())));
+            let tex = thumbnail(&mut thumbs, ui.ctx(), &with).unwrap();
+            assert_eq!(tex.size(), [480, 300], "shrunk to the thumbnail size");
+            // Seen again: from the cache. Junk is remembered as "can't be shown".
+            assert!(thumbnail(&mut thumbs, ui.ctx(), &with).is_some());
+            let junk = line(Some(Image(b"junk".to_vec())));
+            assert!(thumbnail(&mut thumbs, ui.ctx(), &junk).is_none());
+            assert!(thumbnail(&mut thumbs, ui.ctx(), &line(None)).is_none());
+            let picture = egui::Image::from_texture(SizedTexture::from_handle(&tex))
+                .max_size(egui::vec2(200.0, 200.0));
+            ui.add(picture);
+        });
+        out.drop_without_applying_deltas();
+        assert_eq!(thumbs.len(), 2);
     }
 
     #[test]

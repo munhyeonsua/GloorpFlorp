@@ -15,6 +15,10 @@
 //! (`Cancelled`). All carry the room code, so an answer belongs to exactly one
 //! invite. An invite that can't be delivered comes back as `InviteFailed`.
 //!
+//! Pictures: a chat line may carry one PNG or JPEG file (base64, at most
+//! [`MAX_IMAGE`] bytes). Only the newest [`IMAGE_HISTORY`] of them are kept
+//! for newcomers; older lines keep their text and say there was a picture.
+//!
 //! Members are identified by their connection's Tailscale address (Tailscale
 //! already authenticates every device) plus the name they send. Connections
 //! from the server's own machine (loopback, development only) are told apart
@@ -26,13 +30,15 @@
 pub mod client;
 pub mod server;
 
+use std::fmt;
 use std::io::{self, BufRead, Read};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
+use base64::prelude::*;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Bumped whenever the protocol changes incompatibly.
-pub const PROTOCOL: u32 = 1;
+pub const PROTOCOL: u32 = 2;
 pub const DEFAULT_PORT: u16 = 47900;
 /// Longest name, in characters.
 pub const MAX_NAME: usize = 40;
@@ -40,10 +46,16 @@ pub const MAX_NAME: usize = 40;
 pub const MAX_TEXT: usize = 1000;
 /// Chat messages kept for (and sent to) newcomers.
 pub const HISTORY: usize = 200;
-/// Longest line the server reads from a client.
-pub const MAX_CLIENT_LINE: usize = 16 * 1024;
-/// Longest line the client reads from the server (the member list).
-pub const MAX_SERVER_LINE: usize = 1 << 20;
+/// Longest picture file (PNG or JPEG bytes) in a chat message.
+pub const MAX_IMAGE: usize = 1 << 20;
+/// Chat lines whose picture is kept (each can be a megabyte, and every
+/// newcomer gets the whole history); older lines lose theirs.
+pub const IMAGE_HISTORY: usize = 10;
+/// Longest line the server reads from a client (a picture in base64 plus
+/// its text).
+pub const MAX_CLIENT_LINE: usize = 2 << 20;
+/// Longest line the client reads from the server (a picture, the member list).
+pub const MAX_SERVER_LINE: usize = 2 << 20;
 pub const PING_EVERY: Duration = Duration::from_secs(20);
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -57,6 +69,8 @@ pub enum ToServer {
     },
     Chat {
         text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        image: Option<Image>,
     },
     /// Ask member `to` to join my room.
     Invite {
@@ -146,6 +160,51 @@ pub struct ChatLine {
     #[serde(default)]
     pub at: u64,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<Image>,
+}
+
+/// A picture file (PNG or JPEG) in a chat message; base64 on the wire.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Image(pub Vec<u8>);
+
+impl Image {
+    /// A PNG or JPEG of at most [`MAX_IMAGE`] bytes (the server checks
+    /// before passing it on, so nobody gets junk to decode).
+    pub fn ok(&self) -> bool {
+        let b = &self.0;
+        b.len() <= MAX_IMAGE
+            && (b.starts_with(b"\x89PNG\r\n\x1a\n") || b.starts_with(&[0xFF, 0xD8, 0xFF]))
+    }
+}
+
+impl fmt::Debug for Image {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Image({} bytes)", self.0.len())
+    }
+}
+
+impl Serialize for Image {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&BASE64_STANDARD.encode(&self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for Image {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(d)?;
+        BASE64_STANDARD
+            .decode(text)
+            .map(Image)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// Drops the line's picture; the text says there was one.
+pub fn forget_image(line: &mut ChatLine) {
+    if line.image.take().is_some() {
+        line.text = format!("{} (picture)", line.text).trim().to_string();
+    }
 }
 
 /// Now, in Unix seconds.
@@ -206,6 +265,7 @@ mod tests {
             name: "A".into(),
             at: 1_790_000_000,
             text: "hi".into(),
+            image: None,
         }));
         assert_eq!(
             String::from_utf8(line).unwrap(),
@@ -216,5 +276,41 @@ mod tests {
             serde_json::from_str("{\"from\":\"100.64.0.1\",\"name\":\"A\",\"text\":\"hi\"}")
                 .unwrap();
         assert_eq!(old.at, 0);
+    }
+
+    #[test]
+    fn pictures_travel_as_base64() {
+        let png = Image(b"\x89PNG\r\n\x1a\n\0\0".to_vec());
+        let msg = ToServer::Chat {
+            text: String::new(),
+            image: Some(png.clone()),
+        };
+        let line = encode(&msg);
+        assert_eq!(
+            String::from_utf8(line.clone()).unwrap(),
+            "{\"t\":\"chat\",\"text\":\"\",\"image\":\"iVBORw0KGgoAAA==\"}\n"
+        );
+        assert_eq!(serde_json::from_slice::<ToServer>(&line).unwrap(), msg);
+        assert!(png.ok());
+        assert!(Image(vec![0xFF, 0xD8, 0xFF, 0xE0]).ok());
+        assert!(!Image(b"GIF89a".to_vec()).ok());
+        assert!(!Image(vec![0xFF; MAX_IMAGE + 1]).ok());
+
+        let mut line = ChatLine {
+            from: "a".into(),
+            name: "A".into(),
+            at: 1,
+            text: "look".into(),
+            image: Some(png),
+        };
+        forget_image(&mut line);
+        assert_eq!(
+            (line.image.is_none(), line.text.as_str()),
+            (true, "look (picture)")
+        );
+        line.text.clear();
+        line.image = Some(Image(vec![0xFF, 0xD8, 0xFF]));
+        forget_image(&mut line);
+        assert_eq!(line.text, "(picture)");
     }
 }

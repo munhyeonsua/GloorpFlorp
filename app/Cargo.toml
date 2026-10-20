@@ -33,6 +33,9 @@ eframe.workspace = true
 egui.workspace = true
 directories.workspace = true
 simplelog.workspace = true
+# Pictures in the lobby chat: decoding, shrinking, and reading the clipboard.
+image.workspace = true
+arboard.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 # Only for the message box shown when the window can't open.

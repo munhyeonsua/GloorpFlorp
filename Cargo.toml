@@ -36,6 +36,9 @@ eframe = "0.36"
 egui = "0.36"
 directories = "6"
 simplelog = "0.12"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+arboard = "3"
 
 [profile.release]
 opt-level = 3

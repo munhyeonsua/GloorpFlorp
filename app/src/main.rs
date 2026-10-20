@@ -1,6 +1,7 @@
 // No console window in release builds on Windows.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod images;
 mod ui;
 
 use std::sync::Arc;
@@ -23,8 +24,8 @@ fn main() {
         viewport: egui::ViewportBuilder::default()
             .with_title("GloorpFlorp")
             .with_app_id("GloorpFlorp")
-            .with_inner_size([460.0, 760.0])
-            .with_min_inner_size([440.0, 320.0]),
+            .with_inner_size([500.0, 820.0])
+            .with_min_inner_size([460.0, 320.0]),
         ..Default::default()
     };
     // wgpu's default memory blocks reserve ~245 MB of video memory for this
