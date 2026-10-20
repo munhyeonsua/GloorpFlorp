@@ -12,7 +12,7 @@ agents that built the crates: `.claude/handoff/phase1-agent-reports.json` (proto
 
 ## Status
 
-**v1.2.0 (prepared 2026-10-20, waiting for the owner to tag):** a new look
+**Released: [v1.2.0](https://github.com/munhyeonsua/GloorpFlorp/releases/tag/v1.2.0) (2026-10-20):** a new look
 (sections as cards, two columns when the window is wide, an accent colour,
 bigger text, the status always at the top) and pictures in the lobby chat
 (paste, drop or **Paste picture**; `gf-lobby` protocol 2, so the lobby
@@ -26,7 +26,7 @@ member and posts a PNG, then `GloorpFlorp.exe` with `GLOORP_DATA_DIR` set to
 a scratch folder (settings with that lobby address) and `GLOORP_FAKE_AUDIO=1`,
 screenshotted with `PrintWindow` from PowerShell.
 
-**Released: v1.1.2 (2026-10-14):** a monitor share no longer makes a
+**v1.1.2 (2026-10-14).** A monitor share no longer makes a
 CPU-heavy game stutter (Windows Graphics Capture instead of ddagrab on
 Windows 11), plus a noise suppression strength setting; see "Game stutter
 while sharing". It works with a 1.1.x friend (no protocol change).
