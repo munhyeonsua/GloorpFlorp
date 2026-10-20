@@ -12,10 +12,12 @@ agents that built the crates: `.claude/handoff/phase1-agent-reports.json` (proto
 
 ## Status
 
-**Unreleased (2026-10-20):** a new look (sections as cards, an accent
-colour, bigger text, the status always at the top) and pictures in the lobby
-chat (paste, drop or **Paste picture**; `gf-lobby` protocol 2, so the lobby
-server image must be updated with the app). Checked: workspace tests, clippy,
+**v1.2.0 (prepared 2026-10-20, waiting for the owner to tag):** a new look
+(sections as cards, two columns when the window is wide, an accent colour,
+bigger text, the status always at the top) and pictures in the lobby chat
+(paste, drop or **Paste picture**; `gf-lobby` protocol 2, so the lobby
+server image must be updated with the app, and a 1.1.x friend can't use the
+lobby until they update). Checked: workspace tests, clippy,
 fmt, and the window on this PC; not yet a picture sent between two PCs, and
 not pasting from a real clipboard (the owner's clipboard wasn't touched).
 How the window was checked without touching the owner's settings or running
