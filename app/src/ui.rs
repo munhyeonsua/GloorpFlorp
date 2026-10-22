@@ -3,8 +3,9 @@
 //! optional lobby works the same way through `gf_lobby::client` (its own
 //! threads); lobby invites are built on the room commands here.
 
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use eframe::egui::load::SizedTexture;
@@ -12,8 +13,11 @@ use eframe::egui::{
     self, Align, Color32, ComboBox, CornerRadius, FontFamily, FontId, Frame, Grid, Layout, Margin,
     ProgressBar, RichText, Sense, Slider, Stroke, TextEdit, TextStyle, TextureHandle, Ui,
 };
-use gf_lobby::client::{Client, State as LobbyState};
-use gf_lobby::{unix_now, ChatLine, Image, Presence, ToClient, ToServer, MAX_TEXT};
+use gf_lobby::client::{ChangeCallback, Client, State as LobbyState, Transfer};
+use gf_lobby::{
+    new_file_id, unix_now, ChatLine, Image, Presence, SharedFile, ToClient, ToServer, FILE_DAYS,
+    MAX_FILE, MAX_TEXT,
+};
 use image::DynamicImage;
 
 use crate::images;
@@ -113,6 +117,25 @@ struct Outgoing {
     since: Instant,
 }
 
+/// A file going to or coming from the lobby server, on a thread of its own.
+struct FileJob {
+    id: String,
+    name: String,
+    sending: bool,
+    /// Where a download is saved once complete.
+    saved: PathBuf,
+    t: Arc<Transfer>,
+    started: Instant,
+    /// What the thread ended with.
+    end: Arc<Mutex<Option<Result<(), String>>>>,
+}
+
+impl FileJob {
+    fn end(&self) -> Option<Result<(), String>> {
+        self.end.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
 /// An invite waiting for my answer.
 struct Incoming {
     from: String,
@@ -188,6 +211,9 @@ pub struct GloorpApp {
     enlarged: Option<(String, TextureHandle)>,
     /// Ctrl+V was held last frame (see `poll_pictures`).
     paste_held: bool,
+    /// Files being sent or downloaded through the lobby, and finished ones
+    /// until dismissed.
+    files: Vec<FileJob>,
 }
 
 impl GloorpApp {
@@ -235,6 +261,7 @@ impl GloorpApp {
             thumbs: Vec::new(),
             enlarged: None,
             paste_held: false,
+            files: Vec::new(),
         })
     }
 
@@ -738,6 +765,7 @@ impl GloorpApp {
         }
 
         let mut enlarge = None;
+        let mut get = None;
         Frame::new()
             .fill(FIELD)
             .corner_radius(8)
@@ -770,6 +798,27 @@ impl GloorpApp {
                                     ui.label(&c.text);
                                 }
                             });
+                            if let Some(f) = &c.file {
+                                ui.horizontal_wrapped(|ui| {
+                                    let what = format!("{} ({})", f.name, size_text(f.size));
+                                    ui.label(RichText::new(what).strong());
+                                    let busy = self
+                                        .files
+                                        .iter()
+                                        .any(|j| j.id == f.id && j.end().is_none());
+                                    let r = ui
+                                        .add_enabled(!busy, egui::Button::new("Download"))
+                                        .on_hover_text(format!(
+                                            "Save it to your Downloads folder. Files stay on the \
+                                             lobby server for {FILE_DAYS} days."
+                                        ))
+                                        .on_disabled_hover_text("It's downloading.");
+                                    set_accessible_name(&r, &format!("Download {}", f.name));
+                                    if r.clicked() {
+                                        get = Some(f.clone());
+                                    }
+                                });
+                            }
                             let Some(pic) = &c.image else { continue };
                             match thumbnail(&mut self.thumbs, ui.ctx(), c) {
                                 Some(tex) => {
@@ -855,11 +904,23 @@ impl GloorpApp {
                 }
             }
         });
+        ui.label(
+            RichText::new(format!(
+                "To send any file (up to {} GB), drop it onto this window. It waits on the lobby \
+                 server for {FILE_DAYS} days, so your friend can download it later.",
+                MAX_FILE >> 30
+            ))
+            .weak(),
+        );
+        self.file_jobs(ui);
         if let (Some(msg), Some(lobby)) = (send, &self.lobby) {
             lobby.send(msg);
         }
         if paste {
             self.attach_clipboard(ui.ctx(), true);
+        }
+        if let Some(f) = get {
+            self.get_file(ui.ctx(), &f);
         }
         if let Some((from, pic)) = enlarge {
             self.enlarged = images::decode(&pic.0, images::RECEIVED_SIDE)
@@ -1532,21 +1593,18 @@ impl GloorpApp {
         if self.lobby.is_none() {
             return;
         }
-        let dropped = ctx.input(|i| i.raw.dropped_files.first().cloned());
-        if let Some(file) = dropped {
+        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+        for file in dropped {
             // Only read files a picture could be, not a whole video.
             let small = std::fs::metadata(file.path()).is_ok_and(|m| m.len() <= 64 << 20);
-            let picture = if small {
+            let picture = (small && self.attachment.is_none()).then(|| {
                 file.bytes()
                     .and_then(|b| images::decode(&b, images::DROPPED_SIDE))
-            } else {
-                Err("too big".into())
-            };
+            });
+            // A picture goes into the chat; anything else is sent as a file.
             match picture {
-                Ok(img) => self.attach(ctx, img),
-                Err(_) => self.note(
-                    "That file isn't a picture GloorpFlorp can send (a PNG or JPEG up to 64 MB).",
-                ),
+                Some(Ok(img)) => self.attach(ctx, img),
+                _ => self.send_file(ctx, file.path().to_path_buf()),
             }
         }
         const VK_CONTROL: u32 = 0x11;
@@ -1598,6 +1656,158 @@ impl GloorpApp {
 
     fn note(&mut self, text: &str) {
         self.lobby_note = Some((text.to_string(), Instant::now()));
+    }
+
+    // ------------------------------------------------------------ files
+
+    /// Uploads the file to the lobby server; it then shows in the chat.
+    fn send_file(&mut self, ctx: &egui::Context, path: PathBuf) {
+        let name = path.file_name().map_or_else(
+            || path.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        match std::fs::metadata(&path) {
+            Ok(m) if m.is_dir() => {
+                return self.note(&format!(
+                    "{name} is a folder. Zip it, then drop the zip file."
+                ))
+            }
+            Ok(m) if m.len() > MAX_FILE => {
+                return self.note(&format!(
+                    "{name} is too big for the lobby (up to {} GB).",
+                    MAX_FILE >> 30
+                ))
+            }
+            Ok(_) => {}
+            Err(e) => return self.note(&format!("Can't read {name} ({e}).")),
+        }
+        let (addr, who) = self.lobby_for.clone();
+        let id = new_file_id();
+        let job_id = id.clone();
+        self.start_file(ctx, job_id, name, true, PathBuf::new(), move |t, on| {
+            gf_lobby::client::upload(&addr, &who, &id, &path, t, on)
+        });
+    }
+
+    /// Downloads the file into the Downloads folder.
+    fn get_file(&mut self, ctx: &egui::Context, f: &SharedFile) {
+        let dir = directories::UserDirs::new().map(|d| {
+            d.download_dir()
+                .unwrap_or_else(|| d.home_dir())
+                .to_path_buf()
+        });
+        let Some(dir) = dir else {
+            return self.note("Can't find your Downloads folder.");
+        };
+        let saved = free_path(&dir, &safe_file_name(&f.name));
+        let part = part_path(&saved);
+        let (addr, id, to) = (self.lobby_for.0.clone(), f.id.clone(), saved.clone());
+        self.start_file(
+            ctx,
+            f.id.clone(),
+            f.name.clone(),
+            false,
+            saved,
+            move |t, on| {
+                gf_lobby::client::download(&addr, &id, &part, t, on).and_then(|()| {
+                    std::fs::rename(&part, &to)
+                        .map_err(|e| format!("Couldn't rename {} ({e}).", part.display()))
+                })
+            },
+        );
+    }
+
+    fn start_file(
+        &mut self,
+        ctx: &egui::Context,
+        id: String,
+        name: String,
+        sending: bool,
+        saved: PathBuf,
+        work: impl FnOnce(&Transfer, &ChangeCallback) -> Result<(), String> + Send + 'static,
+    ) {
+        let (t, end) = (Arc::new(Transfer::default()), Arc::new(Mutex::new(None)));
+        let (thread_t, thread_end, repaint) = (t.clone(), end.clone(), ctx.clone());
+        let started = std::thread::Builder::new()
+            .name("lobby-file".into())
+            .spawn(move || {
+                let on: ChangeCallback = Arc::new(move || repaint.request_repaint());
+                let result = work(&thread_t, &on);
+                *thread_end.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
+                on();
+            });
+        if let Err(e) = started {
+            return self.note(&format!("Couldn't start the transfer ({e})."));
+        }
+        self.files.push(FileJob {
+            id,
+            name,
+            sending,
+            saved,
+            t,
+            started: Instant::now(),
+            end,
+        });
+    }
+
+    /// Transfers with their progress, then how they ended until dismissed.
+    fn file_jobs(&mut self, ui: &mut Ui) {
+        let mut dismiss = None;
+        for (i, j) in self.files.iter().enumerate() {
+            let name = shorten(&j.name, 40);
+            ui.horizontal_wrapped(|ui| match j.end() {
+                None => {
+                    let verb = if j.sending { "Sending" } else { "Downloading" };
+                    ui.label(format!("{verb} {name}"));
+                    let (done, total) = (
+                        j.t.done.load(Ordering::Relaxed),
+                        j.t.total.load(Ordering::Relaxed),
+                    );
+                    let fraction = if total > 0 {
+                        done as f32 / total as f32
+                    } else {
+                        0.0
+                    };
+                    let text = progress_text(done, total, j.started.elapsed());
+                    ui.add(ProgressBar::new(fraction).desired_width(220.0).text(text));
+                    if ui.button("Cancel").clicked() {
+                        j.t.cancel.store(true, Ordering::Relaxed);
+                    }
+                }
+                Some(result) => {
+                    match result {
+                        Ok(()) if j.sending => {
+                            ui.label(RichText::new(format!("Sent {name}.")).color(GREEN));
+                        }
+                        Ok(()) => {
+                            let text = format!("Saved {name} to {}.", j.saved.display());
+                            ui.label(RichText::new(text).color(GREEN));
+                            if ui
+                                .button("Show")
+                                .on_hover_text("Open its folder.")
+                                .clicked()
+                            {
+                                show_in_folder(&j.saved);
+                            }
+                        }
+                        Err(why) => {
+                            ui.label(RichText::new(format!("{name}: {why}")).color(ORANGE));
+                        }
+                    }
+                    let r = ui.small_button("×").on_hover_text("Remove from this list.");
+                    set_accessible_name(&r, &format!("Remove {name} from the list"));
+                    if r.clicked() {
+                        dismiss = Some(i);
+                    }
+                }
+            });
+            if let Some(problem) = j.t.problem().filter(|_| j.end().is_none()) {
+                ui.label(RichText::new(problem).color(ORANGE));
+            }
+        }
+        if let Some(i) = dismiss {
+            self.files.remove(i);
+        }
     }
 
     /// The chat picture that was clicked, large, until a click or Esc.
@@ -2163,6 +2373,103 @@ fn shorten(s: &str, max: usize) -> String {
     }
 }
 
+/// A file name from the lobby made safe to save on Windows (no folders, no
+/// characters or names Windows refuses).
+fn safe_file_name(name: &str) -> String {
+    let s: String = name
+        .chars()
+        .map(|c| {
+            if c.is_control() || r#"<>:"/\|?*"#.contains(c) {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let s = s.trim().trim_end_matches(['.', ' ']).to_string();
+    let stem = s.split('.').next().unwrap_or_default().to_ascii_uppercase();
+    let numbered = |p: &str| {
+        stem.len() == 4 && stem.starts_with(p) && stem.ends_with(|c: char| c.is_ascii_digit())
+    };
+    let reserved =
+        ["CON", "PRN", "AUX", "NUL"].contains(&stem.as_str()) || numbered("COM") || numbered("LPT");
+    match s {
+        s if s.is_empty() => "file".into(),
+        s if reserved => format!("_{s}"),
+        s => s,
+    }
+}
+
+/// `name` in `dir`, or "name (2).ext", "name (3).ext" … if that (or a
+/// download into it) is already there.
+fn free_path(dir: &Path, name: &str) -> PathBuf {
+    let p = Path::new(name);
+    let stem = p.file_stem().unwrap_or_default().to_string_lossy();
+    let ext = p.extension().map(|e| format!(".{}", e.to_string_lossy()));
+    (1..)
+        .map(|n| match n {
+            1 => dir.join(name),
+            n => dir.join(format!("{stem} ({n}){}", ext.as_deref().unwrap_or(""))),
+        })
+        .find(|p| !p.exists() && !part_path(p).exists())
+        .expect("some number is free")
+}
+
+/// Where a download goes until it is complete.
+fn part_path(saved: &Path) -> PathBuf {
+    let mut name = saved.file_name().unwrap_or_default().to_os_string();
+    name.push(".part");
+    saved.with_file_name(name)
+}
+
+fn size_text(bytes: u64) -> String {
+    let b = bytes as f64;
+    match bytes {
+        n if n >= 1_000_000_000 => format!("{:.1} GB", b / 1e9),
+        n if n >= 1_000_000 => format!("{:.1} MB", b / 1e6),
+        n if n >= 1_000 => format!("{:.0} KB", b / 1e3),
+        n => format!("{n} bytes"),
+    }
+}
+
+/// "37%, 18.5 GB of 50.0 GB, 45.2 MB/s, 12 min left".
+fn progress_text(done: u64, total: u64, elapsed: Duration) -> String {
+    if total == 0 {
+        return "starting…".into();
+    }
+    let speed = done as f64 / elapsed.as_secs_f64().max(0.1);
+    let mut text = format!(
+        "{:.0}%, {} of {}, {}/s",
+        done as f64 * 100.0 / total as f64,
+        size_text(done),
+        size_text(total),
+        size_text(speed as u64)
+    );
+    if speed > 0.0 {
+        let left = (total - done.min(total)) as f64 / speed;
+        text += &match left as u64 {
+            s if s < 60 => format!(", {s} s left"),
+            s if s < 3600 => format!(", {} min left", s.div_ceil(60)),
+            s => format!(", {:.1} h left", s as f64 / 3600.0),
+        };
+    }
+    text
+}
+
+/// Opens Explorer with the file selected.
+fn show_in_folder(path: &Path) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // Explorer wants /select,"path" as one raw argument (paths have no quotes).
+        let _ = std::process::Command::new("explorer")
+            .raw_arg(format!("/select,\"{}\"", path.display()))
+            .spawn();
+    }
+    #[cfg(not(windows))]
+    let _ = path;
+}
+
 /// How long before `now` the Unix time `at` was, in short.
 fn ago(at: u64, now: u64) -> String {
     match now.saturating_sub(at) {
@@ -2292,6 +2599,34 @@ mod tests {
     }
 
     #[test]
+    fn downloaded_files_get_safe_free_names() {
+        assert_eq!(safe_file_name("game clip.mp4"), "game clip.mp4");
+        assert_eq!(safe_file_name("..\\..\\boot.ini"), ".._.._boot.ini");
+        assert_eq!(safe_file_name("a/b:c?.zip. "), "a_b_c_.zip");
+        assert_eq!(safe_file_name("CON.txt"), "_CON.txt");
+        assert_eq!(safe_file_name("com7"), "_com7");
+        assert_eq!(safe_file_name("company.txt"), "company.txt");
+        assert_eq!(safe_file_name(" . "), "file");
+
+        let dir = std::env::temp_dir().join(format!("gf-free-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(free_path(&dir, "a.zip"), dir.join("a.zip"));
+        std::fs::write(dir.join("a.zip"), b"").unwrap();
+        std::fs::write(dir.join("a (2).zip.part"), b"").unwrap();
+        assert_eq!(free_path(&dir, "a.zip"), dir.join("a (3).zip"));
+        assert_eq!(part_path(&dir.join("a.zip")), dir.join("a.zip.part"));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(size_text(50_000_000_000), "50.0 GB");
+        assert_eq!(
+            progress_text(25_000_000_000, 50_000_000_000, Duration::from_secs(500)),
+            "50%, 25.0 GB of 50.0 GB, 50.0 MB/s, 9 min left"
+        );
+        assert_eq!(progress_text(0, 0, Duration::ZERO), "starting…");
+    }
+
+    #[test]
     fn chat_pictures_become_textures() {
         let ctx = egui::Context::default();
         let flat = image::RgbaImage::from_pixel(640, 400, image::Rgba([200, 30, 30, 255]));
@@ -2302,6 +2637,7 @@ mod tests {
             at: 5,
             text: String::new(),
             image,
+            file: None,
         };
         let mut thumbs = Vec::new();
         let out = ctx.run_ui(egui::RawInput::default(), |ui| {

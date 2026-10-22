@@ -249,3 +249,80 @@ fn wrong_version_is_turned_away() {
     assert!(reply.contains("different version"), "{reply}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn files_go_through_the_lobby_and_resume() {
+    use gf_lobby::client::{download, upload, Transfer};
+    use gf_lobby::{new_file_id, MAX_FILE};
+
+    let dir = std::env::temp_dir().join(format!("gf-lobby-test-f-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let addr = start_server(&dir.join("server"));
+    let a = client(addr, "Alice");
+    wait_for(&a, "connected", |s| s.connected);
+    let quiet: gf_lobby::client::ChangeCallback = Arc::new(|| {});
+    let bytes: Vec<u8> = (0..3_000_000u32).map(|i| (i * 31 % 251) as u8).collect();
+    let src = dir.join("big file.bin");
+    std::fs::write(&src, &bytes).unwrap();
+    let addr = addr.to_string();
+
+    // Up, shown in the chat, and down again.
+    let id = new_file_id();
+    let t = Transfer::default();
+    upload(&addr, "Alice", &id, &src, &t, &quiet).unwrap();
+    assert_eq!(t.done.load(std::sync::atomic::Ordering::Relaxed), 3_000_000);
+    let s = wait_for(&a, "the file in the chat", |s| {
+        s.chat.iter().any(|c| c.file.is_some())
+    });
+    let line = s.chat.iter().find(|c| c.file.is_some()).unwrap();
+    let shared = line.file.as_ref().unwrap();
+    assert_eq!(
+        (line.name.as_str(), shared.name.as_str(), shared.size),
+        ("Alice", "big file.bin", 3_000_000)
+    );
+    let part = dir.join("got.part");
+    download(&addr, &shared.id, &part, &Transfer::default(), &quiet).unwrap();
+    assert!(std::fs::read(&part).unwrap() == bytes);
+
+    // A broken-off download goes on from its part file.
+    std::fs::write(&part, &bytes[..1_000_000]).unwrap();
+    let t = Transfer::default();
+    download(&addr, &shared.id, &part, &t, &quiet).unwrap();
+    assert!(std::fs::read(&part).unwrap() == bytes);
+    assert_eq!(t.done.load(std::sync::atomic::Ordering::Relaxed), 3_000_000);
+
+    // A broken-off upload goes on from what the server has.
+    let id = new_file_id();
+    let files = dir.join("server").join("files");
+    std::fs::write(files.join(format!("{id}.part")), &bytes[..1_234_567]).unwrap();
+    upload(&addr, "Alice", &id, &src, &Transfer::default(), &quiet).unwrap();
+    assert!(std::fs::read(files.join(&id)).unwrap() == bytes);
+
+    // Refusals come back in plain words.
+    let gone = download(
+        &addr,
+        "0123456789",
+        &dir.join("x.part"),
+        &Transfer::default(),
+        &quiet,
+    );
+    assert!(gone.unwrap_err().contains("isn't on the lobby server"));
+    let ask = |line: String| {
+        let mut raw = TcpStream::connect(&addr).unwrap();
+        raw.write_all(line.as_bytes()).unwrap();
+        raw.set_read_timeout(Some(WAIT)).unwrap();
+        let mut reply = String::new();
+        let _ = raw.read_to_string(&mut reply);
+        reply
+    };
+    let too_big = format!(
+        "{{\"t\":\"upload\",\"id\":\"0123456789\",\"name\":\"x\",\"size\":{},\"who\":\"A\"}}\n",
+        MAX_FILE + 1
+    );
+    assert!(ask(too_big).contains("too big"));
+    let sneaky = "{\"t\":\"download\",\"id\":\"../members.json\",\"from\":0}\n".to_string();
+    assert!(ask(sneaky).contains("isn't on the lobby server"));
+    drop(a);
+    let _ = std::fs::remove_dir_all(&dir);
+}

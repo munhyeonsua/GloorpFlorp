@@ -4,13 +4,16 @@
 //! the others for long). On Linux another thread asks tailscaled every few
 //! seconds which devices are online.
 //!
-//! Files in the data folder: `members.json` (everyone who ever joined) and
+//! Files in the data folder: `members.json` (everyone who ever joined),
 //! `chat.jsonl` (the chat, one JSON object per line; pictures are big, so
-//! once it passes `REWRITE_CHAT_AT` it is cut down to the history).
+//! once it passes `REWRITE_CHAT_AT` it is cut down to the history) and
+//! `files/` (sent files by id; `<id>.part` while an upload is coming in).
+//! File connections are served on their connection's own thread, so the hub
+//! never waits for a disk or a slow link.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -21,8 +24,9 @@ use crossbeam_channel::Sender;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    encode, forget_image, read_line, unix_now, ChatLine, Member, Presence, ToClient, ToServer,
-    HISTORY, IDLE_TIMEOUT, IMAGE_HISTORY, MAX_CLIENT_LINE, MAX_NAME, MAX_TEXT, PROTOCOL,
+    encode, file_id_ok, forget_image, read_line, unix_now, ChatLine, Member, Presence, SharedFile,
+    ToClient, ToServer, FILE_DAYS, HISTORY, IDLE_TIMEOUT, IMAGE_HISTORY, MAX_CLIENT_LINE, MAX_FILE,
+    MAX_NAME, MAX_TEXT, PROTOCOL,
 };
 
 pub struct Config {
@@ -45,6 +49,8 @@ const BURST: f32 = 5.0;
 /// Room codes are 13 characters; leave room for spaces.
 const MAX_CODE: usize = 40;
 const TOO_FAST: &str = "You're sending messages too fast. Wait a moment.";
+/// Longest file name shown in the chat, in characters.
+const MAX_FILE_NAME: usize = 200;
 
 enum Ev {
     Open {
@@ -67,6 +73,12 @@ enum Ev {
     /// Tailscale address -> online.
     #[cfg_attr(not(unix), allow(dead_code))]
     Tailnet(HashMap<IpAddr, bool>),
+    /// A file upload is complete; `who` is the name the sender gave.
+    Shared {
+        ip: IpAddr,
+        who: String,
+        file: SharedFile,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -171,8 +183,9 @@ pub fn serve(listener: TcpListener, cfg: Config) -> io::Result<()> {
         }
         active.fetch_add(1, Ordering::Relaxed);
         let (conn_tx, conn_active) = (tx.clone(), active.clone());
+        let files = cfg.data_dir.join("files");
         let started = spawn("lobby-conn", move || {
-            read_conn(id, stream, &conn_tx);
+            read_conn(id, ip, stream, &conn_tx, &files);
             conn_active.fetch_sub(1, Ordering::Relaxed);
             let _ = conn_tx.send(Ev::Closed { id });
         });
@@ -204,12 +217,18 @@ fn allowed(ip: IpAddr) -> bool {
     }
 }
 
-fn read_conn(id: u64, stream: TcpStream, tx: &Sender<Ev>) {
+fn read_conn(id: u64, ip: IpAddr, stream: TcpStream, tx: &Sender<Ev>, files: &Path) {
     let mut r = BufReader::new(stream);
     let mut buf = Vec::new();
+    let mut first = true;
     loop {
         match read_line(&mut r, &mut buf, MAX_CLIENT_LINE) {
             Ok(Some(line)) => match serde_json::from_slice::<ToServer>(line) {
+                // A file connection carries one file and nothing else.
+                Ok(msg @ (ToServer::Upload { .. } | ToServer::Download { .. })) if first => {
+                    file_conn(&mut r, msg, files, ip, tx);
+                    return;
+                }
                 Ok(msg) => {
                     if tx.send(Ev::Line { id, msg }).is_err() {
                         return;
@@ -223,6 +242,165 @@ fn read_conn(id: u64, stream: TcpStream, tx: &Sender<Ev>) {
                 return;
             }
         }
+        first = false;
+    }
+}
+
+/// Serves one upload or download; a problem goes back as `Error`.
+fn file_conn(r: &mut BufReader<TcpStream>, msg: ToServer, dir: &Path, ip: IpAddr, tx: &Sender<Ev>) {
+    let Ok(mut w) = r.get_ref().try_clone() else {
+        return;
+    };
+    // The other end may be a slow disk taking a 50 GB file.
+    let _ = w.set_write_timeout(Some(IDLE_TIMEOUT));
+    let result = match msg {
+        ToServer::Upload {
+            id,
+            name,
+            size,
+            who,
+        } => receive(r, &mut w, dir, &id, size).and_then(|new| {
+            if new {
+                let name = clean(&name, MAX_FILE_NAME);
+                log::info!("file {id} ({name}, {size} bytes) stored from {ip}");
+                let file = SharedFile { id, name, size };
+                let _ = tx.send(Ev::Shared { ip, who, file });
+            }
+            reply(&mut w, &ToClient::Stored)
+        }),
+        ToServer::Download { id, from } => send_file(&mut w, dir, &id, from),
+        _ => Ok(()),
+    };
+    if let Err(text) = result {
+        log::info!("file transfer with {ip}: {text}");
+        let _ = w.write_all(&encode(&ToClient::Error { text }));
+    }
+}
+
+fn reply(w: &mut TcpStream, msg: &ToClient) -> Result<(), String> {
+    w.write_all(&encode(msg))
+        .map_err(|e| format!("the connection broke off ({e})"))
+}
+
+/// Takes the rest of upload `id` into `<id>.part`, then renames it to `id`.
+/// `Ok(false)`: it was already complete (the sender missed `Stored`).
+fn receive(
+    r: &mut BufReader<TcpStream>,
+    w: &mut TcpStream,
+    dir: &Path,
+    id: &str,
+    size: u64,
+) -> Result<bool, String> {
+    if !file_id_ok(id) {
+        return Err("That file can't be sent (bad id). Update GloorpFlorp.".into());
+    }
+    if size > MAX_FILE {
+        return Err(format!(
+            "That file is too big for the lobby (up to {} GB).",
+            MAX_FILE >> 30
+        ));
+    }
+    let disk = |e: io::Error| {
+        log::warn!("couldn't store file {id}: {e}");
+        if e.kind() == io::ErrorKind::StorageFull {
+            "The lobby server's disk is full.".to_string()
+        } else {
+            format!("The lobby server couldn't save the file ({e}).")
+        }
+    };
+    let done = dir.join(id);
+    if done.is_file() {
+        reply(w, &ToClient::Ready { have: size })?;
+        return Ok(false);
+    }
+    fs::create_dir_all(dir).map_err(disk)?;
+    let part = dir.join(format!("{id}.part"));
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&part)
+        .map_err(disk)?;
+    let mut have = file.metadata().map_err(disk)?.len();
+    if have > size {
+        file.set_len(0).map_err(disk)?;
+        have = 0;
+    }
+    reply(w, &ToClient::Ready { have })?;
+    // Dropped (and so flushed) at a break-off too, so the sender resumes
+    // after the last byte that arrived.
+    let mut out = BufWriter::with_capacity(1 << 20, file);
+    let mut buf = vec![0; 1 << 20];
+    let mut left = size - have;
+    while left > 0 {
+        let want = buf.len().min(usize::try_from(left).unwrap_or(usize::MAX));
+        let n = r
+            .read(&mut buf[..want])
+            .map_err(|e| format!("the upload broke off ({e})"))?;
+        if n == 0 {
+            return Err("the upload broke off".into());
+        }
+        out.write_all(&buf[..n]).map_err(disk)?;
+        left -= n as u64;
+    }
+    out.flush().map_err(disk)?;
+    drop(out);
+    fs::rename(&part, &done).map_err(disk)?;
+    Ok(true)
+}
+
+/// Sends file `id` from byte `from` on.
+fn send_file(w: &mut TcpStream, dir: &Path, id: &str, from: u64) -> Result<(), String> {
+    let gone = || {
+        format!("That file isn't on the lobby server any more (files are deleted after {FILE_DAYS} days).")
+    };
+    if !file_id_ok(id) {
+        return Err(gone());
+    }
+    let mut f = fs::File::open(dir.join(id)).map_err(|_| gone())?;
+    let size = f.metadata().map_err(|e| e.to_string())?.len();
+    f.seek(SeekFrom::Start(from.min(size)))
+        .map_err(|e| e.to_string())?;
+    reply(w, &ToClient::Sending { size })?;
+    io::copy(&mut f, w).map_err(|e| format!("the download broke off ({e})"))?;
+    Ok(())
+}
+
+/// Deletes sent files (and broken-off uploads) older than [`FILE_DAYS`].
+fn expire_files(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let keep = Duration::from_secs(FILE_DAYS * 24 * 3600);
+    for e in entries.flatten() {
+        let modified = e.metadata().and_then(|m| m.modified());
+        if !modified.is_ok_and(|t| t.elapsed().is_ok_and(|age| age > keep)) {
+            continue;
+        }
+        match fs::remove_file(e.path()) {
+            Ok(()) => log::info!(
+                "deleted {} (older than {FILE_DAYS} days)",
+                e.path().display()
+            ),
+            Err(err) => log::warn!("couldn't delete {}: {err}", e.path().display()),
+        }
+    }
+}
+
+/// The name a member goes by (see `Hello`).
+fn member_name(name: &str) -> String {
+    match clean(name, MAX_NAME) {
+        n if n.is_empty() => "Someone".into(),
+        n => n,
+    }
+}
+
+/// The Tailscale address; on the server's own machine (development) also the
+/// name, so two copies of the app there are two members.
+fn member_id(ip: IpAddr, name: &str) -> String {
+    if ip.is_loopback() {
+        format!("{ip}/{name}")
+    } else {
+        ip.to_string()
     }
 }
 
@@ -311,6 +489,8 @@ impl Hub {
                     refilled: Instant::now(),
                 };
                 self.conns.insert(id, conn);
+                // Often enough without a timer of its own.
+                expire_files(&self.dir.join("files"));
             }
             Ev::Line { id, msg } => self.message(id, msg),
             Ev::Closed { id } => {
@@ -326,6 +506,24 @@ impl Hub {
                 }
             }
             Ev::Tailnet(map) => self.tailnet = map,
+            Ev::Shared { ip, who, file } => {
+                let me = member_id(ip, &member_name(&who));
+                let name = self
+                    .members
+                    .get(&me)
+                    .map_or_else(|| member_name(&who), |k| k.name.clone());
+                let line = ChatLine {
+                    from: me,
+                    name,
+                    at: unix_now(),
+                    text: String::new(),
+                    image: None,
+                    file: Some(file),
+                };
+                self.broadcast(&ToClient::Chat(line.clone()));
+                remember(&mut self.history, line.clone());
+                self.append_chat(&line);
+            }
         }
         self.members_changed();
     }
@@ -339,6 +537,8 @@ impl Hub {
             (ToServer::Hello { v, name }, None) => self.hello(id, v, &name),
             // Once per connection: each one replays the whole history.
             (ToServer::Hello { .. }, Some(_)) => {}
+            // Only as a file connection's first line (see `read_conn`).
+            (ToServer::Upload { .. } | ToServer::Download { .. }, _) => {}
             // Everything else needs a Hello first.
             (_, None) => {}
             (ToServer::Chat { text, image }, Some(me)) => {
@@ -363,6 +563,7 @@ impl Hub {
                     at: unix_now(),
                     text,
                     image,
+                    file: None,
                 };
                 self.broadcast(&ToClient::Chat(line.clone()));
                 remember(&mut self.history, line.clone());
@@ -418,16 +619,9 @@ impl Hub {
         let Some(conn) = self.conns.get_mut(&id) else {
             return;
         };
-        let mut name = clean(name, MAX_NAME);
-        if name.is_empty() {
-            name = "Someone".into();
-        }
+        let name = member_name(name);
         let ip = conn.ip;
-        let me = if ip.is_loopback() {
-            format!("{ip}/{name}")
-        } else {
-            ip.to_string()
-        };
+        let me = member_id(ip, &name);
         conn.member = Some(me.clone());
         conn.waiting = Some(Vec::new());
         let stream = conn.stream.try_clone();
@@ -724,6 +918,7 @@ mod tests {
             at: i,
             text: format!("m{i}"),
             image: None,
+            file: None,
         };
         for i in 0..HISTORY as u64 + 5 {
             remember(&mut hub.history, line(i));
@@ -740,6 +935,26 @@ mod tests {
         assert_eq!(again.history.len(), HISTORY);
         assert_eq!(again.history[0].text, "m5");
         assert_eq!(again.chat_bytes, hub.chat_bytes);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn old_files_are_deleted() {
+        let dir = std::env::temp_dir().join(format!("gf-lobby-expire-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (old, new) = (dir.join("0123456789"), dir.join("abcdef0123.part"));
+        fs::write(&old, b"x").unwrap();
+        fs::write(&new, b"x").unwrap();
+        let eight_days = std::time::SystemTime::now() - Duration::from_secs(8 * 24 * 3600);
+        fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(eight_days)
+            .unwrap();
+        expire_files(&dir);
+        assert!(!old.exists() && new.exists());
         let _ = fs::remove_dir_all(&dir);
     }
 

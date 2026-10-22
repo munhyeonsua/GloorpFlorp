@@ -1,10 +1,14 @@
 //! The app's side of the lobby: connects, keeps the latest state for the
 //! window, and reconnects (after 1 s, doubling up to 30 s) when the
 //! connection drops. Per connection one thread writes (and pings), one reads.
-//! Dropping the [`Client`] disconnects.
+//! Dropping the [`Client`] disconnects. [`upload`] and [`download`] move one
+//! file each over a connection of their own.
 
-use std::io::{BufReader, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -17,6 +21,11 @@ use crate::{
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_RETRY_WAIT: Duration = Duration::from_secs(30);
+/// The server answers a file request at once; a lobby server from before
+/// files ignores it and never answers.
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(15);
+const OLD_SERVER: &str = "The lobby server can't take files yet. Update it: in its folder run \
+                          docker compose pull, then docker compose up -d.";
 
 /// Called from the client's threads whenever the state changed or an event
 /// arrived.
@@ -43,7 +52,7 @@ pub struct Client {
     pub events: Receiver<ToClient>,
 }
 
-fn lock(m: &Mutex<State>) -> MutexGuard<'_, State> {
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -256,5 +265,248 @@ fn read_loop(
             }
         }
         on_change();
+    }
+}
+
+/// An upload or download, shared with the window.
+#[derive(Debug, Default)]
+pub struct Transfer {
+    /// Bytes moved so far.
+    pub done: AtomicU64,
+    /// The file's size (0 until known).
+    pub total: AtomicU64,
+    /// Set to stop it.
+    pub cancel: AtomicBool,
+    /// Why it is waiting to try again, in plain words (cleared once moving).
+    pub problem: Mutex<Option<String>>,
+}
+
+impl Transfer {
+    pub fn problem(&self) -> Option<String> {
+        lock(&self.problem).clone()
+    }
+}
+
+/// How one try ended badly.
+enum Failure {
+    /// Trying again won't help; said in plain words.
+    Refused(String),
+    /// The connection broke: try again from where it stopped.
+    Lost(String),
+}
+
+/// Uploads the file at `path` to the lobby at `addr` as file `id` (see
+/// [`new_file_id`](crate::new_file_id)) for `who` (the name used in the
+/// lobby). After a dropped connection it tries again, resuming, until the
+/// file is stored (it then shows in the chat), cancelled, or refused.
+pub fn upload(
+    addr: &str,
+    who: &str,
+    id: &str,
+    path: &Path,
+    t: &Transfer,
+    on_change: &ChangeCallback,
+) -> Result<(), String> {
+    let name = path
+        .file_name()
+        .map_or_else(|| "file".into(), |n| n.to_string_lossy().into_owned());
+    let unreadable = |e: io::Error| Failure::Refused(format!("Can't read {name} ({e})."));
+    keep_trying(t, on_change, || {
+        let size = fs::metadata(path).map_err(unreadable)?.len();
+        t.total.store(size, Ordering::Relaxed);
+        let first = ToServer::Upload {
+            id: id.into(),
+            name: name.clone(),
+            size,
+            who: who.into(),
+        };
+        let (mut s, mut r) = open(addr, &first)?;
+        let have = match answer(&mut r, true)? {
+            ToClient::Ready { have } => have.min(size),
+            _ => return Err(Failure::Lost(UNEXPECTED.into())),
+        };
+        let mut f = File::open(path).map_err(unreadable)?;
+        f.seek(SeekFrom::Start(have)).map_err(unreadable)?;
+        t.done.store(have, Ordering::Relaxed);
+        match copy(&mut f, &mut s, size - have, t, on_change) {
+            Ok(()) => {}
+            Err(Stop::Read(e)) => return Err(unreadable(e)),
+            // The server may have said why it stopped taking it.
+            Err(Stop::Write(e)) => {
+                let _ = r.get_ref().set_read_timeout(Some(Duration::from_secs(2)));
+                answer(&mut r, false)?;
+                return Err(lost(e));
+            }
+            Err(Stop::Cancelled) => return Ok(()),
+        }
+        let _ = r.get_ref().set_read_timeout(Some(IDLE_TIMEOUT));
+        match answer(&mut r, false)? {
+            ToClient::Stored => Ok(()),
+            _ => Err(Failure::Lost(UNEXPECTED.into())),
+        }
+    })
+}
+
+/// Downloads file `id` from the lobby at `addr` into `part`, appending to
+/// what an earlier try left there. After a dropped connection it tries again,
+/// resuming, until the file is complete, cancelled, or refused.
+pub fn download(
+    addr: &str,
+    id: &str,
+    part: &Path,
+    t: &Transfer,
+    on_change: &ChangeCallback,
+) -> Result<(), String> {
+    let disk = |e: io::Error| Failure::Refused(format!("Can't save to {} ({e}).", part.display()));
+    keep_trying(t, on_change, || {
+        let have = fs::metadata(part).map_or(0, |m| m.len());
+        let first = ToServer::Download {
+            id: id.into(),
+            from: have,
+        };
+        let (_s, mut r) = open(addr, &first)?;
+        let size = match answer(&mut r, true)? {
+            ToClient::Sending { size } => size,
+            _ => return Err(Failure::Lost(UNEXPECTED.into())),
+        };
+        t.total.store(size, Ordering::Relaxed);
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(part)
+            .map_err(disk)?;
+        if have > size {
+            // Not the file the part came from: start over.
+            file.set_len(0).map_err(disk)?;
+            return Err(Failure::Lost(
+                "The file changed on the lobby server.".into(),
+            ));
+        }
+        t.done.store(have, Ordering::Relaxed);
+        let _ = r.get_ref().set_read_timeout(Some(IDLE_TIMEOUT));
+        let mut out = BufWriter::with_capacity(1 << 20, file);
+        let result = copy(&mut r, &mut out, size - have, t, on_change);
+        match result.and_then(|()| out.flush().map_err(Stop::Write)) {
+            Ok(()) | Err(Stop::Cancelled) => Ok(()),
+            Err(Stop::Read(e)) => Err(lost(e)),
+            Err(Stop::Write(e)) => Err(disk(e)),
+        }
+    })
+}
+
+const UNEXPECTED: &str = "The lobby server sent something unexpected.";
+
+fn lost(e: io::Error) -> Failure {
+    Failure::Lost(format!("Lost the connection to the lobby ({e})."))
+}
+
+/// A file connection with its first line sent, and a reader for answers.
+fn open(addr: &str, first: &ToServer) -> Result<(TcpStream, BufReader<TcpStream>), Failure> {
+    let mut s = connect(addr).map_err(Failure::Lost)?;
+    let r = s.try_clone().map_err(lost)?;
+    let _ = s.set_write_timeout(Some(IDLE_TIMEOUT));
+    let _ = r.set_read_timeout(Some(ANSWER_TIMEOUT));
+    s.write_all(&encode(first)).map_err(lost)?;
+    Ok((s, BufReader::new(r)))
+}
+
+/// The server's next answer; an `Error` is a refusal. `first`: no answer in
+/// time means a server too old for files.
+fn answer(r: &mut BufReader<TcpStream>, first: bool) -> Result<ToClient, Failure> {
+    let mut buf = Vec::new();
+    match read_line(r, &mut buf, MAX_SERVER_LINE) {
+        Ok(Some(line)) => match serde_json::from_slice(line) {
+            Ok(ToClient::Error { text }) => Err(Failure::Refused(text)),
+            Ok(msg) => Ok(msg),
+            Err(_) => Err(Failure::Lost(UNEXPECTED.into())),
+        },
+        Ok(None) => Err(Failure::Lost(
+            "The lobby server closed the connection.".into(),
+        )),
+        Err(e)
+            if first
+                && matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+        {
+            Err(Failure::Refused(OLD_SERVER.into()))
+        }
+        Err(e) => Err(lost(e)),
+    }
+}
+
+enum Stop {
+    Read(io::Error),
+    Write(io::Error),
+    Cancelled,
+}
+
+/// Copies `len` bytes, counting them in `t.done`.
+fn copy(
+    from: &mut impl Read,
+    to: &mut impl Write,
+    len: u64,
+    t: &Transfer,
+    on_change: &ChangeCallback,
+) -> Result<(), Stop> {
+    let mut buf = vec![0; 1 << 20];
+    let mut left = len;
+    let mut shown = Instant::now();
+    while left > 0 {
+        if t.cancel.load(Ordering::Relaxed) {
+            return Err(Stop::Cancelled);
+        }
+        let want = buf.len().min(usize::try_from(left).unwrap_or(usize::MAX));
+        let n = from.read(&mut buf[..want]).map_err(Stop::Read)?;
+        if n == 0 {
+            return Err(Stop::Read(io::ErrorKind::UnexpectedEof.into()));
+        }
+        to.write_all(&buf[..n]).map_err(Stop::Write)?;
+        left -= n as u64;
+        t.done.fetch_add(n as u64, Ordering::Relaxed);
+        if shown.elapsed() > Duration::from_millis(250) {
+            lock(&t.problem).take();
+            on_change();
+            shown = Instant::now();
+        }
+    }
+    Ok(())
+}
+
+/// Runs `once` until it succeeds, is refused or cancelled; waits 1 s after a
+/// dropped connection, doubling up to 30 s while nothing gets through.
+fn keep_trying(
+    t: &Transfer,
+    on_change: &ChangeCallback,
+    mut once: impl FnMut() -> Result<(), Failure>,
+) -> Result<(), String> {
+    let mut wait = Duration::from_secs(1);
+    loop {
+        let before = t.done.load(Ordering::Relaxed);
+        let result = once();
+        on_change();
+        if t.cancel.load(Ordering::Relaxed) {
+            return Err("Cancelled.".into());
+        }
+        let text = match result {
+            Ok(()) => return Ok(()),
+            Err(Failure::Refused(text)) => return Err(text),
+            Err(Failure::Lost(text)) => text,
+        };
+        log::info!("lobby file transfer: {text}");
+        *lock(&t.problem) = Some(format!("{text} Trying again…"));
+        on_change();
+        if t.done.load(Ordering::Relaxed) > before {
+            wait = Duration::from_secs(1);
+        }
+        let until = Instant::now() + wait;
+        while Instant::now() < until {
+            if t.cancel.load(Ordering::Relaxed) {
+                return Err("Cancelled.".into());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        wait = (wait * 2).min(MAX_RETRY_WAIT);
     }
 }

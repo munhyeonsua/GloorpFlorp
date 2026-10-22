@@ -361,6 +361,16 @@ somewhere else.
   nothing until both are updated. Once the release is out, run
   `docker compose pull` and then `docker compose up -d` on the lobby host,
   and have your friends update GloorpFlorp too.
+- **Big files:** drop any file (up to 64 GB) that isn't a picture onto the
+  window. It goes to the lobby server and then shows in the chat for
+  everyone, who click **Download** whenever they like: it lands in their
+  Downloads folder (**Show** opens it). Progress, speed and time left show
+  under the chat; **Cancel** stops it. If the connection drops, the transfer
+  goes on from where it stopped by itself. Files stay on the lobby server for
+  7 days, then it deletes them, so the server needs room for what you send
+  that week (a 50 GB file takes 50 GB there). The lobby server must be from
+  the same release or newer (`docker compose pull`, then
+  `docker compose up -d`).
 - **Invite:** click **Invite** next to a friend who is in the lobby.
   GloorpFlorp opens a room and sends them the code. If they accept, they
   join as if they had pasted the code. If they deny, or don't answer within

@@ -19,6 +19,13 @@
 //! [`MAX_IMAGE`] bytes). Only the newest [`IMAGE_HISTORY`] of them are kept
 //! for newcomers; older lines keep their text and say there was a picture.
 //!
+//! Files: a connection of its own whose first line is `Upload` or `Download`
+//! carries one file as raw bytes after the server's answer (`Ready`, with how
+//! much of a broken-off upload the server already has, or `Sending`, with the
+//! size), so a 50 GB file never holds up the chat and a dropped connection
+//! resumes where it stopped. A stored upload shows in the chat as a line
+//! with `file`; the server deletes files [`FILE_DAYS`] days after they came.
+//!
 //! Members are identified by their connection's Tailscale address (Tailscale
 //! already authenticates every device) plus the name they send. Connections
 //! from the server's own machine (loopback, development only) are told apart
@@ -32,6 +39,7 @@ pub mod server;
 
 use std::fmt;
 use std::io::{self, BufRead, Read};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::prelude::*;
@@ -56,6 +64,10 @@ pub const IMAGE_HISTORY: usize = 10;
 pub const MAX_CLIENT_LINE: usize = 2 << 20;
 /// Longest line the client reads from the server (a picture, the member list).
 pub const MAX_SERVER_LINE: usize = 2 << 20;
+/// Biggest file the lobby takes (friends send files of up to ~50 GB).
+pub const MAX_FILE: u64 = 64 << 30;
+/// Days a file stays on the lobby server.
+pub const FILE_DAYS: u64 = 7;
 pub const PING_EVERY: Duration = Duration::from_secs(20);
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -90,6 +102,20 @@ pub enum ToServer {
         code: String,
     },
     Ping,
+    /// First line of a file connection: upload `size` bytes as `name`.
+    /// `id` is picked by the sender (see [`new_file_id`]) and stays the same
+    /// when resuming; `who` is the sender's name, as in `Hello`.
+    Upload {
+        id: String,
+        name: String,
+        size: u64,
+        who: String,
+    },
+    /// First line of a file connection: file `id`, from byte `from` on.
+    Download {
+        id: String,
+        from: u64,
+    },
 }
 
 /// Server to client.
@@ -131,6 +157,16 @@ pub enum ToClient {
         text: String,
     },
     Pong,
+    /// Send the rest of the upload: the server already has `have` bytes.
+    Ready {
+        have: u64,
+    },
+    /// The upload is complete and in the chat.
+    Stored,
+    /// The download follows; the file has `size` bytes in all.
+    Sending {
+        size: u64,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -162,6 +198,32 @@ pub struct ChatLine {
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<Image>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<SharedFile>,
+}
+
+/// A file waiting on the lobby server, to download by `id`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct SharedFile {
+    pub id: String,
+    pub name: String,
+    pub size: u64,
+}
+
+/// File ids are 8 to 64 hex digits: the server uses them as file names.
+pub fn file_id_ok(id: &str) -> bool {
+    (8..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// A new file id: the time in nanoseconds, this process and a counter, so
+/// two PCs (or two files from one) never pick the same.
+pub fn new_file_id() -> String {
+    static COUNT: AtomicU32 = AtomicU32::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let n = COUNT.fetch_add(1, Ordering::Relaxed);
+    format!("{nanos:x}{:08x}{n:04x}", std::process::id())
 }
 
 /// A picture file (PNG or JPEG) in a chat message; base64 on the wire.
@@ -266,6 +328,7 @@ mod tests {
             at: 1_790_000_000,
             text: "hi".into(),
             image: None,
+            file: None,
         }));
         assert_eq!(
             String::from_utf8(line).unwrap(),
@@ -302,6 +365,7 @@ mod tests {
             at: 1,
             text: "look".into(),
             image: Some(png),
+            file: None,
         };
         forget_image(&mut line);
         assert_eq!(
@@ -312,5 +376,20 @@ mod tests {
         line.image = Some(Image(vec![0xFF, 0xD8, 0xFF]));
         forget_image(&mut line);
         assert_eq!(line.text, "(picture)");
+    }
+
+    #[test]
+    fn file_ids_are_safe_file_names() {
+        let (a, b) = (new_file_id(), new_file_id());
+        assert!(file_id_ok(&a) && file_id_ok(&b) && a != b, "{a} {b}");
+        for bad in [
+            "",
+            "abc",
+            "../../etc/passwd",
+            "0123456789abcdeg",
+            &"a".repeat(65),
+        ] {
+            assert!(!file_id_ok(bad), "{bad}");
+        }
     }
 }
