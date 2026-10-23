@@ -9,7 +9,8 @@
 //! once it passes `REWRITE_CHAT_AT` it is cut down to the history) and
 //! `files/` (sent files by id; `<id>.part` while an upload is coming in).
 //! File connections are served on their connection's own thread, so the hub
-//! never waits for a disk or a slow link.
+//! never waits for a disk or a slow link. So is the web page for phones (see
+//! `web`), which shares the port.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
@@ -24,10 +25,12 @@ use crossbeam_channel::Sender;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    encode, file_id_ok, forget_image, read_line, unix_now, ChatLine, Member, Presence, SharedFile,
-    ToClient, ToServer, FILE_DAYS, HISTORY, IDLE_TIMEOUT, IMAGE_HISTORY, MAX_CLIENT_LINE, MAX_FILE,
-    MAX_NAME, MAX_TEXT, PROTOCOL,
+    encode, file_id_ok, forget_image, read_line, unix_now, ChatLine, Image, Member, Presence,
+    SharedFile, ToClient, ToServer, FILE_DAYS, HISTORY, IDLE_TIMEOUT, IMAGE_HISTORY,
+    MAX_CLIENT_LINE, MAX_FILE, MAX_NAME, MAX_TEXT, PROTOCOL,
 };
+
+mod web;
 
 pub struct Config {
     pub data_dir: PathBuf,
@@ -79,7 +82,33 @@ enum Ev {
         who: String,
         file: SharedFile,
     },
+    /// The web page asks what's new since chat line `since` (see `web`).
+    WebPoll {
+        ip: IpAddr,
+        name: String,
+        since: u64,
+        reply: Sender<Vec<u8>>,
+    },
+    /// The web page posts a chat line.
+    WebChat {
+        ip: IpAddr,
+        name: String,
+        text: String,
+        image: Option<Image>,
+        reply: Sender<Result<(), String>>,
+    },
 }
+
+/// A member using the web page.
+struct WebVisitor {
+    /// Its last poll; it counts as in the lobby for `WEB_PRESENCE` after it.
+    seen: Instant,
+    tokens: f32,
+    refilled: Instant,
+}
+
+/// The page polls every 2 s while it is open.
+const WEB_PRESENCE: Duration = Duration::from_secs(10);
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 struct Known {
@@ -112,6 +141,11 @@ struct Hub {
     tx: Sender<Ev>,
     /// Size of chat.jsonl.
     chat_bytes: u64,
+    /// Chat lines added since the server started, plus the history it
+    /// loaded: `history` holds lines `total - history.len()` to `total - 1`.
+    total: u64,
+    /// By member id.
+    web: HashMap<String, WebVisitor>,
 }
 
 /// Runs the lobby on `listener` until the process ends. Fails at the start if
@@ -223,6 +257,11 @@ fn read_conn(id: u64, ip: IpAddr, stream: TcpStream, tx: &Sender<Ev>, files: &Pa
     let mut first = true;
     loop {
         match read_line(&mut r, &mut buf, MAX_CLIENT_LINE) {
+            Ok(Some(line)) if first && web::is_request(line) => {
+                let line = line.to_vec();
+                web::serve(&mut r, &line, ip, tx, files);
+                return;
+            }
             Ok(Some(line)) => match serde_json::from_slice::<ToServer>(line) {
                 // A file connection carries one file and nothing else.
                 Ok(msg @ (ToServer::Upload { .. } | ToServer::Download { .. })) if first => {
@@ -291,6 +330,18 @@ fn receive(
     id: &str,
     size: u64,
 ) -> Result<bool, String> {
+    check_upload(id, size)?;
+    if dir.join(id).is_file() {
+        reply(w, &ToClient::Ready { have: size })?;
+        return Ok(false);
+    }
+    let (file, have) = open_part(dir, id, size)?;
+    reply(w, &ToClient::Ready { have })?;
+    store(r, file, dir, id, size - have)?;
+    Ok(true)
+}
+
+fn check_upload(id: &str, size: u64) -> Result<(), String> {
     if !file_id_ok(id) {
         return Err("That file can't be sent (bad id). Update GloorpFlorp.".into());
     }
@@ -300,37 +351,43 @@ fn receive(
             MAX_FILE >> 30
         ));
     }
-    let disk = |e: io::Error| {
-        log::warn!("couldn't store file {id}: {e}");
-        if e.kind() == io::ErrorKind::StorageFull {
-            "The lobby server's disk is full.".to_string()
-        } else {
-            format!("The lobby server couldn't save the file ({e}).")
-        }
-    };
-    let done = dir.join(id);
-    if done.is_file() {
-        reply(w, &ToClient::Ready { have: size })?;
-        return Ok(false);
+    Ok(())
+}
+
+/// A problem with the server's disk, in plain words.
+fn disk(id: &str, e: io::Error) -> String {
+    log::warn!("couldn't store file {id}: {e}");
+    if e.kind() == io::ErrorKind::StorageFull {
+        "The lobby server's disk is full.".to_string()
+    } else {
+        format!("The lobby server couldn't save the file ({e}).")
     }
-    fs::create_dir_all(dir).map_err(disk)?;
-    let part = dir.join(format!("{id}.part"));
+}
+
+/// `<id>.part`, opened to append, and how many of the `size` bytes it has.
+fn open_part(dir: &Path, id: &str, size: u64) -> Result<(fs::File, u64), String> {
+    fs::create_dir_all(dir).map_err(|e| disk(id, e))?;
     let file = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&part)
-        .map_err(disk)?;
-    let mut have = file.metadata().map_err(disk)?.len();
+        .open(dir.join(format!("{id}.part")))
+        .map_err(|e| disk(id, e))?;
+    let mut have = file.metadata().map_err(|e| disk(id, e))?.len();
     if have > size {
-        file.set_len(0).map_err(disk)?;
+        file.set_len(0).map_err(|e| disk(id, e))?;
         have = 0;
     }
-    reply(w, &ToClient::Ready { have })?;
+    Ok((file, have))
+}
+
+/// Appends the next `left` bytes from `r` to `file` (`<id>.part`), then
+/// renames it to `id`.
+fn store(r: &mut impl Read, file: fs::File, dir: &Path, id: &str, left: u64) -> Result<(), String> {
     // Dropped (and so flushed) at a break-off too, so the sender resumes
     // after the last byte that arrived.
     let mut out = BufWriter::with_capacity(1 << 20, file);
     let mut buf = vec![0; 1 << 20];
-    let mut left = size - have;
+    let mut left = left;
     while left > 0 {
         let want = buf.len().min(usize::try_from(left).unwrap_or(usize::MAX));
         let n = r
@@ -339,30 +396,63 @@ fn receive(
         if n == 0 {
             return Err("the upload broke off".into());
         }
-        out.write_all(&buf[..n]).map_err(disk)?;
+        out.write_all(&buf[..n]).map_err(|e| disk(id, e))?;
         left -= n as u64;
     }
-    out.flush().map_err(disk)?;
+    out.flush().map_err(|e| disk(id, e))?;
     drop(out);
-    fs::rename(&part, &done).map_err(disk)?;
-    Ok(true)
+    fs::rename(dir.join(format!("{id}.part")), dir.join(id)).map_err(|e| disk(id, e))
 }
 
-/// Sends file `id` from byte `from` on.
-fn send_file(w: &mut TcpStream, dir: &Path, id: &str, from: u64) -> Result<(), String> {
+/// Sent file `id`, opened, and its size.
+fn open_shared(dir: &Path, id: &str) -> Result<(fs::File, u64), String> {
     let gone = || {
         format!("That file isn't on the lobby server any more (files are deleted after {FILE_DAYS} days).")
     };
     if !file_id_ok(id) {
         return Err(gone());
     }
-    let mut f = fs::File::open(dir.join(id)).map_err(|_| gone())?;
+    let f = fs::File::open(dir.join(id)).map_err(|_| gone())?;
     let size = f.metadata().map_err(|e| e.to_string())?.len();
+    Ok((f, size))
+}
+
+/// Sends file `id` from byte `from` on.
+fn send_file(w: &mut TcpStream, dir: &Path, id: &str, from: u64) -> Result<(), String> {
+    let (mut f, size) = open_shared(dir, id)?;
     f.seek(SeekFrom::Start(from.min(size)))
         .map_err(|e| e.to_string())?;
     reply(w, &ToClient::Sending { size })?;
     io::copy(&mut f, w).map_err(|e| format!("the download broke off ({e})"))?;
     Ok(())
+}
+
+/// A chat message's text and picture as they are posted, `None` if there is
+/// nothing to post, or why it can't be.
+fn chat_message(
+    text: &str,
+    image: Option<Image>,
+) -> Result<Option<(String, Option<Image>)>, String> {
+    let text = clean(text, MAX_TEXT);
+    if text.is_empty() && image.is_none() {
+        return Ok(None);
+    }
+    if image.as_ref().is_some_and(|i| !i.ok()) {
+        return Err("That picture can't be sent: only PNG or JPEG files up to 1 MB.".into());
+    }
+    Ok(Some((text, image)))
+}
+
+/// Takes one token from a rate limit of [`BURST`], refilled one a second.
+fn take_token(tokens: &mut f32, refilled: &mut Instant) -> bool {
+    let now = Instant::now();
+    *tokens = (*tokens + now.duration_since(*refilled).as_secs_f32()).min(BURST);
+    *refilled = now;
+    if *tokens < 1.0 {
+        return false;
+    }
+    *tokens -= 1.0;
+    true
 }
 
 /// Deletes sent files (and broken-off uploads) older than [`FILE_DAYS`].
@@ -464,12 +554,14 @@ impl Hub {
         let mut hub = Hub {
             dir: dir.to_path_buf(),
             members,
+            total: history.len() as u64,
             history,
             conns: HashMap::new(),
             tailnet: HashMap::new(),
             sent: Vec::new(),
             tx,
             chat_bytes,
+            web: HashMap::new(),
         };
         if hub.chat_bytes > REWRITE_CHAT_AT {
             hub.rewrite_chat();
@@ -512,20 +604,99 @@ impl Hub {
                     .members
                     .get(&me)
                     .map_or_else(|| member_name(&who), |k| k.name.clone());
-                let line = ChatLine {
+                self.post(ChatLine {
                     from: me,
                     name,
                     at: unix_now(),
                     text: String::new(),
                     image: None,
                     file: Some(file),
+                });
+            }
+            Ev::WebPoll {
+                ip,
+                name,
+                since,
+                reply,
+            } => {
+                let me = self.join(ip, &name);
+                self.visitor(&me).seen = Instant::now();
+                let first = self.total - self.history.len() as u64;
+                // Anything else (e.g. the server restarted): everything.
+                let from = if (first..=self.total).contains(&since) {
+                    since
+                } else {
+                    first
                 };
-                self.broadcast(&ToClient::Chat(line.clone()));
-                remember(&mut self.history, line.clone());
-                self.append_chat(&line);
+                let poll = web::Poll {
+                    you: me,
+                    members: self.member_list(),
+                    next: self.total,
+                    lines: self.history.iter().skip((from - first) as usize).collect(),
+                };
+                let _ = reply.send(serde_json::to_vec(&poll).unwrap_or_default());
+            }
+            Ev::WebChat {
+                ip,
+                name,
+                text,
+                image,
+                reply,
+            } => {
+                let me = self.join(ip, &name);
+                let result = chat_message(&text, image).and_then(|message| {
+                    let Some((text, image)) = message else {
+                        return Ok(());
+                    };
+                    let v = self.visitor(&me);
+                    if !take_token(&mut v.tokens, &mut v.refilled) {
+                        return Err(TOO_FAST.into());
+                    }
+                    self.post(ChatLine {
+                        name: self.members[&me].name.clone(),
+                        from: me,
+                        at: unix_now(),
+                        text,
+                        image,
+                        file: None,
+                    });
+                    Ok(())
+                });
+                let _ = reply.send(result);
             }
         }
         self.members_changed();
+    }
+
+    /// Shows a new line to everyone and keeps it.
+    fn post(&mut self, line: ChatLine) {
+        self.broadcast(&ToClient::Chat(line.clone()));
+        remember(&mut self.history, line.clone());
+        self.total += 1;
+        self.append_chat(&line);
+    }
+
+    fn visitor(&mut self, me: &str) -> &mut WebVisitor {
+        self.web
+            .entry(me.to_string())
+            .or_insert_with(|| WebVisitor {
+                seen: Instant::now(),
+                tokens: BURST,
+                refilled: Instant::now(),
+            })
+    }
+
+    /// Makes (or keeps) the device at `ip` a member under `name`; returns its
+    /// member id.
+    fn join(&mut self, ip: IpAddr, name: &str) -> String {
+        let name = member_name(name);
+        let me = member_id(ip, &name);
+        let known = Known { ip, name };
+        if self.members.get(&me) != Some(&known) {
+            self.members.insert(me.clone(), known);
+            self.save_members();
+        }
+        me
     }
 
     fn message(&mut self, id: u64, msg: ToServer) {
@@ -542,32 +713,24 @@ impl Hub {
             // Everything else needs a Hello first.
             (_, None) => {}
             (ToServer::Chat { text, image }, Some(me)) => {
-                let text = clean(&text, MAX_TEXT);
-                if text.is_empty() && image.is_none() {
-                    return;
-                }
-                if image.as_ref().is_some_and(|i| !i.ok()) {
-                    let text =
-                        "That picture can't be sent: only PNG or JPEG files up to 1 MB.".into();
-                    self.send(id, &ToClient::Error { text });
-                    return;
-                }
+                let (text, image) = match chat_message(&text, image) {
+                    Ok(Some(message)) => message,
+                    Ok(None) => return,
+                    Err(text) => return self.send(id, &ToClient::Error { text }),
+                };
                 if !self.allow(id) {
                     let text = TOO_FAST.into();
                     self.send(id, &ToClient::Error { text });
                     return;
                 }
-                let line = ChatLine {
+                self.post(ChatLine {
                     name: self.members[&me].name.clone(),
                     from: me,
                     at: unix_now(),
                     text,
                     image,
                     file: None,
-                };
-                self.broadcast(&ToClient::Chat(line.clone()));
-                remember(&mut self.history, line.clone());
-                self.append_chat(&line);
+                });
             }
             (ToServer::Invite { to, code }, Some(me)) => {
                 let code = clean(&code, MAX_CODE);
@@ -616,20 +779,16 @@ impl Hub {
             self.close(id);
             return;
         }
+        let Some(ip) = self.conns.get(&id).map(|c| c.ip) else {
+            return;
+        };
+        let me = self.join(ip, name);
         let Some(conn) = self.conns.get_mut(&id) else {
             return;
         };
-        let name = member_name(name);
-        let ip = conn.ip;
-        let me = member_id(ip, &name);
         conn.member = Some(me.clone());
         conn.waiting = Some(Vec::new());
         let stream = conn.stream.try_clone();
-        let known = Known { ip, name };
-        if self.members.get(&me) != Some(&known) {
-            self.members.insert(me.clone(), known);
-            self.save_members();
-        }
         // The history can be megabytes (pictures), so a thread writes it and
         // the hub goes on; what the newcomer should get meanwhile waits in
         // `Conn::waiting` until `Ev::Replayed`.
@@ -658,18 +817,9 @@ impl Hub {
 
     /// Takes one token from the connection's rate limit.
     fn allow(&mut self, id: u64) -> bool {
-        let Some(c) = self.conns.get_mut(&id) else {
-            return false;
-        };
-        let now = Instant::now();
-        let refill = now.duration_since(c.refilled).as_secs_f32();
-        c.tokens = (c.tokens + refill).min(BURST);
-        c.refilled = now;
-        if c.tokens < 1.0 {
-            return false;
-        }
-        c.tokens -= 1.0;
-        true
+        self.conns
+            .get_mut(&id)
+            .is_some_and(|c| take_token(&mut c.tokens, &mut c.refilled))
     }
 
     fn member_list(&self) -> Vec<Member> {
@@ -677,7 +827,12 @@ impl Hub {
             .members
             .iter()
             .map(|(id, k)| {
-                let state = if self.conns.values().any(|c| c.member.as_ref() == Some(id)) {
+                let on_page = self
+                    .web
+                    .get(id)
+                    .is_some_and(|v| v.seen.elapsed() < WEB_PRESENCE);
+                let state = if on_page || self.conns.values().any(|c| c.member.as_ref() == Some(id))
+                {
                     Presence::Lobby
                 } else if self.tailnet.get(&k.ip) == Some(&true) {
                     Presence::Online

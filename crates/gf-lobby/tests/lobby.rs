@@ -326,3 +326,127 @@ fn files_go_through_the_lobby_and_resume() {
     drop(a);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// One HTTP request; the answer's head (status line and headers) and body.
+fn http(addr: SocketAddr, request: &str, body: &[u8]) -> (String, Vec<u8>) {
+    let mut s = TcpStream::connect(addr).unwrap();
+    s.write_all(request.as_bytes()).unwrap();
+    s.write_all(body).unwrap();
+    s.set_read_timeout(Some(WAIT)).unwrap();
+    let mut all = Vec::new();
+    let _ = s.read_to_end(&mut all);
+    let end = all.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    (
+        String::from_utf8_lossy(&all[..end]).into_owned(),
+        all[end + 4..].to_vec(),
+    )
+}
+
+#[test]
+fn web_page_for_phones() {
+    let dir = std::env::temp_dir().join(format!("gf-lobby-test-w-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let addr = start_server(&dir);
+    let a = client(addr, "Alice");
+    wait_for(&a, "connected", |s| s.connected);
+    let host = "Host: gloorp-lobby:47900\r\n";
+    let get = |path: &str, extra: &str| {
+        http(
+            addr,
+            &format!("GET {path} HTTP/1.1\r\n{host}{extra}\r\n"),
+            b"",
+        )
+    };
+    let post = |path: &str, extra: &str, body: &[u8]| {
+        let head = format!(
+            "POST {path} HTTP/1.1\r\n{host}{extra}Content-Length: {}\r\n\r\n",
+            body.len()
+        );
+        http(addr, &head, body)
+    };
+
+    let (head, page) = get("/", "");
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(page.starts_with(b"<!doctype html>"));
+
+    // Polling makes the phone a member the app sees in the lobby.
+    let (head, body) = get("/poll?name=My+Phone&since=0", "");
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    let poll: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(poll["you"], "127.0.0.1/My Phone");
+    wait_for(&a, "the phone in the lobby", |s| {
+        state_of(s, "My Phone") == Some(Presence::Lobby)
+    });
+
+    // Chat both ways; a POST without the page's header is turned away.
+    let msg = br#"{"text":"hi from the phone"}"#;
+    let (head, _) = post("/chat?name=My%20Phone", "", msg);
+    assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+    let (head, _) = post("/chat?name=My%20Phone", "X-Gloorp: 1\r\n", msg);
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    wait_for(&a, "the phone's message", |s| {
+        has_chat(s, "My Phone", "hi from the phone")
+    });
+    a.send(ToServer::Chat {
+        text: "hi from the PC".into(),
+        image: None,
+    });
+    let since = poll["next"].as_u64().unwrap();
+    let until = Instant::now() + WAIT;
+    loop {
+        let (_, body) = get(&format!("/poll?name=My+Phone&since={since}"), "");
+        let poll: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let texts: Vec<&str> = poll["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|l| l["text"].as_str())
+            .collect();
+        if texts == ["hi from the phone", "hi from the PC"] {
+            break;
+        }
+        assert!(Instant::now() < until, "{texts:?}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // A file up from the phone shows in the app, and comes down whole or
+    // from where a broken-off download stopped.
+    let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    let (head, _) = post(
+        "/upload?name=My%20Phone&file=clip%20(1).mp4",
+        "X-Gloorp: 1\r\n",
+        &data,
+    );
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    let s = wait_for(&a, "the phone's file", |s| {
+        s.chat
+            .iter()
+            .any(|c| c.name == "My Phone" && c.file.is_some())
+    });
+    let file = s.chat.iter().find_map(|c| c.file.clone()).unwrap();
+    assert_eq!((file.name.as_str(), file.size), ("clip (1).mp4", 200_000));
+    let (head, body) = get(&format!("/file/{}?name=clip%20(1).mp4", file.id), "");
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(
+        head.contains("filename*=UTF-8''clip%20%281%29.mp4"),
+        "{head}"
+    );
+    assert!(body == data);
+    let (head, body) = get(&format!("/file/{}", file.id), "Range: bytes=150000-\r\n");
+    assert!(head.starts_with("HTTP/1.1 206"), "{head}");
+    assert!(
+        head.contains("Content-Range: bytes 150000-199999/200000"),
+        "{head}"
+    );
+    assert!(body == data[150_000..]);
+
+    // Another website's name pointed at the lobby gets nothing.
+    let (head, _) = http(
+        addr,
+        "GET /poll?name=x HTTP/1.1\r\nHost: evil.example.com\r\n\r\n",
+        b"",
+    );
+    assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+    drop(a);
+    let _ = std::fs::remove_dir_all(&dir);
+}

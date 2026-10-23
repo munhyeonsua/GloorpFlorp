@@ -382,6 +382,18 @@ somewhere else.
   **Deny**, and the taskbar button flashes (also while GloorpFlorp is
   minimized). If you're already in a room, the invite is declined for you.
 
+### On your phone
+
+The lobby server is also a web page. On a phone with the Tailscale app on
+(and the `gloorp-lobby` device shared with you, if it's in someone else's
+Tailscale account), open `http://gloorp-lobby:47900` in the browser, or the
+server's Tailscale address like `http://100.101.102.103:47900` if the name
+doesn't work. Pick a name at the top; then you can chat, see who is around,
+send a picture (**Picture**) or any file (**Send file**), and **Download**
+the files others sent. You show as **In the lobby** while the page is open.
+Rooms, screen sharing and voice need the PC app. The page only works through
+Tailscale, like the rest of the lobby.
+
 ## Recommended settings and tips
 
 - **Codec: leave it on Auto.** An RTX 40 or 50 series card (like the RTX 5080)
